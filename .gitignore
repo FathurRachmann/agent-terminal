@@ -26,8 +26,6 @@ dist/
 graphify-out/
 *.log
 .DS_Store
-go/bin/
-go/runtime/
 sandbox-workspace/
 .tmp-pty-test/
 .tmp/

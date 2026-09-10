@@ -12,7 +12,7 @@ Terminal-first AI coding agent built with **Deep Agents** (LangGraph harness), *
 - Always-on guidelines via `.agent/AGENTS.md`
 - **Agent skills** under `.agent/skills/*/SKILL.md` (on-demand via `ls`/`read_file` on `/skills/` — not auto-injected)
 - Multi-agent orchestration: `explorer` / `coder` / `reviewer`
-- Text CLI + Ink TUI; Go + Bubbletea release shell (Phase 5)
+- Text CLI + Ink TUI (`npm run agent`, `-t` for plain CLI)
 - macOS desktop automation (Chrome-first) via `desktop_automate`
 
 ## Quick start
@@ -119,7 +119,7 @@ Retrieves **top-K** memories for the current query using **hybrid semantic (cosi
 ## Architecture
 
 ```
-CLI / TUI / Go binary
+CLI / Ink TUI (`npm run agent`)
         │
         ▼
  createDeepAgent ──► ChatOpenAI (9router) + /embeddings
@@ -131,16 +131,6 @@ CLI / TUI / Go binary
         ├── AGENTS.md guidelines
         └── Subagents (explorer, coder, reviewer)
 ```
-
-## Go binary (optional)
-
-```bash
-cd go
-go build -o bin/agent ./cmd/agent
-./bin/agent --help
-```
-
-The Go Bubbletea shell can spawn the TypeScript runtime (`npm run agent`) or an embedded runtime path via `AGENT_RUNTIME`.
 
 ## License
 
