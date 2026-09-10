@@ -1,0 +1,34 @@
+# Dependencies & build
+node_modules/
+dist/
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# ── Runtime / personal agent state (never commit) ──────────────────────────
+# Session pointer + transcripts + SQLite DBs are created empty on first run /
+# postinstall. Schema is applied automatically; your chats stay local.
+.agent/session.json
+.agent/desktop-allowlist.json
+.agent/context/**
+!.agent/context/.gitkeep
+.agent/task/**
+!.agent/task/.gitkeep
+.agent/memory/**
+!.agent/memory/.gitkeep
+!.agent/memory/README.md
+# Personal guidelines mirror (synced from local SQLite). Starter is AGENTS.md.example
+.agent/AGENTS.md
+
+# Generated / local tooling
+graphify-out/
+*.log
+.DS_Store
+go/bin/
+go/runtime/
+sandbox-workspace/
+.tmp-pty-test/
+.tmp/
+coverage/

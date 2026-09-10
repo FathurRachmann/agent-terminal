@@ -1,0 +1,13 @@
+# Agent Memory
+
+Persistent guidelines and user personalization. Synced from the durable memory store on first run.
+
+## Known Pitfalls
+
+- WHEN starting any feature, bugfix, or refactor → DO ls /skills/, read only needed SKILL.md files, then task_plan → task_todos → execute with task_todo_update → task_verify before claiming done; never load all skills at once
+- WHEN the user asks to open a URL or control Google Chrome → DO call desktop_automate (open_url / open_app / keystroke) and wait for HITL approval — do not refuse or ask them to paste the link manually
+- WHEN this situation recurs → DO Never store sensitive credentials, tokens, or keys in persistent memory or logs
+
+## User preferences
+
+- (none yet — learned from ordinary chat)
