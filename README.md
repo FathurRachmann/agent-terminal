@@ -32,11 +32,15 @@ Personal chats, SQLite DBs, and `AGENTS.md` stay **local** (gitignored). After c
 ### Dev CLI options
 
 ```bash
-npm run agent -- --cwd /path/to/project "Fix the failing tests"
-npm run agent -- --yes "Explain package.json"   # auto-approve execute interrupts
-npm run tui                                      # Ink TUI (live activity + PTY)
-npm run tui -- --cwd ~/Documents/MyApp           # confine sandbox to that folder only
+npm run agent                                    # Ink TUI (default)
+npm run agent -- "Fix the failing tests"         # TUI + initial prompt
+npm run agent -- -y "Explain package.json"       # TUI, auto-approve interrupts
+npm run agent -- -t "List files"                 # plain CLI, no TUI
+npm run agent -- -t --repl                       # text REPL
+npm run agent -- --cwd ~/Documents/MyApp         # confine sandbox to that folder
 ```
+
+(`npm run tui` is an alias of `npm run agent`.)
 
 Workspace confinement: the agent can only read/write/exec inside the current allowlist (starts as `--cwd`). To open another laptop folder mid-session, the agent must call `request_folder_access` and you press **y/n**. Without `-y`, execute / edit / write / folder grants always ask approval.
 

@@ -4,7 +4,7 @@ This directory is **local-only**. Git ignores `*.sqlite`, session transcripts, a
 
 ## What gets created automatically
 
-On `npm install` (postinstall) and on first `npm run agent` / `npm run tui`:
+On `npm install` (postinstall) and on first `npm run agent`:
 
 | Path | Role |
 | --- | --- |

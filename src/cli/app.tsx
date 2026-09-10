@@ -487,8 +487,30 @@ function App({ workspaceRoot, autoApprove, initialPrompt }: Props) {
 }
 
 async function main() {
+  // Direct entry (`npm run tui` alias) — same as default `npm run agent`
+  await startTuiFromArgv(process.argv);
+}
+
+export type TuiStartOptions = {
+  workspaceRoot: string;
+  autoApprove: boolean;
+  initialPrompt?: string;
+};
+
+export async function startTui(options: TuiStartOptions): Promise<void> {
+  const instance = render(
+    <App
+      workspaceRoot={options.workspaceRoot}
+      autoApprove={options.autoApprove}
+      initialPrompt={options.initialPrompt}
+    />,
+  );
+  await instance.waitUntilExit();
+}
+
+export async function startTuiFromArgv(argv: string[]): Promise<void> {
   const program = new Cli()
-    .name("agent-tui")
+    .name("agent")
     .argument("[prompt...]", "Optional initial prompt")
     .option(
       "-c, --cwd <path>",
@@ -496,23 +518,28 @@ async function main() {
       process.env.AGENT_WORKSPACE ?? process.cwd(),
     )
     .option("-y, --yes", "Auto-approve interrupts", false)
-    .parse(process.argv);
+    .allowUnknownOption(true)
+    .parse(argv, { from: "node" });
 
   const opts = program.opts<{ cwd: string; yes: boolean }>();
   const prompt = (program.args as string[]).join(" ");
 
-  const instance = render(
-    <App
-      workspaceRoot={path.resolve(opts.cwd)}
-      autoApprove={opts.yes}
-      initialPrompt={prompt || undefined}
-    />,
-  );
-
-  await instance.waitUntilExit();
+  await startTui({
+    workspaceRoot: path.resolve(opts.cwd),
+    autoApprove: opts.yes,
+    initialPrompt: prompt || undefined,
+  });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only auto-run when this file is the process entry (tsx src/cli/app.tsx)
+const isDirectEntry =
+  process.argv[1]?.includes(`${path.sep}cli${path.sep}app.`) ||
+  process.argv[1]?.endsWith("app.tsx") ||
+  process.argv[1]?.endsWith("app.js");
+
+if (isDirectEntry) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

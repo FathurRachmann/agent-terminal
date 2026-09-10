@@ -126,7 +126,7 @@ func runAgent(cwd, prompt string, autoApprove bool) tea.Cmd {
 	return func() tea.Msg {
 		runtime := os.Getenv("AGENT_RUNTIME")
 		var cmd *exec.Cmd
-		args := []string{"--cwd", cwd}
+		args := []string{"-t", "--cwd", cwd}
 		if autoApprove {
 			args = append(args, "--yes")
 		}
