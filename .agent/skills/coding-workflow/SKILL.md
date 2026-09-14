@@ -16,9 +16,10 @@ description: >-
 | 2 | `read_file` only those SKILL.md | Needed guidance loaded |
 | 3 | `task_plan` | Plan + skillsUsed saved |
 | 4 | `task_todos` | Atomic todos from plan |
-| 5 | Execute each todo | `task_todo_update` in_progress → completed |
-| 6 | `task_verify` | VERIFY PASS vs plan/todos |
-| 7 | Final user summary | Only after verify pass |
+| 5 | Parallelize | `delegate_task` with ≥3 workers OR multiple `task` calls in one turn when independent |
+| 6 | Execute remaining todos | `task_todo_update` in_progress → completed (serialize only true dependencies) |
+| 7 | `task_verify` | VERIFY PASS vs plan/todos |
+| 8 | Final user summary | Only after verify pass |
 
 ## Skill picking examples
 

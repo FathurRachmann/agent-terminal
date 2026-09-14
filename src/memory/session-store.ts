@@ -171,6 +171,58 @@ export class SessionStore {
     return events;
   }
 
+  /**
+   * List chat sessions from transcript files (newest first).
+   */
+  listSessions(): Array<{
+    threadId: string;
+    updatedAt: string;
+    preview: string;
+    turnCount: number;
+  }> {
+    if (!fs.existsSync(this.transcriptsDir)) return [];
+    const files = fs
+      .readdirSync(this.transcriptsDir)
+      .filter((f) => f.endsWith(".jsonl"));
+    const sessions: Array<{
+      threadId: string;
+      updatedAt: string;
+      preview: string;
+      turnCount: number;
+      mtime: number;
+    }> = [];
+
+    for (const file of files) {
+      const full = path.join(this.transcriptsDir, file);
+      let mtime = 0;
+      try {
+        mtime = fs.statSync(full).mtimeMs;
+      } catch {
+        continue;
+      }
+      const threadId = file.replace(/\.jsonl$/, "");
+      const events = this.readTranscript(threadId, 80);
+      const users = events.filter((e) => e.role === "user");
+      const lastUser = users[users.length - 1];
+      const lastAny = events[events.length - 1];
+      sessions.push({
+        threadId,
+        mtime,
+        updatedAt: lastAny?.ts ?? new Date(mtime).toISOString(),
+        preview: (lastUser?.content || lastAny?.content || "(empty)").slice(0, 80),
+        turnCount: users.length,
+      });
+    }
+
+    sessions.sort((a, b) => b.mtime - a.mtime);
+    return sessions.map(({ threadId, updatedAt, preview, turnCount }) => ({
+      threadId,
+      updatedAt,
+      preview,
+      turnCount,
+    }));
+  }
+
   writeConfigSnapshot(config: Record<string, unknown>): void {
     fs.writeFileSync(
       this.configSnapshotPath,

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   isJunkGuideline,
   looksLikeIncompleteReasoning,
+  looksLikeProviderNotice,
+  shouldRenderAsReasoning,
   stripThinkBlocks,
 } from "./sanitize-output.js";
 
@@ -39,5 +41,13 @@ describe("sanitize-output", () => {
     const good =
       "## Persistent\n- `.agent/session.json`\n## Long-term\n- hybrid RAG via embeddings";
     assert.equal(looksLikeIncompleteReasoning(good), false);
+  });
+
+  it("treats provider sunset notices as reasoning-style", () => {
+    const notice =
+      "Gemini 3.5 Flash is no longer available. Please switch to Gemini 3.7 Flash in the latest version of Antigravity.";
+    assert.equal(looksLikeProviderNotice(notice), true);
+    assert.equal(shouldRenderAsReasoning(notice), true);
+    assert.equal(shouldRenderAsReasoning("Folder created successfully."), false);
   });
 });

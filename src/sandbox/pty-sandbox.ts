@@ -8,6 +8,7 @@ import {
   type FileUploadResponse,
 } from "deepagents";
 import { checkCommand, checkCommandWorkspaceAccess, isPathInsideAnyRoot } from "./guardrails.js";
+import { registerPtyBackgroundProcess } from "../agent/process-manage.js";
 
 export type PtySandboxOptions = {
   workingDirectory: string;
@@ -15,6 +16,8 @@ export type PtySandboxOptions = {
   shell?: string;
   cols?: number;
   rows?: number;
+  /** Parallel interactive shells (default 3, env PTY_POOL_SIZE, max 8). */
+  poolSize?: number;
   /** When true, destructive commands that normally need approval are allowed. */
   autoApproveDestructive?: boolean;
   onOutput?: (chunk: string) => void;
@@ -23,11 +26,23 @@ export type PtySandboxOptions = {
 const AWAITING_INPUT_RE =
   /(\[y\/N\]|\[Y\/n\]|\(y\/n\)|password:|passphrase:|Continue\?|Overwrite\?|\(yes\/no\)|Press RETURN|More\?|--More--)\s*$/i;
 
+const DEFAULT_POOL = 3;
+const MAX_POOL = 8;
+
+export function resolvePoolSize(requested?: number): number {
+  const fromEnv = Number(process.env.PTY_POOL_SIZE);
+  const raw =
+    typeof requested === "number" && Number.isFinite(requested)
+      ? requested
+      : Number.isFinite(fromEnv) && fromEnv > 0
+        ? fromEnv
+        : DEFAULT_POOL;
+  return Math.max(1, Math.min(MAX_POOL, Math.floor(raw)));
+}
+
 function defaultShell(): string {
   if (process.env.PTY_SHELL) return process.env.PTY_SHELL;
   if (process.platform === "win32") return "powershell.exe";
-  // Prefer bash for predictable exit-marker scripting in the agent loop.
-  // Override with PTY_SHELL=/bin/zsh if needed.
   return "/bin/bash";
 }
 
@@ -53,88 +68,44 @@ export function truncateOutput(
   };
 }
 
-/**
- * Persistent PTY-backed sandbox for Deep Agents.
- * One interactive shell session per workspace; cwd/env persist across execute().
- */
-export class PtySandbox extends BaseSandbox {
-  readonly id: string;
-  private workingDirectory: string;
-  private allowedRoots: string[];
-  private readonly timeoutMs: number;
+type SessionSpawnOpts = {
+  id: number;
+  shellPath: string;
+  cols: number;
+  rows: number;
+  cwd: string;
+  maxBufferBytes: number;
+  onOutput?: (chunk: string) => void;
+};
+
+/** One interactive shell slot in the pool. */
+class PtySession {
+  readonly id: number;
+  busy = false;
+  private term: pty.IPty | null = null;
+  private buffer = "";
   private readonly shellPath: string;
   private readonly cols: number;
   private readonly rows: number;
-  private readonly autoApproveDestructive: boolean;
+  private cwd: string;
+  private readonly maxBufferBytes: number;
   private readonly onOutput?: (chunk: string) => void;
 
-  private term: pty.IPty | null = null;
-  private buffer = "";
-  private commandSeq = 0;
-  private disposed = false;
-  private executeQueue: Promise<void> = Promise.resolve();
-  private readonly maxBufferBytes = 10 * 1024 * 1024;
-  private readonly minTimeoutMs = 5_000;
-  private readonly maxTimeoutMs = 10 * 60 * 1000;
-
-  constructor(options: PtySandboxOptions) {
-    super();
-    this.workingDirectory = path.resolve(options.workingDirectory);
-    this.allowedRoots = [this.workingDirectory];
-    this.timeoutMs = options.timeoutMs ?? Number(process.env.PTY_TIMEOUT_MS ?? 60_000);
-    this.shellPath = options.shell ?? defaultShell();
-    this.cols = options.cols ?? 120;
-    this.rows = options.rows ?? 40;
-    this.autoApproveDestructive = options.autoApproveDestructive ?? false;
-    this.onOutput = options.onOutput;
-    this.id = `pty-${this.workingDirectory.replace(/[^a-zA-Z0-9]/g, "-")}`;
-
-    if (!fs.existsSync(this.workingDirectory)) {
-      fs.mkdirSync(this.workingDirectory, { recursive: true });
-    }
+  constructor(opts: SessionSpawnOpts) {
+    this.id = opts.id;
+    this.shellPath = opts.shellPath;
+    this.cols = opts.cols;
+    this.rows = opts.rows;
+    this.cwd = opts.cwd;
+    this.maxBufferBytes = opts.maxBufferBytes;
+    this.onOutput = opts.onOutput;
   }
 
-  getWorkspaceRoot(): string {
-    return this.workingDirectory;
+  setCwd(cwd: string): void {
+    this.cwd = cwd;
   }
 
-  getAllowedRoots(): string[] {
-    return [...this.allowedRoots];
-  }
-
-  isPathAllowed(candidate: string): boolean {
-    return isPathInsideAnyRoot(
-      this.allowedRoots,
-      candidate,
-      this.workingDirectory,
-    );
-  }
-
-  /**
-   * After human approval: allow this folder and switch the shell cwd into it.
-   * Access outside the allowlist remains blocked.
-   */
-  grantFolderAccess(folderPath: string): string {
-    const resolved = path.resolve(folderPath);
-    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-      throw new Error(`Not a directory: ${resolved}`);
-    }
-    let real = resolved;
-    try {
-      real = fs.realpathSync(resolved);
-    } catch {
-      /* use resolved */
-    }
-    if (!this.allowedRoots.some((r) => path.resolve(r) === real)) {
-      this.allowedRoots.push(real);
-    }
-    this.workingDirectory = real;
-    // Restart PTY so the next command starts in the granted folder.
-    this.resetSession();
-    return real;
-  }
-
-  private resetSession(): void {
+  kill(): void {
     if (this.term) {
       try {
         this.term.kill();
@@ -146,23 +117,20 @@ export class PtySandbox extends BaseSandbox {
     this.buffer = "";
   }
 
-  private ensureSession(): pty.IPty {
-    if (this.disposed) {
-      throw new Error("PtySandbox has been disposed");
-    }
+  ensure(): pty.IPty {
     if (this.term) return this.term;
 
     const term = pty.spawn(this.shellPath, [], {
       name: "xterm-256color",
       cols: this.cols,
       rows: this.rows,
-      cwd: this.workingDirectory,
+      cwd: this.cwd,
       env: {
         ...process.env,
         TERM: "xterm-256color",
-        // Avoid interactive pagers hanging the agent by default
         PAGER: "cat",
         GIT_PAGER: "cat",
+        AGENT_PTY_SLOT: String(this.id),
       } as Record<string, string>,
     });
 
@@ -182,32 +150,194 @@ export class PtySandbox extends BaseSandbox {
     return term;
   }
 
-  /**
-   * Write raw stdin to the active PTY (for answering [y/N] prompts).
-   */
-  writeStdin(data: string): void {
-    const term = this.ensureSession();
-    term.write(data);
+  write(data: string): void {
+    this.ensure().write(data);
   }
 
-  async execute(command: string): Promise<ExecuteResponse> {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const previous = this.executeQueue;
-    this.executeQueue = gate;
-    await previous;
+  bufferLength(): number {
+    return this.buffer.length;
+  }
+
+  bufferSlice(start: number): string {
+    return this.buffer.slice(start);
+  }
+
+  signalEscalate(): void {
+    if (!this.term) return;
     try {
-      return await this.executeSerialized(command);
-    } finally {
-      release();
+      this.term.write("\x03");
+    } catch {
+      /* ignore */
+    }
+    setTimeout(() => {
+      try {
+        this.term?.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+    }, 1500);
+  }
+}
+
+/**
+ * Persistent PTY-backed sandbox for Deep Agents.
+ * Pool of interactive shells (default 3) so independent execute() calls can run in parallel.
+ * cwd/env persist per slot across commands; grantFolderAccess restarts all slots.
+ */
+export class PtySandbox extends BaseSandbox {
+  readonly id: string;
+  private workingDirectory: string;
+  private allowedRoots: string[];
+  private readonly timeoutMs: number;
+  private readonly shellPath: string;
+  private readonly cols: number;
+  private readonly rows: number;
+  private readonly autoApproveDestructive: boolean;
+  private readonly onOutput?: (chunk: string) => void;
+  private readonly poolSize: number;
+  private readonly sessions: PtySession[];
+  private readonly waitQueue: Array<(session: PtySession) => void> = [];
+  private lastSession: PtySession | null = null;
+
+  private commandSeq = 0;
+  private disposed = false;
+  private readonly maxBufferBytes = 10 * 1024 * 1024;
+  private readonly minTimeoutMs = 5_000;
+  private readonly maxTimeoutMs = 10 * 60 * 1000;
+
+  constructor(options: PtySandboxOptions) {
+    super();
+    this.workingDirectory = path.resolve(options.workingDirectory);
+    this.allowedRoots = [this.workingDirectory];
+    this.timeoutMs = options.timeoutMs ?? Number(process.env.PTY_TIMEOUT_MS ?? 60_000);
+    this.shellPath = options.shell ?? defaultShell();
+    this.cols = options.cols ?? 120;
+    this.rows = options.rows ?? 40;
+    this.autoApproveDestructive = options.autoApproveDestructive ?? false;
+    this.onOutput = options.onOutput;
+    this.poolSize = resolvePoolSize(options.poolSize);
+    this.id = `pty-${this.workingDirectory.replace(/[^a-zA-Z0-9]/g, "-")}`;
+
+    if (!fs.existsSync(this.workingDirectory)) {
+      fs.mkdirSync(this.workingDirectory, { recursive: true });
+    }
+
+    this.sessions = Array.from({ length: this.poolSize }, (_, i) =>
+      this.createSession(i),
+    );
+  }
+
+  getPoolSize(): number {
+    return this.poolSize;
+  }
+
+  private createSession(id: number): PtySession {
+    return new PtySession({
+      id,
+      shellPath: this.shellPath,
+      cols: this.cols,
+      rows: this.rows,
+      cwd: this.workingDirectory,
+      maxBufferBytes: this.maxBufferBytes,
+      onOutput: this.onOutput,
+    });
+  }
+
+  getWorkspaceRoot(): string {
+    return this.workingDirectory;
+  }
+
+  getAllowedRoots(): string[] {
+    return [...this.allowedRoots];
+  }
+
+  isPathAllowed(candidate: string): boolean {
+    return isPathInsideAnyRoot(
+      this.allowedRoots,
+      candidate,
+      this.workingDirectory,
+    );
+  }
+
+  /**
+   * After human approval: allow this folder and switch all shell cwds into it.
+   */
+  grantFolderAccess(folderPath: string): string {
+    const resolved = path.resolve(folderPath);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      throw new Error(`Not a directory: ${resolved}`);
+    }
+    let real = resolved;
+    try {
+      real = fs.realpathSync(resolved);
+    } catch {
+      /* use resolved */
+    }
+    if (!this.allowedRoots.some((r) => path.resolve(r) === real)) {
+      this.allowedRoots.push(real);
+    }
+    this.workingDirectory = real;
+    this.resetAllSessions();
+    return real;
+  }
+
+  private resetAllSessions(): void {
+    for (const session of this.sessions) {
+      session.kill();
+      session.setCwd(this.workingDirectory);
     }
   }
 
-  private async executeSerialized(command: string): Promise<ExecuteResponse> {
-    // Parse optional JSON payload first, then guard the resolved shell command.
-    // Payload shape: {"command":"...","stdin":"y\n","background":true,"timeoutMs":...}
+  private async acquireSession(): Promise<PtySession> {
+    if (this.disposed) {
+      throw new Error("PtySandbox has been disposed");
+    }
+    const free = this.sessions.find((s) => !s.busy);
+    if (free) {
+      free.busy = true;
+      this.lastSession = free;
+      return free;
+    }
+    return new Promise<PtySession>((resolve) => {
+      this.waitQueue.push((session) => {
+        this.lastSession = session;
+        resolve(session);
+      });
+    });
+  }
+
+  private releaseSession(session: PtySession): void {
+    const next = this.waitQueue.shift();
+    if (next) {
+      // Keep busy=true; hand off to waiter.
+      next(session);
+      return;
+    }
+    session.busy = false;
+  }
+
+  /**
+   * Write raw stdin to the last-used (or first) PTY slot — for answering [y/N] prompts.
+   */
+  writeStdin(data: string): void {
+    const session = this.lastSession ?? this.sessions[0];
+    if (!session) throw new Error("No PTY session available");
+    session.write(data);
+  }
+
+  async execute(command: string): Promise<ExecuteResponse> {
+    const session = await this.acquireSession();
+    try {
+      return await this.executeOnSession(session, command);
+    } finally {
+      this.releaseSession(session);
+    }
+  }
+
+  private async executeOnSession(
+    session: PtySession,
+    command: string,
+  ): Promise<ExecuteResponse> {
     let cmd = command;
     let stdin: string | undefined;
     let background = false;
@@ -273,53 +403,66 @@ export class PtySandbox extends BaseSandbox {
     }
 
     if (background) {
-      return this.executeBackground(cmd);
+      return this.executeBackground(session, cmd);
     }
 
-    const term = this.ensureSession();
+    session.ensure();
     this.commandSeq += 1;
-    const marker = `__AGENT_EXIT_${this.commandSeq}_${Date.now()}__`;
-    const startLen = this.buffer.length;
+    const marker = `__AGENT_EXIT_${session.id}_${this.commandSeq}_${Date.now()}__`;
+    const startLen = session.bufferLength();
 
-    // Run command then print a unique exit marker the agent can detect.
-    // Works for bash/zsh; PowerShell users should set PTY_SHELL accordingly.
     const wrapped =
       process.platform === "win32"
         ? `${cmd}\r\necho ${marker}$LASTEXITCODE\r\n`
         : `${cmd}\necho "${marker}$?"\n`;
 
-    term.write(wrapped);
+    session.write(wrapped);
     if (stdin) {
-      term.write(stdin.endsWith("\n") ? stdin : `${stdin}\n`);
+      session.write(stdin.endsWith("\n") ? stdin : `${stdin}\n`);
     }
 
-    return this.waitForMarker(marker, startLen, timeoutMs);
+    return this.waitForMarker(session, marker, startLen, timeoutMs);
   }
 
-  private async executeBackground(cmd: string): Promise<ExecuteResponse> {
-    const term = this.ensureSession();
-    const startLen = this.buffer.length;
+  private async executeBackground(
+    session: PtySession,
+    cmd: string,
+  ): Promise<ExecuteResponse> {
+    session.ensure();
+    const startLen = session.bufferLength();
     const bg =
       process.platform === "win32"
         ? `Start-Process -NoNewWindow -FilePath cmd -ArgumentList '/c ${cmd.replace(/'/g, "''")}'\r\n`
         : `( ${cmd} ) >/tmp/agent-bg-$$.log 2>&1 &\necho "__BG_PID_$!__"\n`;
-    term.write(bg);
+    session.write(bg);
 
     await sleep(500);
-    const slice = this.buffer.slice(startLen);
+    const slice = session.bufferSlice(startLen);
+    const pidMatch = slice.match(/__BG_PID_(\d+)__/);
+    if (pidMatch) {
+      registerPtyBackgroundProcess({
+        pid: Number(pidMatch[1]),
+        command: cmd,
+        slot: session.id,
+      });
+    }
     const { text, truncated } = truncateOutput(slice);
     return {
       output: [
-        `Started background command: ${cmd}`,
+        `Started background command on PTY slot ${session.id}: ${cmd}`,
+        pidMatch ? `Registered PID ${pidMatch[1]} in process_manage list.` : "",
         text,
-        "Note: process is running in the PTY session; check logs / poll as needed.",
-      ].join("\n"),
+        "Note: process is running in this PTY session; check logs / poll as needed.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
       exitCode: 0,
       truncated,
     };
   }
 
   private waitForMarker(
+    session: PtySession,
     marker: string,
     startLen: number,
     timeoutMs: number,
@@ -340,19 +483,18 @@ export class PtySandbox extends BaseSandbox {
       };
 
       const hardTimer = setTimeout(() => {
-        this.signalEscalate();
-        const raw = this.buffer.slice(startLen);
+        session.signalEscalate();
+        const raw = session.bufferSlice(startLen);
         const { text, truncated } = truncateOutput(
-          `${raw}\n[Command timed out after ${timeoutMs}ms; sent SIGINT/SIGTERM]`,
+          `${raw}\n[Command timed out after ${timeoutMs}ms on PTY slot ${session.id}; sent SIGINT/SIGTERM]`,
         );
         finish({ output: text, exitCode: null, truncated });
       }, timeoutMs);
 
       const poll = setInterval(() => {
-        const slice = this.buffer.slice(startLen);
+        const slice = session.bufferSlice(startLen);
         const idx = slice.lastIndexOf(marker);
         if (idx !== -1) {
-          // Expect markerEXITCODE at end of a line
           const after = slice.slice(idx + marker.length);
           const m = after.match(/^(\d+)/);
           if (m) {
@@ -373,18 +515,18 @@ export class PtySandbox extends BaseSandbox {
           }
         }
 
-        if (this.buffer.length !== lastLen) {
-          lastLen = this.buffer.length;
+        if (session.bufferLength() !== lastLen) {
+          lastLen = session.bufferLength();
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
-            const current = this.buffer.slice(startLen).trimEnd();
+            const current = session.bufferSlice(startLen).trimEnd();
             if (!awaitingNotified && AWAITING_INPUT_RE.test(current)) {
               awaitingNotified = true;
               const { text, truncated } = truncateOutput(
                 [
                   current,
                   "",
-                  "[awaitingInput] The PTY appears to be waiting for interactive input.",
+                  `[awaitingInput] PTY slot ${session.id} appears to be waiting for interactive input.`,
                   'Provide stdin on the next execute call as JSON: {"command":"...","stdin":"y"}',
                   "or answer the prompt yourself.",
                 ].join("\n"),
@@ -395,22 +537,6 @@ export class PtySandbox extends BaseSandbox {
         }
       }, 100);
     });
-  }
-
-  private signalEscalate(): void {
-    if (!this.term) return;
-    try {
-      this.term.write("\x03"); // SIGINT via Ctrl-C
-    } catch {
-      /* ignore */
-    }
-    setTimeout(() => {
-      try {
-        this.term?.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
-    }, 1500);
   }
 
   async uploadFiles(
@@ -495,12 +621,10 @@ export class PtySandbox extends BaseSandbox {
 
   dispose(): void {
     this.disposed = true;
-    try {
-      this.term?.kill();
-    } catch {
-      /* ignore */
+    for (const session of this.sessions) {
+      session.kill();
     }
-    this.term = null;
+    this.waitQueue.length = 0;
   }
 }
 
@@ -529,7 +653,6 @@ function stripPtyChrome(raw: string): string {
     if (t.startsWith("For more details, please visit")) return false;
     return true;
   });
-  // Drop leading echoed command lines that only restate the wrapped invoke
   while (
     filtered.length &&
     (/^echo "__AGENT_EXIT_/.test(filtered[0]!.trim()) ||

@@ -22,8 +22,26 @@ import {
 } from "./context-policy.js";
 import { createSpecialistSubagents } from "./subagents.js";
 import { createNormalizeAiMessageMiddleware } from "./normalize-middleware.js";
+import { createCapabilityFilterMiddleware } from "./capability-filter-middleware.js";
+import {
+  createBotScopeController,
+  createBotScopeMiddleware,
+  type BotScopeController,
+} from "./bot-scope-middleware.js";
+import {
+  buildDisabledSkillPermissions,
+  filterToolsByCapability,
+  resolveCapabilityFilter,
+} from "./capabilities-catalog.js";
 import { createWorkspaceAccessTools } from "./workspace-access.js";
 import { createTaskTools } from "./task-tools.js";
+import { createWebTools } from "./web-tools.js";
+import { createOrchestrationTools } from "./orchestration.js";
+import { createSkillManagementTools } from "./skill-manage.js";
+import { createProcessManagementTools } from "./process-manage.js";
+import { createVaultManagementTools } from "./vault-manage.js";
+import { createPlaywrightTools } from "./playwright-tools.js";
+import { createVisionTools } from "./vision-tools.js";
 import {
   createDesktopTools,
   isDesktopAutomationEnabled,
@@ -47,6 +65,11 @@ export const SKILLS_DIR_RELATIVE = path.join(".agent", "skills");
 export type CreateAgentOptions = {
   workspaceRoot: string;
   autoApprove?: boolean;
+  /**
+   * Interrupt before `task_todos` so the UI can show the plan and require
+   * explicit Approve before execution continues. Independent of autoApprove.
+   */
+  requirePlanApproval?: boolean;
   onPtyOutput?: (chunk: string) => void;
   enableCheckpointer?: boolean;
   /** Auto-reflect after turns (default true). */
@@ -76,6 +99,8 @@ export type AgentBundle = {
   contextPolicy: string;
   enableReflection: boolean;
   desktopEnabled: boolean;
+  /** Mutable allowlist for specialized bot sessions (null = general / all tools). */
+  botScope: BotScopeController;
 };
 
 export async function createTerminalAgent(
@@ -159,40 +184,80 @@ export async function createTerminalAgent(
 
   const desktopEnabled =
     isDesktopAutomationEnabled() && isDesktopAutomationSupported();
+  const capabilityFilter = resolveCapabilityFilter(workspaceRoot);
   const desktopTools = desktopEnabled
     ? createDesktopTools(workspaceRoot)
     : [];
 
+  const customTools = filterToolsByCapability(
+    [
+      ...createMemoryTools(memoryStore, workspaceRoot, embedder),
+      ...createWorkspaceAccessTools(sandbox),
+      ...createTaskTools(workspaceRoot),
+      ...createWebTools(),
+      ...createOrchestrationTools(),
+      ...createSkillManagementTools(workspaceRoot),
+      ...createProcessManagementTools(),
+      ...createVaultManagementTools(workspaceRoot),
+      ...createPlaywrightTools(),
+      ...createVisionTools(),
+      ...desktopTools,
+    ],
+    capabilityFilter.disabledToolNames,
+  );
+
+  const capabilityFilterMw = createCapabilityFilterMiddleware(
+    capabilityFilter.disabledToolNames,
+  );
+  const botScope = createBotScopeController();
+  const botScopeMw = createBotScopeMiddleware(botScope);
+  const skillPermissions = buildDisabledSkillPermissions(
+    capabilityFilter.disabledSkillFolders,
+  );
+
   // wrapModelCall order (last = closest to model):
-  // summarization → fileMemory → longTerm → normalize → model
+  // summarization → fileMemory → longTerm → normalize → capabilityFilter → botScope → model
   // Skills are NOT auto-injected: agent must ls /skills/ and read only what it needs.
+  const requirePlanApproval = options.requirePlanApproval !== false;
+  const interruptOn: Record<string, boolean> = {
+    ...(requirePlanApproval ? { task_todos: true } : {}),
+    ...(options.autoApprove
+      ? {}
+      : {
+          execute: true,
+          edit_file: true,
+          write_file: true,
+          request_folder_access: true,
+          ...(desktopEnabled
+            ? {
+                desktop_automate: true,
+                request_desktop_app_access: true,
+                computer_screenshot: true,
+                computer_click: true,
+                computer_type: true,
+                computer_key: true,
+              }
+            : {}),
+        }),
+  };
+
   const agent = await Promise.resolve(
     createDeepAgent({
       model,
       systemPrompt: SYSTEM_PROMPT,
       backend,
-      interruptOn: options.autoApprove
-        ? undefined
-        : {
-            execute: true,
-            edit_file: true,
-            write_file: true,
-            request_folder_access: true,
-            ...(desktopEnabled
-              ? {
-                  desktop_automate: true,
-                  request_desktop_app_access: true,
-                }
-              : {}),
-          },
-      tools: [
-        ...createMemoryTools(memoryStore, workspaceRoot, embedder),
-        ...createWorkspaceAccessTools(sandbox),
-        ...createTaskTools(workspaceRoot),
-        ...desktopTools,
-      ],
+      permissions: skillPermissions.length ? skillPermissions : undefined,
+      interruptOn: Object.keys(interruptOn).length ? interruptOn : undefined,
+      tools: customTools,
       subagents: createSpecialistSubagents(),
-      middleware: [summarization, fileMemory, longTerm, normalize],
+      middleware: [
+        summarization,
+        fileMemory,
+        longTerm,
+        normalize,
+        capabilityFilterMw,
+        botScopeMw,
+      ],
       checkpointer: options.enableCheckpointer
         ? createPersistentCheckpointer(workspaceRoot)
         : undefined,
@@ -211,5 +276,6 @@ export async function createTerminalAgent(
     contextPolicy: describeContextPolicy(),
     enableReflection: options.enableReflection ?? true,
     desktopEnabled,
+    botScope,
   };
 }

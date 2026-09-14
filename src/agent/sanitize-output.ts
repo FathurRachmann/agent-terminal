@@ -52,6 +52,20 @@ export function looksLikeIncompleteReasoning(text: string): boolean {
   return false;
 }
 
+/** Router/provider notices (model sunset, switch model, Antigravity, etc.). */
+export function looksLikeProviderNotice(text: string): boolean {
+  const t = stripThinkBlocks(text).trim();
+  if (!t || t.length > 1200) return false;
+  return /\b(no longer available|model.*deactivated|model.*not found|switch to.*model|please switch|upgraded version|sunset|retired|antigravity)\b/i.test(
+    t,
+  );
+}
+
+/** Prefer reasoning-panel styling over a chat bubble. */
+export function shouldRenderAsReasoning(text: string): boolean {
+  return looksLikeProviderNotice(text) || looksLikeIncompleteReasoning(text);
+}
+
 export function sanitizeAssistantText(text: string): string {
   return stripThinkBlocks(text);
 }

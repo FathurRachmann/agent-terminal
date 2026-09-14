@@ -13,6 +13,7 @@ import {
 } from "../memory/reflection.js";
 import {
   looksLikeIncompleteReasoning,
+  looksLikeProviderNotice,
   sanitizeAssistantText,
 } from "../agent/sanitize-output.js";
 import { contentLooksLikeTextToolCall } from "../agent/parse-text-tool-calls.js";
@@ -46,9 +47,19 @@ export type MemoryRuntime = {
   enableReflection?: boolean;
 };
 
+import {
+  extractInterruptActionNames,
+  isPlanApprovalInterrupt,
+} from "../agent/interrupt-utils.js";
+
 export type ApprovalDecision = {
   decisions: Array<{ type: "approve" | "reject" }>;
 };
+
+export {
+  extractInterruptActionNames,
+  isPlanApprovalInterrupt,
+} from "../agent/interrupt-utils.js";
 
 export type RunAgentOptions = {
   agent: DeepAgent;
@@ -68,6 +79,11 @@ export type RunAgentOptions = {
    * and call desktop_automate directly (models often refuse computer control).
    */
   desktopEnabled?: boolean;
+  /**
+   * Specialized bot scope instruction. Injected into the LLM turn only —
+   * the transcript stores the raw user `prompt`.
+   */
+  botInstruction?: string;
 };
 
 export type AgentPhase =
@@ -167,9 +183,101 @@ function emit(
   onEvent?.(event);
 }
 
+/** Activity events worth keeping in session.jsonl (skip token/reasoning spam). */
+function shouldPersistActivity(event: AgentUiEvent): boolean {
+  switch (event.type) {
+    case "tool_start":
+    case "tool_end":
+    case "warning":
+    case "error":
+    case "interrupt":
+    case "context_compacted":
+    case "reflection":
+      return true;
+    case "status":
+      return event.phase !== "thinking" && event.phase !== "reasoning";
+    default:
+      return false;
+  }
+}
+
+function sanitizeEventForPersist(event: AgentUiEvent): AgentUiEvent {
+  if (event.type === "tool_start") {
+    return {
+      type: "tool_start",
+      name: event.name,
+      input: truncate(event.input, 1200),
+    };
+  }
+  if (event.type === "tool_end") {
+    return {
+      type: "tool_end",
+      name: event.name,
+      output: truncate(event.output, 1200),
+    };
+  }
+  if (event.type === "interrupt") {
+    return {
+      type: "interrupt",
+      payload: truncate(event.payload, 1200),
+    };
+  }
+  if (event.type === "error") {
+    return { type: "error", message: truncate(event.message, 800) };
+  }
+  if (event.type === "warning") {
+    return { type: "warning", message: truncate(event.message, 800) };
+  }
+  return event;
+}
+
+function activitySummary(event: AgentUiEvent): string {
+  switch (event.type) {
+    case "tool_start":
+      return `tool_start:${event.name}`;
+    case "tool_end":
+      return `tool_end:${event.name}`;
+    case "status":
+      return `status:${event.phase}:${event.detail}`;
+    case "warning":
+      return `warning:${event.message}`;
+    case "error":
+      return `error:${event.message}`;
+    case "interrupt":
+      return "interrupt";
+    case "context_compacted":
+      return `context_compacted:${event.detail}`;
+    case "reflection":
+      return `reflection:${event.memoryIds.join(",")}`;
+    default:
+      return event.type;
+  }
+}
+
+/** Append durable activity row so Live activity can restore after reload. */
+export function persistActivityEvent(
+  store: SessionStore | undefined,
+  threadId: string,
+  event: AgentUiEvent,
+): void {
+  if (!store || !shouldPersistActivity(event)) return;
+  const uiEvent = sanitizeEventForPersist(event);
+  store.appendTranscript({
+    threadId,
+    role: "tool",
+    content: activitySummary(uiEvent),
+    meta: { uiEvent },
+  });
+}
+
 function truncate(value: unknown, max = 240): string {
-  const text =
-    typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
+  let text: string;
+  try {
+    text =
+      typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
+  } catch {
+    text = String(value);
+  }
   const oneLine = text.replace(/\s+/g, " ").trim();
   return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
@@ -307,11 +415,29 @@ async function runOnce(
   return { result, streamedText: "" };
 }
 
+const RETRY_MAX = 3;
+const RETRY_DELAY_MS = 3_000;
+
+function isModelAvailabilityError(text: string): boolean {
+  return looksLikeProviderNotice(text);
+}
+
 export async function runAgentTurn(
   options: RunAgentOptions,
 ): Promise<string> {
   const threadId = options.threadId ?? `thread-${Date.now()}`;
   const mem = options.memory;
+  const userOnEvent = options.onEvent;
+  const onEvent: RunAgentOptions["onEvent"] = (event) => {
+    try {
+      persistActivityEvent(mem?.sessionStore, threadId, event);
+    } catch {
+      // Persist must never break the live UI stream.
+    }
+    userOnEvent?.(event);
+  };
+  options = { ...options, threadId, onEvent };
+
   const config = {
     configurable: { thread_id: threadId },
     recursionLimit: 80,
@@ -334,11 +460,16 @@ export async function runAgentTurn(
     return desktopPrep.answer;
   }
 
+  const scopedUserPrompt = options.botInstruction
+    ? `${options.botInstruction}\n\n[USER]\n${options.prompt}`
+    : options.prompt;
+
   let finalText = "";
+  let retryCount = 0;
   let inputPayload: Record<string, unknown> | Command = desktopPrep
     ? {
         messages: [
-          { role: "user", content: options.prompt },
+          { role: "user", content: scopedUserPrompt },
           {
             role: "assistant",
             content: desktopPrep.openedSummary,
@@ -347,7 +478,7 @@ export async function runAgentTurn(
         ],
       }
     : {
-        messages: [{ role: "user", content: options.prompt }],
+        messages: [{ role: "user", content: scopedUserPrompt }],
       };
 
   try {
@@ -360,22 +491,28 @@ export async function runAgentTurn(
       );
       const interrupt = getInterruptPayload(result);
       if (interrupt) {
+        const planGate = isPlanApprovalInterrupt(interrupt);
         emit(options.onEvent, {
           type: "status",
           phase: "waiting_approval",
-          detail: "human approval required",
+          detail: planGate
+            ? "plan approval required"
+            : "human approval required",
         });
         emit(options.onEvent, { type: "interrupt", payload: interrupt });
         mem?.sessionStore.appendTranscript({
           threadId,
           role: "interrupt",
           content: JSON.stringify(interrupt).slice(0, 4000),
+          meta: planGate ? { kind: "plan_approval" } : undefined,
         });
-        const resumeValue = options.autoApprove
-          ? { decisions: [{ type: "approve" as const }] }
-          : options.requestApproval
-            ? await options.requestApproval(interrupt)
-            : await promptApproval(interrupt);
+        // Plan gate always needs an explicit UI/stdin decision — never silent autoApprove.
+        const resumeValue =
+          options.autoApprove && !planGate
+            ? { decisions: [{ type: "approve" as const }] }
+            : options.requestApproval
+              ? await options.requestApproval(interrupt)
+              : await promptApproval(interrupt);
         inputPayload = new Command({ resume: resumeValue });
         continue;
       }
@@ -405,6 +542,22 @@ export async function runAgentTurn(
           message:
             "Model returned unfinished reasoning instead of a final answer. Retry or switch AGENT_MODEL.",
         });
+      }
+
+      // Auto-retry on model availability errors (e.g. "Gemini 3.5 Flash is no longer available")
+      if (finalText && isModelAvailabilityError(finalText)) {
+        retryCount++;
+        if (retryCount <= RETRY_MAX) {
+          emit(options.onEvent, {
+            type: "warning",
+            message: `Model unavailable (attempt ${retryCount}/${RETRY_MAX}). Retrying in ${RETRY_DELAY_MS / 1000}s…`,
+          });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          // Re-use same input payload (fresh user message) so the model re-reads the request
+          finalText = "";
+          continue;
+        }
+        // Exhausted retries — fall through and return the error as-is
       }
       break;
     }

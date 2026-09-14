@@ -12,6 +12,9 @@ dist/
 # postinstall. Schema is applied automatically; your chats stay local.
 .agent/session.json
 .agent/desktop-allowlist.json
+.agent/settings.json
+.agent/bots.json
+.agent/capabilities-prefs.json
 .agent/context/**
 !.agent/context/.gitkeep
 .agent/task/**
@@ -21,6 +24,7 @@ dist/
 !.agent/memory/README.md
 # Personal guidelines mirror (synced from local SQLite). Starter is AGENTS.md.example
 .agent/AGENTS.md
+.agent/.native-abi
 
 # Generated / local tooling
 graphify-out/
@@ -30,3 +34,4 @@ sandbox-workspace/
 .tmp-pty-test/
 .tmp/
 coverage/
+working

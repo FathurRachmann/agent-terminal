@@ -173,6 +173,38 @@ describe("SessionStore (persistent raw history)", () => {
     assert.equal(events[0]?.role, "user");
     assert.ok(fs.existsSync(path.join(dir, ".agent", "memory", "config-snapshot.json")));
   });
+
+  it("stores tool activity with uiEvent meta for reload", () => {
+    sessions.appendTranscript({
+      threadId: "t1",
+      role: "tool",
+      content: "tool_start:execute",
+      meta: {
+        uiEvent: {
+          type: "tool_start",
+          name: "execute",
+          input: { command: "ls" },
+        },
+      },
+    });
+    sessions.appendTranscript({
+      threadId: "t1",
+      role: "tool",
+      content: "tool_end:execute",
+      meta: {
+        uiEvent: {
+          type: "tool_end",
+          name: "execute",
+          output: "ok",
+        },
+      },
+    });
+    const events = sessions.readTranscript("t1");
+    const tools = events.filter((e) => e.role === "tool");
+    assert.ok(tools.length >= 2);
+    const last = tools[tools.length - 1];
+    assert.equal((last?.meta?.uiEvent as { type?: string })?.type, "tool_end");
+  });
 });
 
 describe("PersistentMemoryStore + embeddings", () => {

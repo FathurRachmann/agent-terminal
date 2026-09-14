@@ -106,18 +106,22 @@ export async function runDesktopAction(
         return { ok: true, message: `Frontmost app: ${name}` };
       }
       case "open_app":
-      case "activate_app": {
-        const app = requireApp(workspaceRoot, input.app);
-        if (!app.ok) return app;
-        const msg =
-          input.action === "open_app"
-            ? await openApplication(app.name)
-            : await activateApplication(app.name);
-        return { ok: true, message: msg };
-      }
+            case "activate_app": {
+              const appRes = requireApp(workspaceRoot, input.app);
+              if (!appRes.ok) return appRes;
+              // appRes is guaranteed { ok: true; name: string } here
+              const { name } = appRes as { ok: true; name: string };
+              const msg =
+                input.action === "open_app"
+                  ? await openApplication(name)
+                  : await activateApplication(name);
+              return { ok: true, message: msg };
+            }
       case "open_url": {
-        const app = requireApp(workspaceRoot, input.app ?? "Google Chrome");
-        if (!app.ok) return app;
+        const appRes = requireApp(workspaceRoot, input.app ?? "Google Chrome");
+        if (!appRes.ok) return appRes;
+        // appRes is guaranteed { ok: true; name: string } here
+        const { name } = appRes as { ok: true; name: string };
         const url = input.url?.trim() ?? "";
         if (!url) {
           return { ok: false, message: "open_url requires url" };
@@ -126,12 +130,14 @@ export async function runDesktopAction(
         if (!urlCheck.ok) {
           return { ok: false, message: urlCheck.reason };
         }
-        const msg = await openUrlInApp(app.name, url);
+        const msg = await openUrlInApp(name, url);
         return { ok: true, message: msg };
       }
       case "keystroke": {
-        const app = requireApp(workspaceRoot, input.app ?? "Google Chrome");
-        if (!app.ok) return app;
+        const appRes = requireApp(workspaceRoot, input.app ?? "Google Chrome");
+        if (!appRes.ok) return appRes;
+        // appRes is guaranteed { ok: true; name: string } here
+        const { name } = appRes as { ok: true; name: string };
         const text = input.text ?? "";
         if (!text) {
           return { ok: false, message: "keystroke requires text" };
@@ -144,17 +150,20 @@ export async function runDesktopAction(
         }
         const mods = normalizeModifiers(input.modifiers);
         if (!mods.ok) return mods;
+        const { modifiers } = mods as { ok: true; modifiers: KeyModifier[] };
         const msg = await sendKeystroke({
-          appName: app.name,
+          appName: name,
           text,
-          modifiers: mods.modifiers,
+          modifiers,
         });
         return { ok: true, message: msg };
       }
       case "youtube_play_first": {
-        const app = requireApp(workspaceRoot, input.app ?? "Google Chrome");
-        if (!app.ok) return app;
-        const msg = await chromeClickFirstYoutubeResult(app.name);
+        const appRes = requireApp(workspaceRoot, input.app ?? "Google Chrome");
+        if (!appRes.ok) return appRes;
+        // appRes is guaranteed { ok: true; name: string } here
+        const { name } = appRes as { ok: true; name: string };
+        const msg = await chromeClickFirstYoutubeResult(name);
         return { ok: true, message: msg };
       }
       default: {

@@ -3,10 +3,7 @@
  * Converts jammed markdown into spaced plain text with real line breaks.
  */
 export function formatAgentDisplayText(raw: string): string {
-  let text = raw
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<\/?think>/gi, "")
-    .trim();
+  let text = raw.trim();
 
   if (!text) return "";
 

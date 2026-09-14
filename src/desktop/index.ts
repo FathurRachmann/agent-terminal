@@ -24,6 +24,7 @@ export {
   type KeyModifier,
 } from "./macos.js";
 export { createDesktopTools } from "./tools.js";
+export { createComputerUseTools } from "./computer-use.js";
 export { parseDesktopIntent, type DesktopIntent } from "./intent.js";
 export {
   enrichDesktopIntent,

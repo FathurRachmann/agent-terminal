@@ -59,7 +59,8 @@ Call \`task_plan\` with:
 ## Next
 
 1. `task_todos` — break approach into atomic todos
-2. Execute with `task_todo_update` (in_progress → completed)
-3. `task_verify` against this plan
+2. If ≥3 independent slices: `delegate_task` (≥3 workers) or multiple `task` calls in one turn
+3. Execute remaining dependent steps with `task_todo_update` (in_progress → completed)
+4. `task_verify` against this plan
 
 Trivial exceptions: user says "skip plan / langsung implement", or pure chit-chat / single desktop open.
