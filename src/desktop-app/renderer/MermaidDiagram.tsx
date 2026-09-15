@@ -1,46 +1,18 @@
-import React, { useEffect, useId, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
+import {
+  copyMermaidSourceAsImage,
+  copySvgAsImage,
+  copySvgElementAsImage,
+  copyText,
+} from "./clipboard.js";
 import { CodeBlock } from "./CodeBlock.js";
+import { CopyButton } from "./CopyButton.js";
+import { loadMermaid, renderMermaidForExport } from "./mermaid-loader.js";
 
 type Props = {
   code: string;
   filename?: string;
 };
-
-let mermaidReady: Promise<typeof import("mermaid").default> | null = null;
-
-function loadMermaid() {
-  if (!mermaidReady) {
-    mermaidReady = import("mermaid").then((mod) => {
-      const mermaid = mod.default;
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        theme: "dark",
-        fontFamily: "IBM Plex Sans, Segoe UI, system-ui, sans-serif",
-        themeVariables: {
-          darkMode: true,
-          background: "#0d1117",
-          primaryColor: "#1f6feb",
-          primaryTextColor: "#e7ecf3",
-          primaryBorderColor: "#388bfd",
-          lineColor: "#8b98a8",
-          secondaryColor: "#161b22",
-          tertiaryColor: "#121821",
-          noteBkgColor: "#151c27",
-          noteTextColor: "#e7ecf3",
-          textColor: "#e7ecf3",
-          actorBkg: "#161b22",
-          actorBorder: "#58a6ff",
-          actorTextColor: "#e7ecf3",
-          signalColor: "#8b98a8",
-          signalTextColor: "#e7ecf3",
-        },
-      });
-      return mermaid;
-    });
-  }
-  return mermaidReady;
-}
 
 export function looksLikeMermaid(code: string): boolean {
   const t = code.trim();
@@ -52,6 +24,7 @@ export function looksLikeMermaid(code: string): boolean {
 /** Renders Mermaid source as a visual diagram (SVG). Source stays in .md fences. */
 export function MermaidDiagram({ code, filename }: Props) {
   const reactId = useId().replace(/:/g, "");
+  const svgHostRef = useRef<HTMLDivElement>(null);
   const [layer, setLayer] = useState<"diagram" | "source">("diagram");
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -85,6 +58,17 @@ export function MermaidDiagram({ code, filename }: Props) {
     };
   }, [trimmed, reactId]);
 
+  const copyPreview = async () => {
+    const ok = await copyMermaidSourceAsImage(trimmed, renderMermaidForExport);
+    if (ok) return true;
+    const live = svgHostRef.current?.querySelector("svg");
+    if (live) {
+      const fromDom = await copySvgElementAsImage(live);
+      if (fromDom) return true;
+    }
+    return svg ? copySvgAsImage(svg) : false;
+  };
+
   return (
     <div className="mb-3 overflow-hidden rounded-[10px] border border-[#2a313c] bg-[#0d1117] shadow-[0_8px_24px_rgba(0,0,0,0.28)]">
       <div className="flex items-center justify-between gap-2 border-b border-[#2a313c] bg-gradient-to-b from-[#161b22] to-[#12171e] px-3 py-2">
@@ -116,11 +100,23 @@ export function MermaidDiagram({ code, filename }: Props) {
               {label}
             </button>
           ))}
+          <CopyButton
+            className="ml-0.5"
+            title={
+              layer === "diagram"
+                ? "Copy diagram as image"
+                : "Copy Mermaid source"
+            }
+            disabled={layer === "diagram" && (!svg || busy)}
+            onCopy={() =>
+              layer === "diagram" ? copyPreview() : copyText(trimmed)
+            }
+          />
         </div>
       </div>
 
       {layer === "diagram" ? (
-        <div className="max-h-[480px] overflow-auto bg-[#0d1117] p-3">
+        <div className="bg-[#0d1117] p-3">
           {busy && (
             <div className="py-6 text-center text-[11px] text-muted">
               Rendering diagram…
@@ -131,8 +127,10 @@ export function MermaidDiagram({ code, filename }: Props) {
               Gagal render Mermaid: {error}
             </div>
           )}
+          {/* SAFE: svg from mermaid.render with securityLevel:"strict" (DOMPurify). */}
           {!busy && svg && (
             <div
+              ref={svgHostRef}
               className="mermaid-svg flex justify-center [&_svg]:max-w-full [&_svg]:h-auto"
               dangerouslySetInnerHTML={{ __html: svg }}
             />
@@ -144,6 +142,7 @@ export function MermaidDiagram({ code, filename }: Props) {
             code={trimmed}
             language="mermaid"
             filename={filename || "diagram.mmd"}
+            hideCopy
           />
         </div>
       )}

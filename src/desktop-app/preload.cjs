@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAgent", {
   sendPrompt: (prompt) => ipcRenderer.invoke("agent:sendPrompt", prompt),
+  selfHeal: (payload) => ipcRenderer.invoke("agent:selfHeal", payload || {}),
+  selfHealStatus: () => ipcRenderer.invoke("agent:selfHealStatus"),
   getStatus: () => ipcRenderer.invoke("agent:getStatus"),
   getBots: () => ipcRenderer.invoke("agent:getBots"),
   setActiveBot: (botId) => ipcRenderer.invoke("agent:setActiveBot", botId),
@@ -32,5 +34,17 @@ contextBridge.exposeInMainWorld("electronAgent", {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on("agent:event", listener);
     return () => ipcRenderer.removeListener("agent:event", listener);
+  },
+  getMessagingConfig: () => ipcRenderer.invoke("messaging:getConfig"),
+  saveMessagingConfig: (payload) =>
+    ipcRenderer.invoke("messaging:saveConfig", payload || {}),
+  whatsappStatus: () => ipcRenderer.invoke("messaging:whatsappStatus"),
+  whatsappStart: () => ipcRenderer.invoke("messaging:whatsappStart"),
+  whatsappStop: () => ipcRenderer.invoke("messaging:whatsappStop"),
+  whatsappLogout: () => ipcRenderer.invoke("messaging:whatsappLogout"),
+  onMessagingEvent: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("messaging:event", listener);
+    return () => ipcRenderer.removeListener("messaging:event", listener);
   },
 });

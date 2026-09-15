@@ -23,6 +23,8 @@ type SettingsSnapshot = {
     requirePlanApproval: boolean;
     enableReflection: boolean;
     enableCheckpointer: boolean;
+    autoSelfHeal?: boolean;
+    selfHealErrorThreshold?: number;
   };
   sandbox: {
     ptyTimeoutMs: number;
@@ -220,6 +222,8 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
   const [requirePlan, setRequirePlan] = useState(true);
   const [enableReflection, setEnableReflection] = useState(true);
   const [enableCheckpointer, setEnableCheckpointer] = useState(true);
+  const [autoSelfHeal, setAutoSelfHeal] = useState(true);
+  const [selfHealErrorThreshold, setSelfHealErrorThreshold] = useState(2);
   const [desktopEnabled, setDesktopEnabled] = useState(true);
   const [ptyTimeoutMs, setPtyTimeoutMs] = useState(60000);
   const [ptyPoolSize, setPtyPoolSize] = useState(3);
@@ -242,6 +246,8 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
     setRequirePlan(s.agent.requirePlanApproval);
     setEnableReflection(s.agent.enableReflection);
     setEnableCheckpointer(s.agent.enableCheckpointer);
+    setAutoSelfHeal(s.agent.autoSelfHeal ?? true);
+    setSelfHealErrorThreshold(s.agent.selfHealErrorThreshold ?? 2);
     setDesktopEnabled(s.desktop.enabled);
     setAppsText(s.desktop.apps.join("\n"));
     setPtyTimeoutMs(s.sandbox.ptyTimeoutMs);
@@ -349,6 +355,8 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
           requirePlanApproval: requirePlan,
           enableReflection,
           enableCheckpointer,
+          autoSelfHeal,
+          selfHealErrorThreshold,
         },
         sandbox: {
           ptyTimeoutMs,
@@ -546,6 +554,25 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
                   label="Require plan approval"
                   hint="Interrupt setelah task_plan / sebelum task_todos sampai user Approve."
                 />
+              </SectionCard>
+              <SectionCard title="Self-heal">
+                <Toggle
+                  checked={autoSelfHeal}
+                  onChange={setAutoSelfHeal}
+                  label="Auto self-heal on repeated turn errors"
+                  hint="Setelah N error identik, jalankan repair agent (atau ketik /self-heal)."
+                />
+                <div>
+                  <FieldLabel hint="Jumlah error identik sebelum auto self-heal">
+                    Error threshold
+                  </FieldLabel>
+                  <NumberInput
+                    value={selfHealErrorThreshold}
+                    onChange={setSelfHealErrorThreshold}
+                    min={1}
+                    step={1}
+                  />
+                </div>
               </SectionCard>
               <SectionCard title="Persistence">
                 <Toggle

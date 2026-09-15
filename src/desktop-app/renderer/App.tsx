@@ -19,6 +19,7 @@ import { ReasoningBlock } from "./ReasoningBlock.js";
 import { CapabilitiesView } from "./CapabilitiesView.js";
 import { ArtifactsView, type ArtifactRecord } from "./ArtifactsView.js";
 import { SettingsView } from "./SettingsView.js";
+import { MessagingView } from "./MessagingView.js";
 import {
   ActivityCanvas,
   artifactToCanvasTab,
@@ -38,6 +39,11 @@ import {
   shouldAutoFocusCanvas,
   type ActivityArtifact,
 } from "./activity-artifact.js";
+import {
+  AssistantBubbleActions,
+  UserBubbleActions,
+  type BubbleFeedback,
+} from "./ChatBubbleActions.js";
 import { isPlanApprovalInterrupt } from "../../agent/interrupt-utils.js";
 import { shouldRenderAsReasoning } from "../../agent/sanitize-output.js";
 import {
@@ -60,6 +66,20 @@ declare global {
         threadId?: string;
         busyThreadId?: string | null;
         busyThreadIds?: string[];
+      }>;
+      selfHeal?: (payload?: {
+        note?: string;
+        threadId?: string;
+      }) => Promise<{
+        ok: boolean;
+        content?: string;
+        error?: string;
+        threadId?: string;
+      }>;
+      selfHealStatus?: () => Promise<{
+        phase: string;
+        running: boolean;
+        trigger: string | null;
       }>;
       getStatus: () => Promise<{
         bridge: boolean;
@@ -109,6 +129,8 @@ declare global {
           requirePlanApproval: boolean;
           enableReflection: boolean;
           enableCheckpointer: boolean;
+          autoSelfHeal?: boolean;
+          selfHealErrorThreshold?: number;
         };
         sandbox: {
           ptyTimeoutMs: number;
@@ -314,6 +336,88 @@ declare global {
         threadId?: string;
         error?: string;
       }>;
+      getMessagingConfig?: () => Promise<{
+        ok: boolean;
+        error?: string;
+        config?: {
+          version: 1;
+          whatsapp: {
+            enabled: boolean;
+            users: string[];
+            friends: string[];
+            conciseReplies: boolean;
+          };
+        };
+        whatsapp?: {
+          status:
+            | "disconnected"
+            | "connecting"
+            | "qr"
+            | "connected"
+            | "error";
+          enabled: boolean;
+          hasAuth: boolean;
+          me?: string | null;
+          lastError?: string | null;
+          qrDataUrl?: string | null;
+        };
+      }>;
+      saveMessagingConfig?: (payload: {
+        version?: 1;
+        whatsapp: {
+          enabled: boolean;
+          users: string[];
+          friends: string[];
+          conciseReplies: boolean;
+        };
+      }) => Promise<{
+        ok: boolean;
+        error?: string;
+        config?: {
+          version: 1;
+          whatsapp: {
+            enabled: boolean;
+            users: string[];
+            friends: string[];
+            conciseReplies: boolean;
+          };
+        };
+        whatsapp?: {
+          status:
+            | "disconnected"
+            | "connecting"
+            | "qr"
+            | "connected"
+            | "error";
+          enabled: boolean;
+          hasAuth: boolean;
+          me?: string | null;
+          lastError?: string | null;
+          qrDataUrl?: string | null;
+        };
+      }>;
+      whatsappStatus?: () => Promise<{
+        ok: boolean;
+        whatsapp?: {
+          status:
+            | "disconnected"
+            | "connecting"
+            | "qr"
+            | "connected"
+            | "error";
+          enabled: boolean;
+          hasAuth: boolean;
+          me?: string | null;
+          lastError?: string | null;
+          qrDataUrl?: string | null;
+        };
+      }>;
+      whatsappStart?: () => Promise<{ ok: boolean; error?: string }>;
+      whatsappStop?: () => Promise<{ ok: boolean }>;
+      whatsappLogout?: () => Promise<{ ok: boolean; error?: string }>;
+      onMessagingEvent?: (
+        callback: (event: unknown) => void,
+      ) => () => void;
       onEvent: (callback: (event: DesktopAgentEvent) => void) => () => void;
     };
   }
@@ -409,7 +513,7 @@ export function App() {
   const [planApprovalPending, setPlanApprovalPending] = useState(false);
   const [planApprovalBusy, setPlanApprovalBusy] = useState(false);
   const [mainView, setMainView] = useState<
-    "chat" | "capabilities" | "artifacts" | "settings"
+    "chat" | "capabilities" | "artifacts" | "settings" | "messaging"
   >("chat");
   const stickToBottom = useRef(true);
 
@@ -533,6 +637,12 @@ export function App() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [phase, setPhase] = useState<AgentPhase>("boot");
+  const [messageFeedback, setMessageFeedback] = useState<
+    Record<string, BubbleFeedback>
+  >({});
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const [status, setStatus] = useState<BridgeStatus>({
     connected: false,
     agentReady: false,
@@ -1233,21 +1343,51 @@ export function App() {
     return { text: "Agent bridge ready", color: "#3fb950" };
   }, [status]);
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return;
-    const prompt = input.trim();
+  const handleSend = async (
+    promptOverride?: string,
+    options?: { truncateFromId?: string },
+  ) => {
+    const prompt = (promptOverride ?? input).trim();
+    if (!prompt || loading) return;
     const turnId = activeThreadIdRef.current;
     if (turnId && isThreadBusy(turnId)) return;
-    setInput("");
+
+    const truncateId = options?.truncateFromId;
+    const cutIdx = truncateId
+      ? items.findIndex((m) => m.id === truncateId)
+      : -1;
+
+    if (!promptOverride) setInput("");
+    setEditingUserId(null);
+    setEditDraft("");
     setLoading(true);
     setPhase("thinking");
     if (turnId) addBusyThread(turnId);
     draftRef.current = "";
     setDraftAnswer("");
-    setItems((prev) => [
-      ...prev,
-      { id: `u-${Date.now()}`, kind: "user", text: prompt, at: now() },
-    ]);
+    setItems((prev) => {
+      const base =
+        truncateId != null
+          ? (() => {
+              const idx = prev.findIndex((m) => m.id === truncateId);
+              return idx < 0 ? prev : prev.slice(0, idx);
+            })()
+          : prev;
+      return [
+        ...base,
+        { id: `u-${Date.now()}`, kind: "user", text: prompt, at: now() },
+      ];
+    });
+    if (cutIdx >= 0) {
+      const keptIds = new Set(items.slice(0, cutIdx).map((m) => m.id));
+      setMessageFeedback((prev) => {
+        const next: Record<string, BubbleFeedback> = {};
+        for (const [id, v] of Object.entries(prev)) {
+          if (keptIds.has(id)) next[id] = v;
+        }
+        return next;
+      });
+    }
 
     try {
       if (!window.electronAgent?.sendPrompt) {
@@ -1326,6 +1466,63 @@ export function App() {
     }
   };
 
+  const copyText = async (id: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      window.setTimeout(() => {
+        setCopiedId((cur) => (cur === id ? null : cur));
+      }, 1500);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const toggleFeedback = (id: string, value: "up" | "down") => {
+    setMessageFeedback((prev) => ({
+      ...prev,
+      [id]: prev[id] === value ? null : value,
+    }));
+  };
+
+  /** Retry assistant: resend the nearest prior user prompt. */
+  const retryAssistant = (assistantId: string) => {
+    if (loading) return;
+    const idx = items.findIndex((m) => m.id === assistantId);
+    if (idx < 0) return;
+    let userIdx = -1;
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      if (items[i]?.kind === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx < 0) return;
+    const user = items[userIdx]!;
+    if (user.kind !== "user") return;
+    void handleSend(user.text, { truncateFromId: user.id });
+  };
+
+  /** Retry user: resend the same message from that point. */
+  const retryUser = (userId: string) => {
+    if (loading) return;
+    const user = items.find((m) => m.id === userId);
+    if (!user || user.kind !== "user") return;
+    void handleSend(user.text, { truncateFromId: userId });
+  };
+
+  const startEditUser = (userId: string, text: string) => {
+    if (loading) return;
+    setEditingUserId(userId);
+    setEditDraft(text);
+  };
+
+  const submitEditUser = (userId: string) => {
+    const text = editDraft.trim();
+    if (!text || loading) return;
+    void handleSend(text, { truncateFromId: userId });
+  };
+
   const runningBg = processes.filter((p) => p.status === "running").length;
   const activeBot = bots.find((b) => b.id === selectedBotId);
   const backgroundBusyCount = busyThreadIds.filter(
@@ -1395,6 +1592,17 @@ export function App() {
               }`}
             >
               Artifacts
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainView("messaging")}
+              className={`rounded-lg px-3 py-2 text-left text-[11px] transition ${
+                mainView === "messaging"
+                  ? "bg-accent/15 text-accent-soft"
+                  : "text-fg-dim hover:bg-surface-2 hover:text-fg"
+              }`}
+            >
+              Messaging
             </button>
             <button
               type="button"
@@ -1701,6 +1909,8 @@ export function App() {
 
       {mainView === "capabilities" ? (
         <CapabilitiesView onClose={() => setMainView("chat")} />
+      ) : mainView === "messaging" ? (
+        <MessagingView onClose={() => setMainView("chat")} />
       ) : mainView === "settings" ? (
         <SettingsView
           onClose={() => {
@@ -1774,26 +1984,95 @@ export function App() {
         >
           {items.map((item) => {
             if (item.kind === "user") {
+              const isEditing = editingUserId === item.id;
               return (
-                <div key={item.id} className="flex max-w-[86%] flex-col self-end">
+                <div
+                  key={item.id}
+                  className="group flex max-w-[86%] flex-col self-end"
+                >
                   <div className="mb-1 text-right text-[9.5px] text-muted">
                     You · {item.at}
                   </div>
-                  <div className="rounded-2xl rounded-br-md border border-accent/25 bg-[#152033] px-3.5 py-2.5 text-[12px] leading-relaxed whitespace-pre-wrap">
-                    {item.text}
-                  </div>
+                  {isEditing ? (
+                    <div className="rounded-2xl rounded-br-md border border-accent/40 bg-[#152033] px-3 py-2.5">
+                      <textarea
+                        value={editDraft}
+                        rows={3}
+                        autoFocus
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            submitEditUser(item.id);
+                          }
+                          if (e.key === "Escape") {
+                            setEditingUserId(null);
+                            setEditDraft("");
+                          }
+                        }}
+                        className="w-full resize-y rounded-md border border-border bg-surface-1 px-2.5 py-2 text-[12px] leading-relaxed text-fg outline-none"
+                      />
+                      <div className="mt-2 flex justify-end gap-1.5">
+                        <button
+                          type="button"
+                          disabled={loading}
+                          onClick={() => {
+                            setEditingUserId(null);
+                            setEditDraft("");
+                          }}
+                          className="rounded-md border border-border px-2.5 py-1 text-[10px] text-muted hover:text-fg"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={loading || !editDraft.trim()}
+                          onClick={() => submitEditUser(item.id)}
+                          className="rounded-md bg-accent px-2.5 py-1 text-[10px] font-semibold text-surface-0 disabled:opacity-50"
+                        >
+                          Save & send
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl rounded-br-md border border-accent/25 bg-[#152033] px-3.5 py-2.5 text-[12px] leading-relaxed whitespace-pre-wrap">
+                      {item.text}
+                    </div>
+                  )}
+                  <UserBubbleActions
+                    disabled={loading}
+                    editing={isEditing}
+                    onEdit={() => startEditUser(item.id, item.text)}
+                    onRetry={() => retryUser(item.id)}
+                    onCancelEdit={() => {
+                      setEditingUserId(null);
+                      setEditDraft("");
+                    }}
+                  />
                 </div>
               );
             }
             if (item.kind === "assistant") {
+              const isWelcome = item.id === "welcome";
               return (
-                <div key={item.id} className="max-w-[90%] self-start">
+                <div key={item.id} className="group max-w-[90%] self-start">
                   <div className="mb-1 text-[9.5px] text-muted">
                     Agent · {item.at}
                   </div>
                   <div className="rounded-2xl rounded-bl-md border border-border bg-surface-3 px-3.5 py-3">
                     <MarkdownBody text={item.text} />
                   </div>
+                  {!isWelcome ? (
+                    <AssistantBubbleActions
+                      disabled={loading}
+                      feedback={messageFeedback[item.id] ?? null}
+                      copied={copiedId === item.id}
+                      onCopy={() => void copyText(item.id, item.text)}
+                      onLike={() => toggleFeedback(item.id, "up")}
+                      onDislike={() => toggleFeedback(item.id, "down")}
+                      onRetry={() => retryAssistant(item.id)}
+                    />
+                  ) : null}
                 </div>
               );
             }

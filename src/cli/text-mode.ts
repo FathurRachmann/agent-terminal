@@ -4,6 +4,11 @@ import path from "node:path";
 import { createTerminalAgent } from "../agent/create-agent.js";
 import { runAgentTurn } from "./run-agent.js";
 import { describeContextPolicy } from "../agent/context-policy.js";
+import {
+  buildSelfHealPrompt,
+  parseSelfHealCommand,
+  SELF_HEAL_BOT_INSTRUCTION,
+} from "../agent/self-heal/index.js";
 
 export type TextModeOptions = {
   cwd: string;
@@ -157,6 +162,26 @@ export async function runTextMode(opts: TextModeOptions): Promise<void> {
         const line = (await rl.question(`\n${c.cyan}${c.bold}User>${c.reset} `)).trim();
         if (!line) continue;
         if (line === "exit" || line === "quit") break;
+
+        const heal = parseSelfHealCommand(line);
+        if (heal) {
+          process.stdout.write(`\n${c.yellow}${c.bold}Self-heal>${c.reset} `);
+          const prompt = buildSelfHealPrompt({
+            recentErrors: heal.note || "(manual trigger — inspect recent failures)",
+            userNote: heal.note,
+          });
+          await runAgentTurn({
+            agent,
+            prompt,
+            botInstruction: SELF_HEAL_BOT_INSTRUCTION,
+            threadId: opts.thread ?? "repl",
+            autoApprove: opts.yes,
+            onEvent,
+            desktopEnabled: false,
+            memory,
+          });
+          continue;
+        }
 
         process.stdout.write(`\n${c.green}${c.bold}Agent>${c.reset} `);
         await runAgentTurn({

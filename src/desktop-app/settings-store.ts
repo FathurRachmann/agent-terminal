@@ -6,6 +6,10 @@ export type AgentBehaviorSettings = {
   requirePlanApproval: boolean;
   enableReflection: boolean;
   enableCheckpointer: boolean;
+  /** Auto-start self-heal after repeated identical turn errors. */
+  autoSelfHeal: boolean;
+  /** Identical eligible errors required before auto self-heal. */
+  selfHealErrorThreshold: number;
 };
 
 export type UiSettings = {
@@ -84,6 +88,8 @@ const DEFAULT_AGENT: AgentBehaviorSettings = {
   requirePlanApproval: true,
   enableReflection: true,
   enableCheckpointer: true,
+  autoSelfHeal: true,
+  selfHealErrorThreshold: 2,
 };
 
 const DEFAULT_UI: UiSettings = {

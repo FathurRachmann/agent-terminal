@@ -1,5 +1,13 @@
-import React, { useEffect, useId, useMemo, useState } from "react";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  copyMermaidSourceAsImage,
+  copySvgAsImage,
+  copySvgElementAsImage,
+  copyText,
+} from "./clipboard.js";
 import { CodeBlock } from "./CodeBlock.js";
+import { CopyButton } from "./CopyButton.js";
+import { loadMermaid, renderMermaidForExport } from "./mermaid-loader.js";
 import {
   looksLikeSqlSchema,
   schemaSourceToMermaidEr,
@@ -12,37 +20,6 @@ type Props = {
   language?: string;
 };
 
-let mermaidReady: Promise<typeof import("mermaid").default> | null = null;
-
-function loadMermaid() {
-  if (!mermaidReady) {
-    mermaidReady = import("mermaid").then((mod) => {
-      const mermaid = mod.default;
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        theme: "dark",
-        fontFamily: "IBM Plex Sans, Segoe UI, system-ui, sans-serif",
-        themeVariables: {
-          darkMode: true,
-          background: "#0d1117",
-          primaryColor: "#1f6feb",
-          primaryTextColor: "#e7ecf3",
-          primaryBorderColor: "#388bfd",
-          lineColor: "#8b98a8",
-          secondaryColor: "#161b22",
-          tertiaryColor: "#121821",
-          noteBkgColor: "#151c27",
-          noteTextColor: "#e7ecf3",
-          textColor: "#e7ecf3",
-        },
-      });
-      return mermaid;
-    });
-  }
-  return mermaidReady;
-}
-
 export { looksLikeSqlSchema };
 
 /**
@@ -51,6 +28,7 @@ export { looksLikeSqlSchema };
  */
 export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
   const reactId = useId().replace(/:/g, "");
+  const svgHostRef = useRef<HTMLDivElement>(null);
   const [layer, setLayer] = useState<"diagram" | "source" | "dbml">("diagram");
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -110,13 +88,40 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
 
   const openInDbdiagram = async () => {
     if (!dbmlSrc.trim()) return;
-    try {
-      await navigator.clipboard.writeText(dbmlSrc);
-    } catch {
-      /* clipboard may be unavailable */
-    }
+    await copyText(dbmlSrc);
     window.open("https://dbdiagram.io/", "_blank", "noopener,noreferrer");
   };
+
+  const copyCurrent = async () => {
+    if (layer === "diagram") {
+      if (mermaidSrc) {
+        const ok = await copyMermaidSourceAsImage(
+          mermaidSrc,
+          renderMermaidForExport,
+        );
+        if (ok) return true;
+      }
+      const live = svgHostRef.current?.querySelector("svg");
+      if (live) {
+        const fromDom = await copySvgElementAsImage(live);
+        if (fromDom) return true;
+      }
+      return svg ? copySvgAsImage(svg) : false;
+    }
+    if (layer === "dbml") {
+      return copyText(dbmlSrc || "");
+    }
+    return copyText(trimmed);
+  };
+
+  const copyTitle =
+    layer === "diagram"
+      ? "Copy diagram as image"
+      : layer === "dbml"
+        ? "Copy DBML"
+        : isDbmlSource
+          ? "Copy source"
+          : "Copy SQL";
 
   return (
     <div className="mb-3 overflow-hidden rounded-[10px] border border-[#2a313c] bg-[#0d1117] shadow-[0_8px_24px_rgba(0,0,0,0.28)]">
@@ -150,10 +155,17 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
               {label}
             </button>
           ))}
+          <CopyButton
+            className="ml-0.5"
+            title={copyTitle}
+            disabled={layer === "diagram" && (!svg || busy)}
+            onCopy={copyCurrent}
+          />
           <button
             type="button"
             onClick={() => void openInDbdiagram()}
-            title="Salin DBML ke clipboard & buka dbdiagram.io"
+            aria-label="Copy DBML and open in dbdiagram.io"
+            title="Copy DBML to clipboard and open dbdiagram.io"
             className="ml-1 rounded border border-border px-2 py-0.5 text-[9.5px] text-fg-dim hover:border-accent/40 hover:text-accent"
           >
             dbdiagram.io
@@ -162,7 +174,7 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
       </div>
 
       {layer === "diagram" ? (
-        <div className="max-h-[520px] overflow-auto bg-[#0d1117] p-3">
+        <div className="bg-[#0d1117] p-3">
           {busy && (
             <div className="py-6 text-center text-[11px] text-muted">
               Rendering schema diagram…
@@ -173,8 +185,10 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
               Gagal render schema: {error}
             </div>
           )}
+          {/* SAFE: svg from mermaid.render with securityLevel:"strict" (DOMPurify). */}
           {!busy && svg && (
             <div
+              ref={svgHostRef}
               className="mermaid-svg flex justify-center [&_svg]:max-w-full [&_svg]:h-auto"
               dangerouslySetInnerHTML={{ __html: svg }}
             />
@@ -186,6 +200,7 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
             code={dbmlSrc || "(empty)"}
             language="dbml"
             filename={(filename || "schema").replace(/\.sql$/i, ".dbml")}
+            hideCopy
           />
         </div>
       ) : (
@@ -196,6 +211,7 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
             filename={
               filename || (isDbmlSource ? "schema.dbml" : "schema.sql")
             }
+            hideCopy
           />
         </div>
       )}

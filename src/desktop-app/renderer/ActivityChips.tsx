@@ -91,28 +91,36 @@ function eventTitle(ev: AgentUiEvent): string {
 export function eventBody(ev: AgentUiEvent): string {
   switch (ev.type) {
     case "status":
-      return ev.detail;
+      return safeStr(ev.detail);
     case "reasoning":
     case "token":
-      return ev.text;
+      return safeStr(ev.text);
     case "tool_start":
       return shortJson(ev.input, 600);
     case "tool_end":
-      return ev.output.slice(0, 800) + (ev.output.length > 800 ? "…" : "");
+      return truncate(safeStr(ev.output), 800);
     case "interrupt":
       return shortJson(ev.payload, 600);
     case "context_compacted":
-      return ev.detail;
+      return safeStr(ev.detail);
     case "reflection":
-      return `${ev.memoryIds.length} memories stored`;
+      return `${Array.isArray(ev.memoryIds) ? ev.memoryIds.length : 0} memories stored`;
     case "warning":
     case "error":
-      return ev.message;
+      return safeStr(ev.message, "(no details)");
     case "done":
-      return ev.text.slice(0, 400) + (ev.text.length > 400 ? "…" : "");
+      return truncate(safeStr(ev.text), 400);
     default:
       return "";
   }
+}
+
+function safeStr(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function asRecord(input: unknown): Record<string, unknown> {
@@ -246,12 +254,16 @@ export function compactActivityLabel(ev: AgentUiEvent): {
     return { icon: "💭", text: "Reasoning…", color: "#c3a6ff" };
   }
   if (ev.type === "warning") {
-    return { icon: "⚠", text: ev.message.slice(0, 80), color: "#e3b341" };
+    return {
+      icon: "⚠",
+      text: truncate(safeStr(ev.message, "Warning"), 80),
+      color: "#e3b341",
+    };
   }
   if (ev.type === "reflection") {
     return {
       icon: "🧠",
-      text: `Stored ${ev.memoryIds.length} memories`,
+      text: `Stored ${Array.isArray(ev.memoryIds) ? ev.memoryIds.length : 0} memories`,
       color: "#79b8ff",
     };
   }
@@ -259,7 +271,11 @@ export function compactActivityLabel(ev: AgentUiEvent): {
     return { icon: "📦", text: "Context compacted", color: "#8b949e" };
   }
   if (ev.type === "error") {
-    return { icon: "!", text: ev.message.slice(0, 80), color: "#ff7b72" };
+    return {
+      icon: "!",
+      text: truncate(safeStr(ev.message, "Error"), 80),
+      color: "#ff7b72",
+    };
   }
   return { icon: "•", text: eventTitle(ev), color: "#8b949e" };
 }
@@ -349,16 +365,17 @@ export function formatEventDetail(
   }
   if (event.type === "reasoning" || event.type === "token" || event.type === "done") {
     const text = event.type === "done" ? event.text : event.text;
-    return text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+    return truncate(safeStr(text), 4000);
   }
   if (event.type === "warning" || event.type === "error") {
-    return event.message;
+    return safeStr(event.message, "(no details)");
   }
   if (event.type === "reflection") {
-    return `Memory IDs:\n${event.memoryIds.join("\n") || "(none)"}`;
+    const ids = Array.isArray(event.memoryIds) ? event.memoryIds : [];
+    return `Memory IDs:\n${ids.join("\n") || "(none)"}`;
   }
   if (event.type === "context_compacted") {
-    return event.detail;
+    return safeStr(event.detail);
   }
   return eventBody(event);
 }

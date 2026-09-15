@@ -1,9 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { copyText } from "./clipboard.js";
+import { CopyButton } from "./CopyButton.js";
 
 type CodeBlockProps = {
   code: string;
   language?: string;
   filename?: string;
+  /** Hide Copy when a parent panel already exposes copy. */
+  hideCopy?: boolean;
 };
 
 type HighlighterComponent = React.ComponentType<{
@@ -19,7 +23,12 @@ type HighlighterComponent = React.ComponentType<{
 }>;
 
 /** Cursor-like dark code panel with header + syntax highlight. */
-export function CodeBlock({ code, language = "text", filename }: CodeBlockProps) {
+export function CodeBlock({
+  code,
+  language = "text",
+  filename,
+  hideCopy = false,
+}: CodeBlockProps) {
   const [collapsed, setCollapsed] = useState(false);
   const [Highlighter, setHighlighter] = useState<HighlighterComponent | null>(
     null,
@@ -62,14 +71,22 @@ export function CodeBlock({ code, language = "text", filename }: CodeBlockProps)
             {language}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={() => setCollapsed((v) => !v)}
-          aria-label={collapsed ? "Expand code" : "Collapse code"}
-          className="cursor-pointer border-0 bg-transparent p-0.5 text-xs leading-none text-[#8b949e]"
-        >
-          {collapsed ? "▢" : "×"}
-        </button>
+        <div className="flex shrink-0 items-center gap-1">
+          {!hideCopy && (
+            <CopyButton
+              title="Copy code"
+              onCopy={() => copyText(trimmed)}
+            />
+          )}
+          <button
+            type="button"
+            onClick={() => setCollapsed((v) => !v)}
+            aria-label={collapsed ? "Expand code" : "Collapse code"}
+            className="cursor-pointer border-0 bg-transparent p-0.5 text-xs leading-none text-[#8b949e]"
+          >
+            {collapsed ? "▢" : "×"}
+          </button>
+        </div>
       </div>
 
       {!collapsed && (

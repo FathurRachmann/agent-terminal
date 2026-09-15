@@ -17,6 +17,30 @@ import {
   ensureSettingsFile,
   type SettingsUpdatePayload,
 } from "./settings-service.js";
+import {
+  loadMessagingConfig,
+  resolveWhatsAppAccessRole,
+  saveMessagingConfig,
+  threadIdForWhatsAppJid,
+  type MessagingConfig,
+} from "./messaging-store.js";
+import {
+  WA_FRIEND_ALLOWED_TOOLS,
+  buildWhatsAppRoleInstruction,
+} from "./messaging-roles.js";
+import {
+  WhatsAppBridge,
+  type WhatsAppBridgeEvent,
+  type WhatsAppInboundMessage,
+} from "./whatsapp-bridge.js";
+import { extractInterruptActionNames, isPlanApprovalInterrupt } from "../agent/interrupt-utils.js";
+import {
+  buildSelfHealPrompt,
+  parseSelfHealCommand,
+  SelfHealController,
+  SELF_HEAL_BOT_INSTRUCTION,
+  type SelfHealTrigger,
+} from "../agent/self-heal/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,6 +58,8 @@ const pendingApprovals = new Map<
   string,
   (decision: { decisions: Array<{ type: "approve" | "reject" }> }) => void
 >();
+let whatsappBridge: WhatsAppBridge | null = null;
+const selfHeal = new SelfHealController();
 
 function listBusyThreadIds(): string[] {
   return [...busyThreadIds];
@@ -82,8 +108,269 @@ function resolvePreload(): string {
 }
 
 function emitToRenderer(event: AgentUiEvent) {
+  if (event.type === "error" && typeof event.message === "string") {
+    selfHeal.recordTurnError(event.message, "turn");
+  }
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send("agent:event", event);
+}
+
+async function runSelfHealTurn(opts: {
+  trigger: SelfHealTrigger;
+  note?: string;
+  threadId?: string;
+}): Promise<{ ok: boolean; content?: string; error?: string; threadId: string }> {
+  const turnThreadId = opts.threadId ?? activeThreadId;
+  if (!agentBundle) {
+    const error =
+      agentBootError ??
+      "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
+    emitToRenderer({ type: "error", message: error });
+    return { ok: false, error, threadId: turnThreadId };
+  }
+
+  const begin = selfHeal.begin(opts.trigger);
+  if (!begin.ok) {
+    emitToRenderer({
+      type: "warning",
+      message: begin.reason,
+      threadId: turnThreadId,
+    } as never);
+    return { ok: false, error: begin.reason, threadId: turnThreadId };
+  }
+
+  if (busyThreadIds.has(turnThreadId)) {
+    selfHeal.end("failed", "Session busy");
+    return {
+      ok: false,
+      error: "This session is already running a turn.",
+      threadId: turnThreadId,
+    };
+  }
+
+  const prompt = buildSelfHealPrompt({
+    recentErrors: selfHeal.errors.snapshot(),
+    userNote: opts.note,
+    maxIterations: selfHeal.maxIterations,
+  });
+
+  busyThreadIds.add(turnThreadId);
+  selfHeal.setPhase("repairing");
+  emitToRenderer({
+    type: "status",
+    phase: "thinking",
+    detail: `self-heal (${opts.trigger}) started`,
+    threadId: turnThreadId,
+  } as never);
+  emitToRenderer({
+    type: "warning",
+    message: `Self-heal ${opts.trigger}: diagnosing recent errors and repairing agent code…`,
+    threadId: turnThreadId,
+  } as never);
+
+  try {
+    const { runAgentTurn } = await import("../cli/run-agent.js");
+    if (busyThreadIds.size === 1) {
+      agentBundle.botScope.setAllowedTools(null);
+    }
+    const answer = await runAgentTurn({
+      agent: agentBundle.agent,
+      prompt,
+      botInstruction: SELF_HEAL_BOT_INSTRUCTION,
+      threadId: turnThreadId,
+      autoApprove: loadStoredSettings(workspaceRoot).agent.autoApproveDestructive,
+      desktopEnabled: false,
+      requestApproval: () =>
+        new Promise((resolve) => {
+          pendingApprovals.set(turnThreadId, resolve);
+        }),
+      memory: {
+        sessionStore: agentBundle.sessionStore,
+        memoryStore: agentBundle.memoryStore,
+        embedder: agentBundle.embedder,
+        model: agentBundle.model,
+        workspaceRoot: agentBundle.workspaceRoot,
+        enableReflection: agentBundle.enableReflection,
+      },
+      onEvent: (ev) =>
+        emitToRenderer({ ...ev, threadId: turnThreadId } as never),
+    });
+    selfHeal.end("done");
+    emitToRenderer({
+      type: "warning",
+      message: "Self-heal finished. Review the repair summary above, then retry the original task.",
+      threadId: turnThreadId,
+    } as never);
+    return {
+      ok: true,
+      content: answer,
+      threadId: turnThreadId,
+    };
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    selfHeal.end("failed", error);
+    emitToRenderer({
+      type: "error",
+      message: `Self-heal failed: ${error}`,
+      threadId: turnThreadId,
+    } as never);
+    return { ok: false, error, threadId: turnThreadId };
+  } finally {
+    busyThreadIds.delete(turnThreadId);
+    const pending = pendingApprovals.get(turnThreadId);
+    if (pending) {
+      pendingApprovals.delete(turnThreadId);
+      pending({ decisions: [{ type: "reject" }] });
+    }
+    if (busyThreadIds.size === 0) {
+      applyBotScope(activeBotId);
+    }
+  }
+}
+
+function emitMessagingToRenderer(event: WhatsAppBridgeEvent) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("messaging:event", event);
+}
+
+function ensureWhatsAppBridge(): WhatsAppBridge {
+  if (!whatsappBridge) {
+    whatsappBridge = new WhatsAppBridge(workspaceRoot, (ev) => {
+      emitMessagingToRenderer(ev);
+      if (ev.type === "message_in") {
+        void handleWhatsAppInbound(ev.payload);
+      }
+    });
+  }
+  return whatsappBridge;
+}
+
+/** WhatsApp HITL: friends only auto-approve workspace file writes; reject shell/folder/plan. */
+function decideWhatsAppApproval(
+  role: "user" | "friend",
+  interrupt: unknown,
+): { decisions: Array<{ type: "approve" | "reject" }> } {
+  if (isPlanApprovalInterrupt(interrupt)) {
+    return { decisions: [{ type: "reject" }] };
+  }
+  const tools = extractInterruptActionNames(interrupt);
+  if (role === "user") {
+    return { decisions: [{ type: "approve" }] };
+  }
+  const friendOk = new Set(["write_file", "edit_file"]);
+  const ok = tools.length > 0 && tools.every((t) => friendOk.has(t));
+  return { decisions: [{ type: ok ? "approve" : "reject" }] };
+}
+
+async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
+  const bridge = ensureWhatsAppBridge();
+  const config = loadMessagingConfig(workspaceRoot);
+  const identity = msg.identityJid || msg.jid;
+  const turnThreadId = threadIdForWhatsAppJid(identity);
+  const role = resolveWhatsAppAccessRole(identity, config.whatsapp);
+
+  if (!role) {
+    emitMessagingToRenderer({
+      type: "ignored",
+      payload: {
+        jid: identity,
+        reason: "Not in User/Friends allowlist (main guard).",
+      },
+    });
+    return;
+  }
+
+  if (!agentBundle) {
+    const error =
+      agentBootError ?? "Agent engine not ready; cannot reply on WhatsApp.";
+    emitMessagingToRenderer({ type: "error", payload: { message: error } });
+    await bridge.sendText(
+      msg.jid,
+      "Agent belum siap. Coba lagi sebentar ya.",
+    );
+    return;
+  }
+
+  if (busyThreadIds.has(turnThreadId)) {
+    await bridge.sendText(
+      msg.jid,
+      "Masih memproses pesan sebelumnya — tunggu sebentar lalu kirim lagi.",
+    );
+    return;
+  }
+
+  busyThreadIds.add(turnThreadId);
+  emitToRenderer({
+    type: "status",
+    phase: "thinking",
+    detail: `turn started (wa:${role})`,
+    threadId: turnThreadId,
+  } as never);
+
+  await bridge.startTyping(msg.jid);
+
+  try {
+    const { runAgentTurn } = await import("../cli/run-agent.js");
+    // Apply role tool scope for this WA turn.
+    selectBotWithoutScopeMutation("general");
+    if (role === "friend") {
+      agentBundle.botScope.setAllowedTools([...WA_FRIEND_ALLOWED_TOOLS]);
+    } else {
+      agentBundle.botScope.setAllowedTools(null);
+    }
+
+    const botInstruction = buildWhatsAppRoleInstruction(
+      role,
+      config.whatsapp.conciseReplies,
+    );
+
+    const answer = await runAgentTurn({
+      agent: agentBundle.agent,
+      prompt: msg.text,
+      botInstruction,
+      threadId: turnThreadId,
+      // Owner can proceed through tool interrupts; friends use selective approve.
+      autoApprove: false,
+      desktopEnabled: false,
+      requestApproval: async (interrupt) =>
+        decideWhatsAppApproval(role, interrupt),
+      memory: {
+        sessionStore: agentBundle.sessionStore,
+        memoryStore: agentBundle.memoryStore,
+        embedder: agentBundle.embedder,
+        model: agentBundle.model,
+        workspaceRoot: agentBundle.workspaceRoot,
+        enableReflection: agentBundle.enableReflection,
+      },
+      onEvent: (ev) =>
+        emitToRenderer({ ...ev, threadId: turnThreadId } as never),
+    });
+
+    const text = (answer || "").trim() || "(empty response)";
+    const clipped =
+      text.length > 3500 ? `${text.slice(0, 3490)}\n…(truncated)` : text;
+    const pauseMs = Math.min(1_800, Math.max(400, Math.floor(clipped.length * 12)));
+    await new Promise((r) => setTimeout(r, pauseMs));
+    await bridge.sendText(msg.jid, clipped);
+  } catch (e) {
+    const error = e instanceof Error ? e.message : String(e);
+    emitToRenderer({
+      type: "error",
+      message: error,
+      threadId: turnThreadId,
+    } as never);
+    emitMessagingToRenderer({ type: "error", payload: { message: error } });
+    await bridge.sendText(
+      msg.jid,
+      "Maaf, terjadi error saat memproses pesan. Coba lagi nanti.",
+    );
+  } finally {
+    await bridge.stopTyping(msg.jid);
+    busyThreadIds.delete(turnThreadId);
+    if (busyThreadIds.size === 0) {
+      applyBotScope(activeBotId);
+    }
+  }
 }
 
 function listSessionsSafe() {
@@ -182,6 +469,19 @@ app.whenReady().then(async () => {
     const folders = agentBundle?.sandbox.getAllowedRoots() ?? [workspaceRoot];
     return buildSettingsSnapshot(workspaceRoot, folders);
   });
+
+  ipcMain.handle("agent:selfHealStatus", async () => selfHeal.getStatus());
+
+  ipcMain.handle(
+    "agent:selfHeal",
+    async (_event, payload?: { note?: string; threadId?: string }) => {
+      return runSelfHealTurn({
+        trigger: "manual",
+        note: payload?.note,
+        threadId: payload?.threadId || activeThreadId,
+      });
+    },
+  );
 
   ipcMain.handle(
     "agent:updateSettings",
@@ -524,6 +824,69 @@ app.whenReady().then(async () => {
     },
   );
 
+  ipcMain.handle("messaging:getConfig", async () => {
+    const bridge = ensureWhatsAppBridge();
+    const config = bridge.reloadConfig();
+    return {
+      ok: true,
+      config,
+      whatsapp: bridge.getStatus(),
+    };
+  });
+
+  ipcMain.handle(
+    "messaging:saveConfig",
+    async (_event, payload: Partial<MessagingConfig> | MessagingConfig) => {
+      try {
+        const current = loadMessagingConfig(workspaceRoot);
+        const next = saveMessagingConfig(workspaceRoot, {
+          version: 1,
+          whatsapp: {
+            ...current.whatsapp,
+            ...(payload && typeof payload === "object" && "whatsapp" in payload
+              ? (payload as MessagingConfig).whatsapp
+              : {}),
+          },
+        });
+        const bridge = ensureWhatsAppBridge();
+        bridge.reloadConfig();
+        if (next.whatsapp.enabled && bridge.getStatus().status === "disconnected") {
+          // Don't auto-start on save — user presses Start; only refresh status.
+        }
+        if (!next.whatsapp.enabled) {
+          await bridge.stop();
+        }
+        return { ok: true, config: next, whatsapp: bridge.getStatus() };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle("messaging:whatsappStatus", async () => {
+    const bridge = ensureWhatsAppBridge();
+    return { ok: true, whatsapp: bridge.getStatus() };
+  });
+
+  ipcMain.handle("messaging:whatsappStart", async () => {
+    const bridge = ensureWhatsAppBridge();
+    bridge.reloadConfig();
+    return bridge.start();
+  });
+
+  ipcMain.handle("messaging:whatsappStop", async () => {
+    const bridge = ensureWhatsAppBridge();
+    return bridge.stop();
+  });
+
+  ipcMain.handle("messaging:whatsappLogout", async () => {
+    const bridge = ensureWhatsAppBridge();
+    return bridge.logout();
+  });
+
   ipcMain.handle("agent:sendPrompt", async (_event, prompt: string) => {
     if (!agentBundle) {
       const error =
@@ -531,6 +894,15 @@ app.whenReady().then(async () => {
         "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
       emitToRenderer({ type: "error", message: error });
       return { ok: false, error };
+    }
+
+    const healCmd = parseSelfHealCommand(prompt);
+    if (healCmd) {
+      return runSelfHealTurn({
+        trigger: "manual",
+        note: healCmd.note,
+        threadId: activeThreadId,
+      });
     }
 
     const turnThreadId = activeThreadId;
@@ -552,6 +924,15 @@ app.whenReady().then(async () => {
       detail: "turn started",
       threadId: turnThreadId,
     } as never);
+    let autoHealQueued = false;
+    let turnResult: {
+      ok: boolean;
+      content?: string;
+      error?: string;
+      threadId: string;
+      activeBotId?: string;
+      busyThreadIds?: string[];
+    } = { ok: false, threadId: turnThreadId };
     try {
       const { runAgentTurn } = await import("../cli/run-agent.js");
       const currentBot =
@@ -603,7 +984,7 @@ app.whenReady().then(async () => {
         onEvent: (ev) =>
           emitToRenderer({ ...ev, threadId: turnThreadId } as never),
       });
-      return {
+      turnResult = {
         ok: true,
         content: answer,
         threadId: turnThreadId,
@@ -617,7 +998,14 @@ app.whenReady().then(async () => {
         message: error,
         threadId: turnThreadId,
       } as never);
-      return {
+      const prefs = loadStoredSettings(workspaceRoot).agent;
+      if (
+        prefs.autoSelfHeal &&
+        selfHeal.shouldAutoTrigger(true, prefs.selfHealErrorThreshold)
+      ) {
+        autoHealQueued = true;
+      }
+      turnResult = {
         ok: false,
         error,
         threadId: turnThreadId,
@@ -637,6 +1025,22 @@ app.whenReady().then(async () => {
         applyBotScope(activeBotId);
       }
     }
+
+    if (autoHealQueued) {
+      emitToRenderer({
+        type: "warning",
+        message:
+          "Repeated turn errors detected — starting automatic self-heal…",
+        threadId: turnThreadId,
+      } as never);
+      void runSelfHealTurn({
+        trigger: "auto",
+        note: "auto-triggered after repeated turn errors",
+        threadId: turnThreadId,
+      });
+    }
+
+    return turnResult;
   });
 
   try {
@@ -659,6 +1063,16 @@ app.whenReady().then(async () => {
     }
     applyBotScope(activeBotId);
     console.log("Agent engine ready");
+    // Resume WhatsApp if previously enabled + has auth.
+    try {
+      const cfg = loadMessagingConfig(workspaceRoot);
+      if (cfg.whatsapp.enabled) {
+        const bridge = ensureWhatsAppBridge();
+        void bridge.start();
+      }
+    } catch (err) {
+      console.error("WhatsApp auto-start failed:", err);
+    }
   } catch (err) {
     agentBootError = err instanceof Error ? err.message : String(err);
     console.error("Failed to boot agent engine:", err);
@@ -672,5 +1086,6 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  void whatsappBridge?.stop();
   if (process.platform !== "darwin") app.quit();
 });
