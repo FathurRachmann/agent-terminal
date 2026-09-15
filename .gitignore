@@ -15,6 +15,8 @@ dist/
 .agent/settings.json
 .agent/bots.json
 .agent/capabilities-prefs.json
+.agent/messaging.json
+.agent/whatsapp-auth/
 .agent/context/**
 !.agent/context/.gitkeep
 .agent/task/**
@@ -25,6 +27,11 @@ dist/
 # Personal guidelines mirror (synced from local SQLite). Starter is AGENTS.md.example
 .agent/AGENTS.md
 .agent/.native-abi
+# Per-machine skill curator / usage counters (absolute paths, session IDs)
+.agent/skills/.curator_ledger.jsonl
+.agent/skills/.curator_state
+.agent/skills/.usage.json
+.agent/skills/.usage.json.lock
 
 # Generated / local tooling
 graphify-out/
