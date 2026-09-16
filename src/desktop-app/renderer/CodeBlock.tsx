@@ -49,14 +49,14 @@ export function CodeBlock({
   }, []);
 
   return (
-    <div className="mb-3 overflow-hidden rounded-[10px] border border-[#2a313c] bg-[#0d1117] shadow-[0_8px_24px_rgba(0,0,0,0.28)]">
-      <div className="flex items-center justify-between gap-2.5 border-b border-[#2a313c] bg-gradient-to-b from-[#161b22] to-[#12171e] px-3 py-2">
+    <div className="mb-3 overflow-hidden rounded-[10px] border border-border bg-surface-1 shadow-[0_8px_24px_rgba(0,0,0,0.4)]">
+      <div className="flex items-center justify-between gap-2.5 border-b border-border bg-gradient-to-b from-surface-3 to-surface-2 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="font-mono text-[9.5px] font-bold text-[#8b949e]">
+          <span className="font-mono text-[9.5px] font-bold text-muted">
             {"</>"}
           </span>
           <span
-            className="truncate font-mono text-[11px] font-semibold text-[#e6edf3]"
+            className="truncate font-mono text-[11px] font-semibold text-fg"
             title={title}
           >
             {title}
@@ -67,7 +67,7 @@ export function CodeBlock({
           {added > 0 && (
             <span className="text-[9.5px] font-semibold text-success">+{added}</span>
           )}
-          <span className="text-[9px] tracking-wider text-[#6e7681] uppercase">
+          <span className="text-[9px] tracking-wider text-muted uppercase">
             {language}
           </span>
         </div>
@@ -82,7 +82,7 @@ export function CodeBlock({
             type="button"
             onClick={() => setCollapsed((v) => !v)}
             aria-label={collapsed ? "Expand code" : "Collapse code"}
-            className="cursor-pointer border-0 bg-transparent p-0.5 text-xs leading-none text-[#8b949e]"
+            className="cursor-pointer border-0 bg-transparent p-0.5 text-xs leading-none text-muted"
           >
             {collapsed ? "▢" : "×"}
           </button>
@@ -98,21 +98,21 @@ export function CodeBlock({
               customStyle={{
                 margin: 0,
                 padding: "12px 0",
-                background: "#0d1117",
+                background: "#111113",
                 fontSize: 11,
                 lineHeight: 1.55,
-                fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, monospace',
+                fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
               }}
               codeTagProps={{
                 style: {
-                  fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, monospace',
+                  fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
                 },
               }}
               showLineNumbers={trimmed.split("\n").length > 3}
               lineNumberStyle={{
                 minWidth: "2.5em",
                 paddingRight: 12,
-                color: "#484f58",
+                color: "#5c5c66",
                 userSelect: "none",
               }}
               wrapLongLines={false}
@@ -152,7 +152,7 @@ export function CodeBlock({
                 fontSize: 11,
                 lineHeight: 1.55,
                 color: "#e6edf3",
-                fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, monospace',
+                fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
                 overflow: "auto",
               }}
             >
@@ -224,7 +224,7 @@ const cursorDark: { [key: string]: React.CSSProperties } = {
   'code[class*="language-"]': {
     color: "#e6edf3",
     background: "none",
-    fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, monospace',
+    fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
     textAlign: "left",
     whiteSpace: "pre",
     wordSpacing: "normal",
@@ -234,8 +234,8 @@ const cursorDark: { [key: string]: React.CSSProperties } = {
   },
   'pre[class*="language-"]': {
     color: "#e6edf3",
-    background: "#0d1117",
-    fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, monospace',
+    background: "#111113",
+    fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
     textAlign: "left",
     whiteSpace: "pre",
     lineHeight: "1.55",

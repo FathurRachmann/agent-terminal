@@ -15,6 +15,7 @@ export {
   normalizeWhatsAppIdentity,
   parseAllowedUsersCsv,
   resolveWhatsAppAccessRole,
+  resolveWhatsAppAccessRoleFromCandidates,
   threadIdForWhatsAppJid,
 } from "./messaging-shared.js";
 

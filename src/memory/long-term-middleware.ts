@@ -65,6 +65,8 @@ export function createLongTermMemoryMiddleware(
       const candidates = store
         .listWithEmbeddings({ limit: 400 })
         .filter((m) => m.kind !== "preference" && m.kind !== "rule");
+      // Chat-context facts are durable corrections / "ingat…" — keep them eligible
+      // for RAG (they are kind=fact with tag chat-context).
       let queryEmbedding: number[] | null = null;
       if (embedder) {
         try {

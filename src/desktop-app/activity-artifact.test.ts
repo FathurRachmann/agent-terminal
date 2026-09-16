@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   extractResultPathsFromText,
   inferPreviewKind,
+  looksLikeWorkspacePath,
   normalizeCanvasKey,
   parseDelimitedPreview,
   pickAutoFocusArtifact,
@@ -20,7 +21,19 @@ describe("activity artifacts", () => {
     assert.equal(inferPreviewKind("xlsx"), "spreadsheet");
     assert.equal(inferPreviewKind("docx"), "document");
     assert.equal(inferPreviewKind("docs"), "document");
+    assert.equal(inferPreviewKind("pdf"), "pdf");
+    assert.equal(inferPreviewKind("mp4"), "media");
+    assert.equal(inferPreviewKind("onnx"), "binary");
     assert.equal(inferPreviewKind("sheet"), "spreadsheet");
+    assert.equal(shouldAutoFocusCanvas("pdf"), true);  });
+
+  it("detects clickable workspace paths", () => {
+    assert.equal(looksLikeWorkspacePath("working/uu_pdp_27_2022.md"), true);
+    assert.equal(looksLikeWorkspacePath("README.md"), true);
+    assert.equal(looksLikeWorkspacePath("./src/app.ts"), true);
+    assert.equal(looksLikeWorkspacePath("not a path"), false);
+    assert.equal(looksLikeWorkspacePath("https://example.com/a.md"), false);
+    assert.equal(looksLikeWorkspacePath("console.log"), false);
   });
 
   it("resolves write_file artifacts with inline content", () => {
@@ -59,6 +72,19 @@ describe("activity artifacts", () => {
       "Saved report to ./working/laporan_bulanan.docx\n",
     );
     assert.ok(paths.some((p) => p.endsWith("laporan_bulanan.docx")));
+  });
+
+  it("extracts backtick paths that contain spaces", () => {
+    const paths = extractResultPathsFromText(
+      "File ada di `working/LAPORAN TP ADMINISTRASI SEPTEMBER 2026 - DIANDRA.doc` siap dibuka.",
+    );
+    assert.ok(
+      paths.some((p) =>
+        p.includes("LAPORAN TP ADMINISTRASI SEPTEMBER 2026 - DIANDRA.doc"),
+      ),
+      `got ${JSON.stringify(paths)}`,
+    );
+    assert.ok(!paths.includes("DIANDRA.doc"));
   });
 
   it("parses csv preview grids", () => {

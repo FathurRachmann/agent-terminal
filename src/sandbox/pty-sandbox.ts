@@ -12,6 +12,8 @@ import { registerPtyBackgroundProcess } from "../agent/process-manage.js";
 
 export type PtySandboxOptions = {
   workingDirectory: string;
+  /** Extra allowed roots beyond workingDirectory (e.g. project folders). */
+  initialAllowedRoots?: string[];
   timeoutMs?: number;
   shell?: string;
   cols?: number;
@@ -208,7 +210,10 @@ export class PtySandbox extends BaseSandbox {
   constructor(options: PtySandboxOptions) {
     super();
     this.workingDirectory = path.resolve(options.workingDirectory);
-    this.allowedRoots = [this.workingDirectory];
+    const extras = (options.initialAllowedRoots ?? [])
+      .map((r) => path.resolve(r))
+      .filter((r) => r && r !== this.workingDirectory);
+    this.allowedRoots = [this.workingDirectory, ...extras];
     this.timeoutMs = options.timeoutMs ?? Number(process.env.PTY_TIMEOUT_MS ?? 60_000);
     this.shellPath = options.shell ?? defaultShell();
     this.cols = options.cols ?? 120;

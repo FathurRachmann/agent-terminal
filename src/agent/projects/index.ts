@@ -1,0 +1,16 @@
+export {
+  createProject,
+  deleteProject,
+  getActiveProject,
+  isValidProjectId,
+  listProjectSummaries,
+  loadProjectRegistry,
+  primaryFolderOf,
+  projectsRegistryPath,
+  saveProjectRegistry,
+  setActiveProject,
+  updateProject,
+  type ProjectRecord,
+  type ProjectRegistry,
+  type ProjectSummary,
+} from "./registry.js";

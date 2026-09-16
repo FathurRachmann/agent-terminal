@@ -174,6 +174,32 @@ describe("SessionStore (persistent raw history)", () => {
     assert.ok(fs.existsSync(path.join(dir, ".agent", "memory", "config-snapshot.json")));
   });
 
+  it("clears, moves, and deletes sessions", () => {
+    sessions.appendTranscript({
+      threadId: "t-move",
+      role: "user",
+      content: "move me",
+    });
+    sessions.setSessionProject("t-move", "proj-a");
+    assert.equal(sessions.readSessionMeta("t-move").projectId, "proj-a");
+    assert.equal(sessions.listSessions("proj-a").length, 1);
+
+    sessions.clearTranscript("t-move");
+    assert.equal(sessions.readTranscript("t-move").length, 0);
+    assert.equal(sessions.readSessionMeta("t-move").projectId, "proj-a");
+
+    sessions.setSessionProject("t-move", null);
+    assert.equal(sessions.readSessionMeta("t-move").projectId, null);
+
+    sessions.deleteSession("t-move");
+    assert.equal(sessions.readTranscript("t-move").length, 0);
+    assert.ok(
+      !fs.existsSync(
+        path.join(dir, ".agent", "memory", "sessions", "t-move.jsonl"),
+      ),
+    );
+  });
+
   it("stores tool activity with uiEvent meta for reload", () => {
     sessions.appendTranscript({
       threadId: "t1",
@@ -324,5 +350,34 @@ describe("reflection / compression", () => {
     const agents = fs.readFileSync(agentsMdPathFor(dir), "utf8");
     assert.match(agents, /## User preferences/);
     assert.match(agents, /USER prefers Indonesian/i);
+  });
+
+  it("learns chat context from corrections and ingat instructions", async () => {
+    const { storedIds } = await reflectAndStore({
+      store,
+      sessionStore: sessions,
+      embedder: fakeEmbedder(),
+      agentsMdPath: agentsMdPathFor(dir),
+      input: {
+        threadId: "r1",
+        userPrompt:
+          "Salah. Ingat: kalau kirim laporan Word ke WhatsApp, selalu kirim file .docx-nya juga",
+        assistantResponse: "Oke file ada di working/laporan.doc",
+      },
+    });
+    assert.ok(storedIds.length >= 1);
+    const facts = store.list({ kind: "fact" });
+    const chat = facts.filter((f) => f.tags.includes("chat-context"));
+    assert.ok(
+      chat.some((f) => /CHAT remember:.*docx/i.test(f.content)),
+      `expected remember fact, got ${chat.map((f) => f.content).join(" | ")}`,
+    );
+    assert.ok(
+      chat.some((f) => /CHAT correction:/i.test(f.content)),
+      "expected correction fact",
+    );
+    const agents = fs.readFileSync(agentsMdPathFor(dir), "utf8");
+    assert.match(agents, /## Chat context/);
+    assert.match(agents, /CHAT remember:/i);
   });
 });

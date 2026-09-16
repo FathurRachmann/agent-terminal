@@ -35,6 +35,14 @@ export function isSelfHealEligibleError(message: string): boolean {
   if (/already running a turn/i.test(m)) return false;
   if (/user rejected|approval denied|rejected by user/i.test(m)) return false;
   if (/agent engine not ready/i.test(m)) return false;
+  // Opaque provider/SDK crashes — editing agent source won't fix; avoid heal loops.
+  if (
+    /cannot read propert(?:y|ies) of undefined \(reading ['"]message['"]\)/i.test(
+      m,
+    )
+  )
+    return false;
+  if (/malformed error payload \(missing error\.message\)/i.test(m)) return false;
   return true;
 }
 

@@ -114,6 +114,8 @@ export function createTaskTools(workspaceRoot: string) {
         ...prev,
         goal: goal.trim(),
         plan: plan.trim(),
+        // New plan invalidates prior todos — they must be recreated after approval.
+        todos: [],
         skillsUsed: skillsUsed?.map((s) => s.trim()).filter(Boolean) ?? prev.skillsUsed,
         updatedAt: new Date().toISOString(),
       };

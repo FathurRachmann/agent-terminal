@@ -6,7 +6,7 @@ const phaseLabel: Record<AgentPhase, string> = {
   thinking: "Thinking",
   reasoning: "Reasoning",
   tool: "Running tools",
-  pty: "Shell busy",
+  pty: "Running shell",
   waiting_approval: "Waiting for approval",
   reflecting: "Reflecting",
   done: "Done",

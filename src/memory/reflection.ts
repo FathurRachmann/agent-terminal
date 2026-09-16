@@ -17,6 +17,9 @@ import {
   shouldLearnUserStyle,
   type StandardUserPreference,
 } from "./user-profile.js";
+import {
+  extractChatContextFromTurn,
+} from "./chat-context.js";
 import path from "node:path";
 
 export type ReflectionInput = {
@@ -34,6 +37,7 @@ export type ReflectionInput = {
  * - episodes/errors from the turn
  * - engineering rules (WHEN → DO) when a durable lesson exists
  * - user preferences from ordinary chat (USER prefers/writes/asks)
+ * - chat context from corrections / "ingat…" / standing instructions
  */
 export async function reflectAndStore(options: {
   store: PersistentMemoryStore;
@@ -118,6 +122,33 @@ export async function reflectAndStore(options: {
       });
       synced = true;
     }
+  }
+
+  // Chat context → corrections, "ingat …", standing instructions from conversation.
+  const chatItems = extractChatContextFromTurn({
+    userPrompt: input.userPrompt,
+    assistantResponse: input.assistantResponse,
+  });
+  for (const item of chatItems) {
+    if (isDuplicateChatContext(store, item.text)) continue;
+    const saved = await store.upsertWithEmbedding(
+      {
+        kind: "fact",
+        title: item.title,
+        content: item.text,
+        tags: ["auto-reflection", "chat-context", item.kind],
+        importance: item.importance,
+      },
+      embedder,
+    );
+    storedIds.push(saved.id);
+    sessionStore.appendTranscript({
+      threadId: input.threadId,
+      role: "reflection",
+      content: `chat-context: ${item.text}`,
+      meta: { memoryId: saved.id, kind: "fact", chatKind: item.kind },
+    });
+    synced = true;
   }
 
   if (synced) {
@@ -285,6 +316,35 @@ function isDuplicateContent(
       let overlap = 0;
       for (const w of a) if (b.has(w)) overlap += 1;
       return overlap / Math.min(a.size, b.size) >= 0.7;
+    }
+    return false;
+  });
+}
+
+function isDuplicateChatContext(
+  store: PersistentMemoryStore,
+  text: string,
+): boolean {
+  const existing = store
+    .list({ kind: "fact", limit: 200 })
+    .filter((r) => r.tags.includes("chat-context"));
+  const norm = text.toLowerCase().replace(/\s+/g, " ").trim();
+  const kindMatch = norm.match(/^chat\s+(remember|correction|context):\s*/);
+  const kind = kindMatch?.[1] ?? "";
+  const body = norm.replace(/^chat\s+(remember|correction|context):\s*/, "");
+  return existing.some((r) => {
+    const other = r.content.toLowerCase().replace(/\s+/g, " ").trim();
+    const otherKind =
+      other.match(/^chat\s+(remember|correction|context):\s*/)?.[1] ?? "";
+    // Only dedupe within the same chat-context kind
+    if (kind && otherKind && kind !== otherKind) return false;
+    if (other === norm) return true;
+    const otherBody = other.replace(
+      /^chat\s+(remember|correction|context):\s*/,
+      "",
+    );
+    if (body.length >= 12 && otherBody.length >= 12) {
+      if (otherBody.includes(body) || body.includes(otherBody)) return true;
     }
     return false;
   });

@@ -4,7 +4,7 @@ type MermaidApi = typeof import("mermaid").default;
 
 type MermaidInitConfig = Parameters<MermaidApi["initialize"]>[0];
 
-const FONT = "IBM Plex Sans, Segoe UI, system-ui, sans-serif";
+const FONT = "Plus Jakarta Sans, system-ui, sans-serif";
 
 const DARK_CONFIG: MermaidInitConfig = {
   startOnLoad: false,
@@ -14,21 +14,21 @@ const DARK_CONFIG: MermaidInitConfig = {
   fontFamily: FONT,
   themeVariables: {
     darkMode: true,
-    background: "#0d1117",
+    background: "#111113",
     primaryColor: "#1f6feb",
-    primaryTextColor: "#e7ecf3",
-    primaryBorderColor: "#388bfd",
-    lineColor: "#8b98a8",
-    secondaryColor: "#161b22",
-    tertiaryColor: "#121821",
-    noteBkgColor: "#151c27",
-    noteTextColor: "#e7ecf3",
-    textColor: "#e7ecf3",
-    actorBkg: "#161b22",
-    actorBorder: "#58a6ff",
-    actorTextColor: "#e7ecf3",
-    signalColor: "#8b98a8",
-    signalTextColor: "#e7ecf3",
+    primaryTextColor: "#ededf0",
+    primaryBorderColor: "#6b9fff",
+    lineColor: "#8b8b93",
+    secondaryColor: "#1e1e21",
+    tertiaryColor: "#171719",
+    noteBkgColor: "#1e1e21",
+    noteTextColor: "#ededf0",
+    textColor: "#ededf0",
+    actorBkg: "#1e1e21",
+    actorBorder: "#6b9fff",
+    actorTextColor: "#ededf0",
+    signalColor: "#8b8b93",
+    signalTextColor: "#ededf0",
   },
 };
 
@@ -99,7 +99,7 @@ function clearSvgRootBackground(svg: string): string {
         return `${pre}${cleaned}${post}`;
       },
     )
-    .replace(/\sfill="(?:#0d1117|#000000|#000)"/gi, ' fill="none"');
+    .replace(/\sfill="(?:#111113|#0d1117|#0a0a0b|#000000|#000)"/gi, ' fill="none"');
 }
 
 /**

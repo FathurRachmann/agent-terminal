@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getBots, saveBots, type BotDefinition } from "../agent/bot-manager.js";
+import { soulPath as profileSoulPath } from "../agent/profiles/paths.js";
 import {
   applySettingsEnvToProcess,
   envPath,
@@ -58,6 +59,12 @@ const TOOL_CATALOG: Array<{
   { name: "browser_screenshot", category: "Browser", description: "Screenshot" },
   { name: "browser_close", category: "Browser", description: "Close browser" },
   { name: "vision_analyze", category: "Vision", description: "Analyze image" },
+  { name: "read_document", category: "Filesystem", description: "Read docx/xlsx text" },
+  { name: "graphify_status", category: "Codebase graph", description: "Graph ready?" },
+  { name: "graphify_query", category: "Codebase graph", description: "Query project graph" },
+  { name: "graphify_path", category: "Codebase graph", description: "Path between concepts" },
+  { name: "graphify_explain", category: "Codebase graph", description: "Explain a concept" },
+  { name: "graphify_update", category: "Codebase graph", description: "Refresh project graph" },
   { name: "desktop_automate", category: "Desktop", description: "macOS automation" },
   {
     name: "request_desktop_app_access",
@@ -100,12 +107,30 @@ function numEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+export type SettingsContext = {
+  /** Profile/agent state root (contains `.agent/`). */
+  agentHome: string;
+  /** Project tree for tools. */
+  workspaceRoot: string;
+  profileId?: string;
+};
+
 export function buildSettingsSnapshot(
-  workspaceRoot: string,
-  allowedFolders: string[] = [workspaceRoot],
+  ctx: SettingsContext | string,
+  allowedFolders?: string[],
 ): SettingsSnapshot {
-  applySettingsEnvToProcess(workspaceRoot);
-  const stored = loadStoredSettings(workspaceRoot);
+  const agentHome =
+    typeof ctx === "string" ? path.resolve(ctx) : path.resolve(ctx.agentHome);
+  const workspaceRoot =
+    typeof ctx === "string"
+      ? agentHome
+      : path.resolve(ctx.workspaceRoot || ctx.agentHome);
+  const profileId =
+    typeof ctx === "string" ? "default" : (ctx.profileId ?? "default");
+  const folders = allowedFolders ?? [workspaceRoot];
+
+  applySettingsEnvToProcess(agentHome);
+  const stored = loadStoredSettings(agentHome);
   const apiKey = process.env.ROUTER_API_KEY ?? "";
   const desktopFlag = (process.env.DESKTOP_AUTOMATION ?? "1").trim().toLowerCase();
   const desktopEnabled = !(
@@ -131,35 +156,38 @@ export function buildSettingsSnapshot(
       ptyTimeoutMs: numEnv("PTY_TIMEOUT_MS", 60_000),
       ptyPoolSize: numEnv("PTY_POOL_SIZE", 3),
       ptyShell: process.env.PTY_SHELL ?? "",
-      allowedFolders,
+      allowedFolders: folders,
     },
     desktop: {
       enabled: desktopEnabled,
-      apps: loadDesktopAllowlist(workspaceRoot),
+      apps: loadDesktopAllowlist(agentHome),
     },
     memory: {
       enableReflection: stored.agent.enableReflection,
-      agentsMd: readAgentsMd(workspaceRoot),
-      agentsMdPath: path.join(workspaceRoot, ".agent", "AGENTS.md"),
+      agentsMd: readAgentsMd(agentHome),
+      agentsMdPath: path.join(agentHome, ".agent", "AGENTS.md"),
     },
     ui: stored.ui,
-    bots: getBots(workspaceRoot),
+    bots: getBots(agentHome),
     toolCatalog: TOOL_CATALOG,
     paths: {
       workspaceRoot,
-      envPath: envPath(workspaceRoot),
-      settingsPath: settingsPath(workspaceRoot),
-      botsPath: path.join(workspaceRoot, ".agent", "bots.json"),
+      profileHome: agentHome,
+      profileId,
+      envPath: envPath(agentHome),
+      settingsPath: settingsPath(agentHome),
+      botsPath: path.join(agentHome, ".agent", "bots.json"),
       desktopAllowlistPath: path.join(
-        workspaceRoot,
+        agentHome,
         ".agent",
         "desktop-allowlist.json",
       ),
       capabilitiesPrefsPath: path.join(
-        workspaceRoot,
+        agentHome,
         ".agent",
         "capabilities-prefs.json",
       ),
+      soulPath: profileSoulPath(agentHome),
     },
     reloadRequiredHint:
       "Model, sandbox, and agent-behavior changes reload the engine when idle.",
@@ -167,10 +195,20 @@ export function buildSettingsSnapshot(
 }
 
 export function applySettingsUpdate(
-  workspaceRoot: string,
+  ctx: SettingsContext | string,
   patch: SettingsUpdatePayload,
 ): { snapshot: SettingsSnapshot; needsReload: boolean } {
-  const stored = loadStoredSettings(workspaceRoot);
+  const agentHome =
+    typeof ctx === "string" ? path.resolve(ctx) : path.resolve(ctx.agentHome);
+  const workspaceRoot =
+    typeof ctx === "string"
+      ? agentHome
+      : path.resolve(ctx.workspaceRoot || ctx.agentHome);
+  const profileId =
+    typeof ctx === "string" ? "default" : (ctx.profileId ?? "default");
+  const settingsCtx: SettingsContext = { agentHome, workspaceRoot, profileId };
+
+  const stored = loadStoredSettings(agentHome);
   let needsReload = false;
   const envUpdates: Record<string, string | undefined> = {};
   const envMirror: NonNullable<StoredSettings["env"]> = { ...(stored.env ?? {}) };
@@ -200,7 +238,6 @@ export function applySettingsUpdate(
       envMirror.CONTEXT_WINDOW_TOKENS = String(n);
     }
     if (m.routerApiKey !== undefined) {
-      // Only write when user explicitly provided a new value (or clear).
       envUpdates.ROUTER_API_KEY = m.routerApiKey;
       if (m.routerApiKey) process.env.ROUTER_API_KEY = m.routerApiKey;
       else delete process.env.ROUTER_API_KEY;
@@ -234,7 +271,7 @@ export function applySettingsUpdate(
       envMirror.DESKTOP_AUTOMATION = flag;
     }
     if (patch.desktop.apps) {
-      saveDesktopAllowlist(workspaceRoot, patch.desktop.apps);
+      saveDesktopAllowlist(agentHome, patch.desktop.apps);
     }
   }
 
@@ -253,30 +290,30 @@ export function applySettingsUpdate(
   }
 
   if (patch.memory?.agentsMd !== undefined) {
-    writeAgentsMd(workspaceRoot, patch.memory.agentsMd);
+    writeAgentsMd(agentHome, patch.memory.agentsMd);
   }
 
   if (patch.bots) {
-    saveBots(workspaceRoot, patch.bots);
+    saveBots(agentHome, patch.bots);
   }
 
   stored.env = envMirror;
-  saveStoredSettings(workspaceRoot, stored);
+  saveStoredSettings(agentHome, stored);
 
   if (Object.keys(envUpdates).length > 0) {
-    upsertEnvFile(envPath(workspaceRoot), envUpdates);
+    upsertEnvFile(envPath(agentHome), envUpdates);
   }
-  applySettingsEnvToProcess(workspaceRoot);
+  applySettingsEnvToProcess(agentHome);
 
   return {
-    snapshot: buildSettingsSnapshot(workspaceRoot),
+    snapshot: buildSettingsSnapshot(settingsCtx),
     needsReload,
   };
 }
 
-export function ensureSettingsFile(workspaceRoot: string): void {
-  const file = settingsPath(workspaceRoot);
+export function ensureSettingsFile(agentHome: string): void {
+  const file = settingsPath(agentHome);
   if (!fs.existsSync(file)) {
-    saveStoredSettings(workspaceRoot, loadStoredSettings(workspaceRoot));
+    saveStoredSettings(agentHome, loadStoredSettings(agentHome));
   }
 }

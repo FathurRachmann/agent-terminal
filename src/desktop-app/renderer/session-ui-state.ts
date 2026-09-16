@@ -1,15 +1,46 @@
 import type { AgentPhase, AgentUiEvent } from "../../cli/run-agent.js";
-import { shouldRenderAsReasoning } from "../../agent/sanitize-output.js";
+import {
+  resolveFinalAssistantText,
+  shouldRenderAsReasoning,
+} from "../../agent/sanitize-output.js";
 import { isPlanApprovalInterrupt } from "../../agent/interrupt-utils.js";
 import type { CanvasTab } from "./ActivityCanvas.js";
+import {
+  formatPlanApprovalMarkdown,
+  parseTaskPlanArgs,
+} from "./plan-approval.js";
+import { collectDeliverablePaths } from "../file-delivery-shared.js";
 
 export type DesktopAgentEvent = AgentUiEvent & { threadId?: string };
 
 export type ChatItem =
-  | { id: string; kind: "user"; text: string; at: string }
+  | {
+      id: string;
+      kind: "user";
+      text: string;
+      at: string;
+      attachments?: Array<{
+        path: string;
+        absPath?: string;
+        basename: string;
+        kind: "image" | "file";
+        mime?: string;
+        size?: number;
+        label?: string;
+        previewUrl?: string;
+      }>;
+    }
   | { id: string; kind: "assistant"; text: string; at: string }
   | { id: string; kind: "system"; text: string; at: string }
   | { id: string; kind: "reasoning"; text: string; at: string; label?: string }
+  | {
+      id: string;
+      kind: "file";
+      path: string;
+      basename: string;
+      at: string;
+      note?: string;
+    }
   | { id: string; kind: "trace"; event: AgentUiEvent; at: string };
 
 export type ActivityRow = { id: string; event: AgentUiEvent; at: string };
@@ -20,9 +51,11 @@ export type SessionUiSnap = {
   draftAnswer: string;
   phase: AgentPhase;
   planApprovalPending: boolean;
+  /** Markdown shown in chat PlanApprovalCard while waiting for Approve. */
+  pendingPlanMarkdown: string | null;
   canvasTabs: CanvasTab[];
   activeCanvasId: string | null;
-  railLayer: "trace" | "canvas";
+  railLayer: "canvas" | "files";
   pendingTools: Array<{ name: string; input: unknown }>;
   pendingDeliverables: string[];
   loading: boolean;
@@ -46,9 +79,10 @@ export function emptySessionSnap(
     draftAnswer: "",
     phase: "boot",
     planApprovalPending: false,
+    pendingPlanMarkdown: null,
     canvasTabs: [],
     activeCanvasId: null,
-    railLayer: "trace",
+    railLayer: "canvas",
     pendingTools: [],
     pendingDeliverables: [],
     loading: false,
@@ -84,7 +118,21 @@ export function reduceSessionEvent(
       };
     }
     if (event.phase === "done" || event.phase === "error") {
-      next = { ...next, planApprovalPending: false, loading: false };
+      // Keep plan-gate UI across a soft "done" after task_plan — the model often
+      // ends the turn while waiting for Approve. Only error clears the gate.
+      if (event.phase === "error") {
+        next = {
+          ...next,
+          planApprovalPending: false,
+          pendingPlanMarkdown: null,
+          loading: false,
+        };
+      } else {
+        next = { ...next, loading: false };
+      }
+    }
+    if (event.phase === "reflecting") {
+      next = { ...next, loading: false };
     }
     if (event.detail === "turn started") {
       next = { ...next, loading: true, phase: "thinking" };
@@ -104,7 +152,10 @@ export function reduceSessionEvent(
   }
 
   if (event.type === "done") {
-    const finalText = (event.text || next.draftAnswer).trim();
+    const finalText = resolveFinalAssistantText(
+      event.text,
+      next.draftAnswer,
+    ).trim();
     const items = [...next.items];
     if (finalText && shouldRenderAsReasoning(finalText)) {
       items.push({
@@ -121,6 +172,27 @@ export function reduceSessionEvent(
         text: finalText || "(empty response)",
         at,
       });
+    }
+    if (finalText) {
+      const paths = collectDeliverablePaths(
+        [finalText],
+        next.pendingDeliverables,
+      ).slice(0, 5);
+      const existing = new Set(
+        items.filter((i) => i.kind === "file").map((i) => i.path),
+      );
+      for (const p of paths) {
+        if (existing.has(p)) continue;
+        existing.add(p);
+        items.push({
+          id: `file-${id}-${p}`,
+          kind: "file",
+          path: p,
+          basename: p.split(/[/\\]/).pop() || p,
+          at,
+          note: "Open in app, or Save as… to download a copy",
+        });
+      }
     }
     next = {
       ...next,
@@ -144,7 +216,7 @@ export function reduceSessionEvent(
     };
   }
 
-  if (event.type !== "token") {
+  if (event.type !== "token" && event.type !== "pty") {
     const activity = [...next.activity, { id, event, at }];
     next = {
       ...next,
@@ -179,6 +251,18 @@ export function reduceSessionEvent(
         { id: `t-${id}`, kind: "trace", event: synthetic, at },
       ],
     };
+
+    if (event.name === "task_plan") {
+      const parsed = parseTaskPlanArgs(input);
+      if (parsed.plan || parsed.goal) {
+        next = {
+          ...next,
+          pendingPlanMarkdown: formatPlanApprovalMarkdown(parsed),
+          planApprovalPending: true,
+          railLayer: "canvas",
+        };
+      }
+    }
   }
 
   return next;

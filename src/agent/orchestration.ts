@@ -98,10 +98,11 @@ export function createOrchestrationTools() {
       name: "delegate_task",
       description:
         "Spawn ≥3 parallel sub-agent workers in ONE call (Promise pool). " +
-        "Use after task_plan when todos/research can run independently — do NOT wait " +
-        "one-by-one. Typical split: explorer + coder outline + reviewer, or 3 research slices. " +
-        "Each worker is an isolated LLM call (no shared tools). For full tool-using " +
-        "subagents (filesystem/PTY), also emit multiple `task` tool calls in the same turn.",
+        "Default for ≥3 independent LLM slices (research/outline/review) — do NOT wait " +
+        "one-by-one. For independent shell/filesystem probes, prefer multiple native " +
+        "`execute`/`grep`/`read_file` tool calls in the same turn (PTY pool). " +
+        "For full tool-using subagents (filesystem/PTY), also emit multiple `task` " +
+        "tool calls in the same turn.",
       schema: z.object({
         tasks: z
           .array(

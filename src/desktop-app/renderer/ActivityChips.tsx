@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   resolveArtifactsFromTool,
   pickAutoFocusArtifact,
@@ -28,7 +28,8 @@ export type AgentUiEvent =
   | { type: "done"; text: string }
   | { type: "error"; message: string }
   | { type: "reflection"; memoryIds: string[] }
-  | { type: "warning"; message: string };
+  | { type: "warning"; message: string }
+  | { type: "pty"; text: string };
 
 function shortJson(value: unknown, max = 280): string {
   try {
@@ -83,6 +84,8 @@ function eventTitle(ev: AgentUiEvent): string {
       return "error";
     case "done":
       return "done";
+    case "pty":
+      return "pty";
     default:
       return "event";
   }
@@ -109,6 +112,8 @@ export function eventBody(ev: AgentUiEvent): string {
     case "error":
       return safeStr(ev.message, "(no details)");
     case "done":
+      return truncate(safeStr(ev.text), 400);
+    case "pty":
       return truncate(safeStr(ev.text), 400);
     default:
       return "";
@@ -242,7 +247,7 @@ export function compactActivityLabel(ev: AgentUiEvent): {
       return { icon: "⏸", text: "Waiting for approval", color: "#e3b341" };
     }
     if (ev.phase === "reflecting") {
-      return { icon: "🧠", text: "Reflecting…", color: "#79b8ff" };
+      return { icon: "🧠", text: "Updating memories…", color: "#79b8ff" };
     }
     if (ev.phase === "reasoning") {
       return { icon: "💭", text: "Reasoning…", color: "#c3a6ff" };
@@ -261,9 +266,13 @@ export function compactActivityLabel(ev: AgentUiEvent): {
     };
   }
   if (ev.type === "reflection") {
+    const n = Array.isArray(ev.memoryIds) ? ev.memoryIds.length : 0;
     return {
       icon: "🧠",
-      text: `Stored ${Array.isArray(ev.memoryIds) ? ev.memoryIds.length : 0} memories`,
+      text:
+        n > 0
+          ? `Success updated memories (${n})`
+          : "Success updated memories",
       color: "#79b8ff",
     };
   }
@@ -286,11 +295,8 @@ export function shouldMirrorInChat(ev: AgentUiEvent): boolean {
   if (ev.type === "warning" || ev.type === "reflection") return true;
   if (ev.type === "context_compacted") return true;
   if (ev.type === "status") {
-    return (
-      ev.phase === "waiting_approval" ||
-      ev.phase === "reflecting" ||
-      ev.phase === "error"
-    );
+    // Never mirror reflecting — memory update is background; show success chip only.
+    return ev.phase === "waiting_approval" || ev.phase === "error";
   }
   return false;
 }
@@ -321,6 +327,152 @@ export function CompactActivityChip({ event }: { event: AgentUiEvent }) {
       {open && expandable && <DetailBlock text={detail} />}
     </div>
   );
+}
+
+/** Summary label for a finished batch of process chips. */
+export function summarizeTraceGroup(events: AgentUiEvent[]): {
+  icon: string;
+  text: string;
+  color: string;
+} {
+  if (events.length === 0) {
+    return { icon: "•", text: "No steps", color: "#8b949e" };
+  }
+  if (events.length === 1) {
+    return compactActivityLabel(events[0]!);
+  }
+  const labels = events.map((e) => compactActivityLabel(e));
+  const first = labels[0]!;
+  const sameText = labels.every((l) => l.text === first.text);
+  if (sameText) {
+    return {
+      icon: first.icon,
+      text: `${first.text} ×${events.length}`,
+      color: "#8b949e",
+    };
+  }
+  return {
+    icon: "⌘",
+    text: `${events.length} steps`,
+    color: "#8b949e",
+  };
+}
+
+/**
+ * Live turn: show each process chip expanded.
+ * After the turn finishes: collapse into one summary row (click to expand).
+ */
+export function CollapsibleTraceGroup({
+  entries,
+  live = false,
+}: {
+  entries: Array<{ id: string; event: AgentUiEvent }>;
+  live?: boolean;
+}) {
+  const [open, setOpen] = useState(live);
+
+  useEffect(() => {
+    setOpen(live);
+  }, [live]);
+
+  if (entries.length === 0) return null;
+
+  if (live) {
+    return (
+      <div className="flex max-w-[92%] flex-col gap-0.5 self-start pl-1">
+        {entries.map((row) => (
+          <CompactActivityChip key={row.id} event={row.event} />
+        ))}
+      </div>
+    );
+  }
+
+  const summary = summarizeTraceGroup(entries.map((e) => e.event));
+
+  return (
+    <div className="max-w-[92%] self-start pl-1">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="inline-flex max-w-full cursor-pointer items-center gap-2 border-0 bg-transparent py-0.5 text-left text-[11px] leading-snug"
+        style={{ color: summary.color }}
+        title={open ? "Collapse steps" : "Expand steps"}
+      >
+        <span className="w-2.5 shrink-0 text-[9px] text-muted">
+          {open ? "▾" : "▸"}
+        </span>
+        <span className="w-4 shrink-0 text-center opacity-95">{summary.icon}</span>
+        <span className="truncate text-fg-dim">{summary.text}</span>
+      </button>
+      {open && (
+        <div className="mt-0.5 ml-1 flex flex-col gap-0.5 border-l border-border pl-2">
+          {entries.map((row) => (
+            <CompactActivityChip key={row.id} event={row.event} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export type TraceChatItem = {
+  id: string;
+  kind: "trace";
+  event: AgentUiEvent;
+  at: string;
+};
+
+export type ChatSegmentItem = { id: string; kind: string };
+
+export type ChatTraceSegment<T extends TraceChatItem> = {
+  type: "traces";
+  items: T[];
+  live: boolean;
+};
+
+export type ChatSingleSegment<T extends ChatSegmentItem> = {
+  type: "single";
+  item: T;
+};
+
+/** Group consecutive process chips; mark the active turn's trailing group as live. */
+export function buildChatSegments<T extends ChatSegmentItem>(
+  items: T[],
+  loading: boolean,
+): Array<ChatSingleSegment<T> | ChatTraceSegment<Extract<T, TraceChatItem>>> {
+  let lastUserIndex = -1;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i]!.kind === "user") {
+      lastUserIndex = i;
+      break;
+    }
+  }
+
+  const out: Array<
+    ChatSingleSegment<T> | ChatTraceSegment<Extract<T, TraceChatItem>>
+  > = [];
+  let i = 0;
+  while (i < items.length) {
+    const item = items[i]!;
+    if (item.kind === "trace") {
+      const group: Array<Extract<T, TraceChatItem>> = [];
+      const start = i;
+      while (i < items.length && items[i]!.kind === "trace") {
+        group.push(items[i] as Extract<T, TraceChatItem>);
+        i += 1;
+      }
+      const hasAssistantAfter = items
+        .slice(i)
+        .some((x) => x.kind === "assistant");
+      const live = loading && start > lastUserIndex && !hasAssistantAfter;
+      out.push({ type: "traces", items: group, live });
+      continue;
+    }
+    out.push({ type: "single", item });
+    i += 1;
+  }
+  return out;
 }
 
 function prettyJson(value: unknown, max = 4000): string {

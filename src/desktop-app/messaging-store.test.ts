@@ -15,6 +15,7 @@ import {
   normalizeWhatsAppIdentity,
   parseAllowedUsersCsv,
   resolveWhatsAppAccessRole,
+  resolveWhatsAppAccessRoleFromCandidates,
   threadIdForWhatsAppJid,
 } from "./messaging-shared.js";
 import { WA_FRIEND_ALLOWED_TOOLS } from "./messaging-roles.js";
@@ -99,15 +100,25 @@ describe("messaging store / allowlist", () => {
     ]);
   });
 
-  it("prefers user role when number is in both lists", () => {
-    const cfg = coerceMessagingConfig({
-      whatsapp: {
-        users: ["628111000001"],
-        friends: ["628111000001", "628222000002"],
-      },
-    });
-    assert.deepEqual(cfg.whatsapp.friends, ["628222000002"]);
-    assert.equal(resolveWhatsAppAccessRole("628111000001", cfg.whatsapp), "user");
+  it("prefers user when any candidate is owner", () => {
+    const cfg = {
+      users: ["628111000001"],
+      friends: ["628222000002"],
+    };
+    assert.equal(
+      resolveWhatsAppAccessRoleFromCandidates(
+        ["999@lid", "628111000001@s.whatsapp.net"],
+        cfg,
+      ),
+      "user",
+    );
+    assert.equal(
+      resolveWhatsAppAccessRoleFromCandidates(
+        ["22969485119587@lid", "628222000002@s.whatsapp.net"],
+        cfg,
+      ),
+      "friend",
+    );
   });
 
   it("friend tool allowlist excludes shell and folder access", () => {

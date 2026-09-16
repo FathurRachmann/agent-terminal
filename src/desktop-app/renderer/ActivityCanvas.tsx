@@ -25,10 +25,16 @@ type PreviewPayload = {
   text?: string;
   html?: string;
   dataUrl?: string;
+  previewUrl?: string;
+  mime?: string;
+  size?: number;
+  sizeLabel?: string;
   sheets?: Array<{ name: string; rows: string[][] }>;
   truncated?: boolean;
   note?: string;
   basename?: string;
+  path?: string;
+  ext?: string;
 };
 
 type Props = {
@@ -158,6 +164,56 @@ function DocumentHtml({ html, title }: { html: string; title: string }) {
   );
 }
 
+function FileCard({
+  payload,
+  filePath,
+}: {
+  payload: PreviewPayload;
+  filePath: string;
+}) {
+  const open = () => {
+    void window.electronAgent?.openWorkspaceFile?.(filePath);
+  };
+  const reveal = () => {
+    void window.electronAgent?.revealWorkspaceFile?.(filePath);
+  };
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+      <div className="rounded-lg border border-border bg-surface-2 px-5 py-4">
+        <div className="text-[12px] font-semibold text-fg">
+          {payload.basename || "File"}
+        </div>
+        <div className="mt-1 text-[10px] text-muted">
+          {(payload.ext ? `.${payload.ext}` : "file") +
+            (payload.sizeLabel ? ` · ${payload.sizeLabel}` : "") +
+            (payload.mime ? ` · ${payload.mime}` : "")}
+        </div>
+        {payload.note && (
+          <div className="mt-2 max-w-sm text-[10px] leading-snug text-muted">
+            {payload.note}
+          </div>
+        )}
+      </div>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={open}
+          className="rounded-md bg-accent px-3 py-1.5 text-[11px] font-semibold text-surface-0"
+        >
+          Open
+        </button>
+        <button
+          type="button"
+          onClick={reveal}
+          className="rounded-md border border-border bg-surface-2 px-3 py-1.5 text-[11px] text-fg"
+        >
+          Reveal
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function artifactToCanvasTab(artifact: ActivityArtifact): CanvasTab {
   return {
     id: normalizeCanvasKey(artifact.path),
@@ -241,8 +297,8 @@ export function ActivityCanvas({
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="flex flex-1 items-center justify-center px-4 text-center text-[10.5px] text-muted">
-          Canvas kosong. Buka file dari Trace (Read / Write / Edit) untuk preview
-          .md, kode, .html, .csv, .xlsx, .docx.
+          Canvas kosong. Buka file dari Trace / Files untuk preview apa saja
+          (PDF, gambar, media, dokumen, kode, atau file binary).
         </div>
         {planApproval?.pending && (
           <div className="shrink-0 border-t border-border bg-surface-2 px-3 py-2.5">
@@ -319,7 +375,7 @@ export function ActivityCanvas({
         {!loading && payload && !payload.ok && (
           <div className="p-3 text-[10.5px] text-danger">{payload.error}</div>
         )}
-        {!loading && payload?.ok && payload.note && !text && !payload.html && !sheets.length && (
+        {!loading && payload?.ok && payload.note && !text && !payload.html && !sheets.length && !payload.previewUrl && !payload.dataUrl && kind !== "binary" && (
           <div className="p-3 text-[10.5px] text-muted">{payload.note}</div>
         )}
         {!loading && payload?.ok && kind === "markdown" && text && (
@@ -338,10 +394,49 @@ export function ActivityCanvas({
             />
           </div>
         )}
-        {!loading && payload?.ok && kind === "image" && payload.dataUrl && (
+        {!loading && payload?.ok && kind === "pdf" && payload.previewUrl && (
+          <iframe
+            title={active?.basename ?? "pdf"}
+            src={payload.previewUrl}
+            className="h-full min-h-[200px] w-full border-0 bg-surface-1"
+          />
+        )}
+        {!loading && payload?.ok && kind === "media" && payload.previewUrl && (
+          <div className="flex h-full items-center justify-center overflow-auto p-3">
+            {(payload.mime?.startsWith("audio/") ||
+              payload.language === "audio") ? (
+              <audio
+                controls
+                src={payload.previewUrl}
+                className="w-full max-w-xl"
+              >
+                <track kind="captions" />
+              </audio>
+            ) : (
+              <video
+                controls
+                src={payload.previewUrl}
+                className="max-h-full max-w-full rounded-md border border-border"
+              >
+                <track kind="captions" />
+              </video>
+            )}
+          </div>
+        )}
+        {!loading &&
+          payload?.ok &&
+          (kind === "binary" ||
+            (kind === "document" && !payload.html) ||
+            (kind === "unsupported" && !text)) && (
+            <FileCard
+              payload={payload}
+              filePath={active?.path ?? payload.path ?? ""}
+            />
+          )}
+        {!loading && payload?.ok && kind === "image" && (payload.dataUrl || payload.previewUrl) && (
           <div className="flex h-full items-start justify-center overflow-auto p-3">
             <img
-              src={payload.dataUrl}
+              src={payload.dataUrl || payload.previewUrl}
               alt={active?.basename ?? "image"}
               className="max-h-full max-w-full rounded-md border border-border object-contain"
             />
@@ -400,6 +495,11 @@ export function ActivityCanvas({
           !text &&
           !payload.html &&
           !sheets.length &&
+          !payload.previewUrl &&
+          !payload.dataUrl &&
+          kind !== "binary" &&
+          kind !== "pdf" &&
+          kind !== "media" &&
           payload.note && (
             <div className="p-3 text-[10.5px] text-muted">{payload.note}</div>
           )}

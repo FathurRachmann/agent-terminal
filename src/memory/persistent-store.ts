@@ -17,8 +17,9 @@ export class PersistentMemoryStore {
   readonly dbPath: string;
   private readonly db: DatabaseSync;
 
-  constructor(workspaceRoot: string) {
-    const dir = path.join(workspaceRoot, ".agent", "memory");
+  constructor(workspaceRoot: string, agentHome?: string) {
+    const stateRoot = path.resolve(agentHome ?? workspaceRoot);
+    const dir = path.join(stateRoot, ".agent", "memory");
     fs.mkdirSync(dir, { recursive: true });
     this.dbPath = path.join(dir, "persistent.sqlite");
     this.db = new DatabaseSync(this.dbPath);
@@ -196,6 +197,10 @@ export class PersistentMemoryStore {
   syncRulesToAgentsMd(agentsMdPath: string): void {
     const rules = this.list({ kind: "rule", limit: 100 });
     const prefs = this.list({ kind: "preference", limit: 40 });
+    const chatCtx = this.list({ kind: "fact", limit: 80 })
+      .filter((r) => r.tags.includes("chat-context"))
+      .sort((a, b) => b.importance - a.importance || b.updatedAt - a.updatedAt)
+      .slice(0, 30);
     const lines = [
       "# Agent Memory",
       "",
@@ -213,6 +218,16 @@ export class PersistentMemoryStore {
     } else {
       for (const pref of prefs) {
         lines.push(`- ${pref.content}`);
+      }
+    }
+    lines.push("", "## Chat context", "");
+    if (chatCtx.length === 0) {
+      lines.push(
+        "- (none yet — learned from corrections, \"ingat…\", and standing chat instructions)",
+      );
+    } else {
+      for (const item of chatCtx) {
+        lines.push(`- ${item.content}`);
       }
     }
     lines.push("");

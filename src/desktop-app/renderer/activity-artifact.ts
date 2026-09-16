@@ -7,6 +7,9 @@ export type PreviewKind =
   | "csv"
   | "spreadsheet"
   | "document"
+  | "pdf"
+  | "media"
+  | "binary"
   | "image"
   | "text"
   | "unsupported";
@@ -87,6 +90,8 @@ export function canvasResultRank(kind: PreviewKind): number {
   switch (kind) {
     case "document":
       return 100;
+    case "pdf":
+      return 98;
     case "spreadsheet":
       return 90;
     case "html":
@@ -95,8 +100,12 @@ export function canvasResultRank(kind: PreviewKind): number {
       return 70;
     case "image":
       return 65;
+    case "media":
+      return 62;
     case "markdown":
       return 60;
+    case "binary":
+      return 40;
     case "text":
       return 25;
     case "code":
@@ -175,6 +184,42 @@ export function extensionOf(p: string): string {
   return base.slice(i + 1);
 }
 
+/** True when inline text looks like a workspace-relative file path users can open. */
+export function looksLikeWorkspacePath(raw: string): boolean {
+  const t = String(raw || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!t || t.length > 300 || /\s/.test(t)) return false;
+  if (/^[`'"([{]/.test(t)) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return false;
+  // path/to/file.ext or ./file.ext or file.ext
+  if (
+    !/^(?:\.?\.?\/)?[\w.@+-]+(?:\/[\w.@+-]+)*\.[A-Za-z0-9]{1,12}$/.test(t)
+  ) {
+    return false;
+  }
+  const ext = extensionOf(t);
+  if (!ext) return false;
+  const kind = inferPreviewKind(ext);
+  const hasSlash = t.includes("/");
+  // Bare `console.log`-style tokens: only allow common deliverable extensions.
+  if (!hasSlash) {
+    return (
+      kind === "markdown" ||
+      kind === "document" ||
+      kind === "pdf" ||
+      kind === "spreadsheet" ||
+      kind === "html" ||
+      kind === "csv" ||
+      kind === "image" ||
+      kind === "media" ||
+      kind === "binary"
+    );
+  }
+  if (ext in CODE_EXT) return true;
+  return kind !== "unsupported";
+}
+
 export function inferPreviewKind(ext: string): PreviewKind {
   const e = ext.toLowerCase();
   if (e === "md" || e === "mdx" || e === "markdown") return "markdown";
@@ -186,9 +231,23 @@ export function inferPreviewKind(ext: string): PreviewKind {
   if (e === "docx" || e === "doc" || e === "docs" || e === "rtf" || e === "odt") {
     return "document";
   }
-  if (e === "pdf") return "document";
+  if (e === "pdf") return "pdf";
   if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif"].includes(e)) {
     return "image";
+  }
+  if (
+    ["mp4", "webm", "mov", "mkv", "m4v", "avi", "mp3", "wav", "ogg", "m4a", "aac", "flac"].includes(
+      e,
+    )
+  ) {
+    return "media";
+  }
+  if (
+    ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "dmg", "iso", "exe", "bin", "onnx", "wasm"].includes(
+      e,
+    )
+  ) {
+    return "binary";
   }
   if (e in CODE_EXT) return e === "html" || e === "htm" ? "html" : "code";
   if (e === "txt" || e === "log") return "text";
@@ -267,23 +326,75 @@ function artifactFromPath(
 /**
  * Pull deliverable file paths (.docx, .xlsx, .md, …) out of free text
  * (shell commands, script bodies, tool output).
+ * Supports spaces inside backticks/quotes (e.g. `working/LAPORAN … DIANDRA.doc`).
  */
 export function extractResultPathsFromText(text: string): string[] {
   if (!text) return [];
-  const re =
-    /(?:^|[\s"'=`(,\[{])((?:\.?\.?\/)?[\w./\\-]+\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))/gi;
   const found: string[] = [];
   const seen = new Set<string>();
+
+  const refineQuoted = (raw: string): string => {
+    let t = String(raw || "")
+      .trim()
+      .replace(/\\/g, "/");
+    if (!t) return "";
+    if (t.includes("/")) {
+      // Drop leading prose before the first path-looking segment
+      const idx = t.search(/(?:\.\.?\/|[A-Za-z0-9_.-]+\/)/);
+      if (idx > 0) t = t.slice(idx);
+      return t;
+    }
+    if (!/\s/.test(t)) return t;
+    // Spaced filename without slash — strip leading noise words ("wrote foo.docx")
+    const noise =
+      /^(wrote|saved|created|file|path|at|to|the|a|an|output|result|here|see)$/i;
+    const tokens = t.split(/\s+/);
+    while (tokens.length > 1 && noise.test(tokens[0] || "")) tokens.shift();
+    return tokens.join(" ");
+  };
+
+  const push = (raw: string, quoted = false) => {
+    let p = quoted ? refineQuoted(raw) : String(raw || "").trim().replace(/\\/g, "/");
+    p = p.replace(/[.,;:!?)\]}]+$/g, "");
+    if (!p || seen.has(p)) return;
+    const kind = inferPreviewKind(extensionOf(p));
+    if (canvasResultRank(kind) < 60) return;
+    seen.add(p);
+    found.push(p);
+  };
+
+  // 1) Backtick-quoted paths (may contain spaces)
+  const tickRe =
+    /`([^`\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))`/gi;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const raw = (m[1] || "").replace(/\\/g, "/");
-    if (!raw || seen.has(raw)) continue;
-    const kind = inferPreviewKind(extensionOf(raw));
-    if (canvasResultRank(kind) < 60) continue;
-    seen.add(raw);
-    found.push(raw);
-  }
-  return found;
+  while ((m = tickRe.exec(text)) !== null) push(m[1] || "", true);
+
+  // 2) Double / single quoted paths (may contain spaces)
+  const dqRe =
+    /"([^"\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))"/gi;
+  while ((m = dqRe.exec(text)) !== null) push(m[1] || "", true);
+  const sqRe =
+    /'([^'\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))'/gi;
+  while ((m = sqRe.exec(text)) !== null) push(m[1] || "", true);
+
+  // 3) Unquoted paths (no spaces) — classic working/foo.docx
+  const unquoted =
+    /(?:^|[\s"'=`(,\[{])((?:\.?\.?\/)?[\w./\\-]+\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))/gi;
+  while ((m = unquoted.exec(text)) !== null) push(m[1] || "", false);
+
+  // Drop bare basenames that are clearly truncated from a longer path match
+  return found.filter((p) => {
+    if (p.includes("/")) return true;
+    return !found.some(
+      (other) =>
+        other !== p &&
+        other.includes("/") &&
+        (other.endsWith(`/${p}`) ||
+          other.endsWith(` ${p}`) ||
+          other.endsWith(`-${p}`) ||
+          other.endsWith(` - ${p}`)),
+    );
+  });
 }
 
 export function resolveArtifactFromTool(options: {

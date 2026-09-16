@@ -1,7 +1,13 @@
 export type { MemoryKind, MemoryRecord, MemoryWriteInput, MemorySearchHit } from "./types.js";
 export { PersistentMemoryStore } from "./persistent-store.js";
 export { SessionStore } from "./session-store.js";
-export type { SessionState, TranscriptEvent, TranscriptRole } from "./session-store.js";
+export type {
+  SessionState,
+  SessionListItem,
+  SessionMeta,
+  TranscriptEvent,
+  TranscriptRole,
+} from "./session-store.js";
 export {
   rankRelevantMemories,
   formatMemoriesForPrompt,
@@ -29,3 +35,8 @@ export {
   formatStandardGuideline,
   deterministicGuideline,
 } from "./guideline.js";
+export {
+  extractChatContextFromTurn,
+  isChatContextContent,
+} from "./chat-context.js";
+export type { ChatContextItem, ChatContextKind } from "./chat-context.js";

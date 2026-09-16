@@ -124,13 +124,13 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
           : "Copy SQL";
 
   return (
-    <div className="mb-3 overflow-hidden rounded-[10px] border border-[#2a313c] bg-[#0d1117] shadow-[0_8px_24px_rgba(0,0,0,0.28)]">
-      <div className="flex items-center justify-between gap-2 border-b border-[#2a313c] bg-gradient-to-b from-[#161b22] to-[#12171e] px-3 py-2">
+    <div className="mb-3 overflow-hidden rounded-[10px] border border-border bg-surface-1 shadow-[0_8px_24px_rgba(0,0,0,0.4)]">
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-gradient-to-b from-surface-3 to-surface-2 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[9.5px] font-semibold tracking-wide text-accent uppercase">
             Schema
           </span>
-          <span className="truncate font-mono text-[11px] text-[#e6edf3]">
+          <span className="truncate font-mono text-[11px] text-fg">
             {filename || (isDbmlSource ? "schema.dbml" : "schema.sql")}
           </span>
         </div>
@@ -174,7 +174,7 @@ export function DbSchemaDiagram({ code, filename, language = "sql" }: Props) {
       </div>
 
       {layer === "diagram" ? (
-        <div className="bg-[#0d1117] p-3">
+        <div className="bg-surface-1 p-3">
           {busy && (
             <div className="py-6 text-center text-[11px] text-muted">
               Rendering schema diagram…

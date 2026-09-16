@@ -79,6 +79,22 @@ export function resolveWhatsAppAccessRole(
   return null;
 }
 
+/**
+ * Prefer phone/user match across LID + PN candidates (Baileys may present both).
+ */
+export function resolveWhatsAppAccessRoleFromCandidates(
+  candidates: string[],
+  config: Pick<WhatsAppMessagingConfig, "users" | "friends">,
+): WhatsAppAccessRole | null {
+  let friend: WhatsAppAccessRole | null = null;
+  for (const c of candidates) {
+    const role = resolveWhatsAppAccessRole(c, config);
+    if (role === "user") return "user";
+    if (role === "friend") friend = "friend";
+  }
+  return friend;
+}
+
 export function parseAllowedUsersCsv(csv: string): string[] {
   return String(csv || "")
     .split(/[,;\n]+/)

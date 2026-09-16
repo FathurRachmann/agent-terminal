@@ -69,3 +69,16 @@ export function shouldRenderAsReasoning(text: string): boolean {
 export function sanitizeAssistantText(text: string): string {
   return stripThinkBlocks(text);
 }
+
+/** Prefer the longest sanitized user-facing answer (stream draft vs done payload). */
+export function resolveFinalAssistantText(
+  eventText: string | undefined,
+  draft: string,
+): string {
+  const fromEvent = sanitizeAssistantText(String(eventText ?? "")).trim();
+  const fromDraft = sanitizeAssistantText(draft).trim();
+  if (!fromEvent && !fromDraft) return "";
+  if (!fromEvent) return fromDraft;
+  if (!fromDraft) return fromEvent;
+  return fromDraft.length > fromEvent.length ? fromDraft : fromEvent;
+}

@@ -223,14 +223,43 @@ export function createNormalizeAiMessageMiddleware() {
   return createMiddleware({
     name: "NormalizeAiMessageMiddleware",
     wrapModelCall: async (request, handler) => {
-      const response = await handler(request);
-      if (isCommand(response)) return response;
-      const normalized = normalizeToAiMessage(response as BaseMessage);
-      // Guarantee instanceof AIMessage for middleware validators (avoid cross-copy duck types).
-      if (AIMessageChunk.isInstance(normalized) || AIMessage.isInstance(normalized)) {
-        return normalized;
+      let response: unknown;
+      try {
+        response = await handler(request);
+      } catch (err) {
+        throw rewriteProviderSdkCrash(err);
       }
-      return new AIMessage({ content: String(normalized ?? "") });
+      if (isCommand(response)) return response;
+      try {
+        const normalized = normalizeToAiMessage(response as BaseMessage);
+        // Guarantee instanceof AIMessage for middleware validators (avoid cross-copy duck types).
+        if (
+          AIMessageChunk.isInstance(normalized) ||
+          AIMessage.isInstance(normalized)
+        ) {
+          return normalized;
+        }
+        return new AIMessage({ content: String(normalized ?? "") });
+      } catch (err) {
+        throw rewriteProviderSdkCrash(err);
+      }
     },
   });
+}
+
+/** 9router / OpenAI SDK sometimes throws TypeError on malformed error payloads. */
+export function rewriteProviderSdkCrash(err: unknown): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    /cannot read propert(?:y|ies) of undefined \(reading ['"]message['"]\)/i.test(
+      msg,
+    )
+  ) {
+    return new Error(
+      "Model/provider returned a malformed error payload (missing error.message). " +
+        "Retry the turn, or check ROUTER_BASE_URL / AGENT_MODEL health. " +
+        `Original: ${msg}`,
+    );
+  }
+  return err instanceof Error ? err : new Error(msg);
 }

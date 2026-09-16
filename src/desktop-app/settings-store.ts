@@ -14,8 +14,17 @@ export type AgentBehaviorSettings = {
 
 export type UiSettings = {
   defaultRailOpen: boolean;
-  defaultRailLayer: "trace" | "canvas";
+  /** Right activity rail default tab. Legacy `"trace"` maps to `"canvas"`. */
+  defaultRailLayer: "canvas" | "files";
   compactActivity: boolean;
+  /** Show `phase: …` in the app footer. */
+  showFooterPhase: boolean;
+  /** Show Learned memory popover button in the footer. */
+  showLearnedInFooter: boolean;
+  /** Make workspace file paths in chat clickable → open Canvas. */
+  openChatPathsInCanvas: boolean;
+  /** Prefer longer streamed draft when done payload is shorter. */
+  preferStreamedAnswer: boolean;
 };
 
 export type StoredSettings = {
@@ -74,11 +83,14 @@ export type SettingsSnapshot = {
   toolCatalog: Array<{ name: string; category: string; description: string }>;
   paths: {
     workspaceRoot: string;
+    profileHome: string;
+    profileId: string;
     envPath: string;
     settingsPath: string;
     botsPath: string;
     desktopAllowlistPath: string;
     capabilitiesPrefsPath: string;
+    soulPath: string;
   };
   reloadRequiredHint: string;
 };
@@ -94,9 +106,23 @@ const DEFAULT_AGENT: AgentBehaviorSettings = {
 
 const DEFAULT_UI: UiSettings = {
   defaultRailOpen: true,
-  defaultRailLayer: "trace",
+  defaultRailLayer: "canvas",
   compactActivity: false,
+  showFooterPhase: true,
+  showLearnedInFooter: true,
+  openChatPathsInCanvas: true,
+  preferStreamedAnswer: true,
 };
+
+function normalizeUiSettings(raw: Partial<UiSettings> | undefined): UiSettings {
+  const merged = { ...DEFAULT_UI, ...(raw ?? {}) };
+  const layer = String(
+    (raw as { defaultRailLayer?: string } | undefined)?.defaultRailLayer ??
+      merged.defaultRailLayer,
+  );
+  merged.defaultRailLayer = layer === "files" ? "files" : "canvas";
+  return merged;
+}
 
 export function settingsPath(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".agent", "settings.json");
@@ -120,7 +146,7 @@ export function loadStoredSettings(workspaceRoot: string): StoredSettings {
   return {
     version: 1,
     agent: { ...DEFAULT_AGENT, ...(raw?.agent ?? {}) },
-    ui: { ...DEFAULT_UI, ...(raw?.ui ?? {}) },
+    ui: normalizeUiSettings(raw?.ui),
     env: raw?.env ?? {},
   };
 }
@@ -134,7 +160,7 @@ export function saveStoredSettings(
   const payload: StoredSettings = {
     version: 1,
     agent: { ...DEFAULT_AGENT, ...settings.agent },
-    ui: { ...DEFAULT_UI, ...settings.ui },
+    ui: normalizeUiSettings(settings.ui),
     env: settings.env ?? {},
   };
   fs.writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -142,6 +168,24 @@ export function saveStoredSettings(
 
 /** Apply settings.json env overrides into process.env (boot + after save). */
 export function applySettingsEnvToProcess(workspaceRoot: string): void {
+  // Profile or workspace `.env` overlays (dotenv already loaded workspace cwd `.env`).
+  const file = envPath(workspaceRoot);
+  if (fs.existsSync(file)) {
+    try {
+      const content = fs.readFileSync(file, "utf8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0) continue;
+        const key = trimmed.slice(0, eq).trim();
+        const value = trimmed.slice(eq + 1);
+        if (key) process.env[key] = value;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   const stored = loadStoredSettings(workspaceRoot);
   const env = stored.env ?? {};
   for (const [key, value] of Object.entries(env)) {

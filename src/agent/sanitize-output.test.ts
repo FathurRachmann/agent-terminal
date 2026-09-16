@@ -4,6 +4,7 @@ import {
   isJunkGuideline,
   looksLikeIncompleteReasoning,
   looksLikeProviderNotice,
+  resolveFinalAssistantText,
   shouldRenderAsReasoning,
   stripThinkBlocks,
 } from "./sanitize-output.js";
@@ -49,5 +50,15 @@ describe("sanitize-output", () => {
     assert.equal(looksLikeProviderNotice(notice), true);
     assert.equal(shouldRenderAsReasoning(notice), true);
     assert.equal(shouldRenderAsReasoning("Folder created successfully."), false);
+  });
+
+  it("keeps longer streamed draft when done payload is shorter", () => {
+    const draft =
+      "1. First point\n2. **Logic error**: variable might be unset in edge cases.\n3. Done.";
+    const done = "1. First point\n2. **Logic error**: variable might be unset in edge";
+    assert.equal(
+      resolveFinalAssistantText(done, draft),
+      draft,
+    );
   });
 });

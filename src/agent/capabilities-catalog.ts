@@ -33,7 +33,7 @@ const BUILTIN_TOOLS: Array<{
     id: "tool:execute",
     name: "execute",
     category: "Shell",
-    description: "Run commands in the PTY pool (default 3 parallel slots).",
+    description: "Run commands in the PTY pool (default 3 parallel slots). Prefer multiple execute calls in one turn for independent commands.",
     detail:
       "Persistent interactive shell. Supports JSON payload `{ command, stdin?, background?, timeoutMs? }`. Independent commands can run across up to 3 PTY slots.",
   },
@@ -85,7 +85,7 @@ const BUILTIN_TOOLS: Array<{
     category: "Orchestration",
     description: "Delegate to explorer / coder / reviewer subagents.",
     detail:
-      "Deep Agents `task` tool. Prefer multiple `task` calls in one turn when workstreams are independent.",
+      "Deep Agents `task` tool. Skills with frontmatter `agent:` register extra subagents at boot. Prefer multiple `task` calls in one turn when independent.",
   },
 ];
 
@@ -151,7 +151,8 @@ const CUSTOM_TOOLS: Array<{
     name: "delegate_task",
     category: "Orchestration",
     description: "Spawn ≥3 parallel LLM workers in one call.",
-    detail: "Promise-pool workers for independent research/outline/review slices.",
+    detail:
+      "Usually unnecessary after approved task_todos — runtime already injects fixed explorer/coder/reviewer synthesis. Use for a new independent research batch only.",
   },
   {
     id: "tool:web_search",
@@ -278,6 +279,50 @@ const CUSTOM_TOOLS: Array<{
     category: "Vision",
     description: "Multimodal analysis of a local image/screenshot.",
     detail: "Describe UI state, errors, or visual diffs.",
+  },
+  {
+    id: "tool:read_document",
+    name: "read_document",
+    category: "Filesystem",
+    description: "Extract text from Word/Excel/text documents.",
+    detail:
+      "Use for .docx/.xlsx instead of read_file (those are binary ZIP packages).",
+  },
+  {
+    id: "tool:graphify_status",
+    name: "graphify_status",
+    category: "Codebase graph",
+    description: "Check project Graphify graph readiness.",
+    detail: "Looks for <project>/graphify-out/graph.json (project-scoped).",
+  },
+  {
+    id: "tool:graphify_query",
+    name: "graphify_query",
+    category: "Codebase graph",
+    description: "Query the project knowledge graph for architecture questions.",
+    detail:
+      "Cursor-style: prefer this when graph exists before broad grep / reading GRAPH_REPORT.md.",
+  },
+  {
+    id: "tool:graphify_path",
+    name: "graphify_path",
+    category: "Codebase graph",
+    description: "Shortest path between two concepts in the project graph.",
+    detail: "e.g. AuthModule → Database.",
+  },
+  {
+    id: "tool:graphify_explain",
+    name: "graphify_explain",
+    category: "Codebase graph",
+    description: "Explain a concept/node and its neighbors.",
+    detail: "Plain-language subgraph summary.",
+  },
+  {
+    id: "tool:graphify_update",
+    name: "graphify_update",
+    category: "Codebase graph",
+    description: "Build or refresh the project Graphify graph.",
+    detail: "AST-only update into <project>/graphify-out/ (not per session).",
   },
   {
     id: "tool:desktop_automate",

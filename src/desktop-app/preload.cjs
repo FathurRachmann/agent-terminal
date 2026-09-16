@@ -1,10 +1,31 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAgent", {
-  sendPrompt: (prompt) => ipcRenderer.invoke("agent:sendPrompt", prompt),
+  sendPrompt: (prompt, attachments) =>
+    ipcRenderer.invoke(
+      "agent:sendPrompt",
+      attachments?.length
+        ? { prompt, attachments }
+        : prompt,
+    ),
+  pickAttachments: (options) =>
+    ipcRenderer.invoke("agent:pickAttachments", options || {}),
+  importAttachmentPaths: (paths) =>
+    ipcRenderer.invoke("agent:importAttachmentPaths", { paths }),
+  importAttachmentBuffer: (payload) =>
+    ipcRenderer.invoke("agent:importAttachmentBuffer", payload || {}),
+  getPathForFile: (file) => {
+    try {
+      return webUtils?.getPathForFile?.(file) || file?.path || "";
+    } catch {
+      return file?.path || "";
+    }
+  },
+
   selfHeal: (payload) => ipcRenderer.invoke("agent:selfHeal", payload || {}),
   selfHealStatus: () => ipcRenderer.invoke("agent:selfHealStatus"),
   getStatus: () => ipcRenderer.invoke("agent:getStatus"),
+  getGitSummary: () => ipcRenderer.invoke("agent:getGitSummary"),
   getBots: () => ipcRenderer.invoke("agent:getBots"),
   setActiveBot: (botId) => ipcRenderer.invoke("agent:setActiveBot", botId),
   getLearnedRules: () => ipcRenderer.invoke("agent:getLearnedRules"),
@@ -14,17 +35,48 @@ contextBridge.exposeInMainWorld("electronAgent", {
   listSessions: () => ipcRenderer.invoke("agent:listSessions"),
   newSession: () => ipcRenderer.invoke("agent:newSession"),
   openSession: (threadId) => ipcRenderer.invoke("agent:openSession", threadId),
+  clearSession: (threadId) => ipcRenderer.invoke("agent:clearSession", threadId),
+  deleteSession: (threadId) =>
+    ipcRenderer.invoke("agent:deleteSession", threadId),
+  moveSessionToProject: (threadId, projectId) =>
+    ipcRenderer.invoke("agent:moveSessionToProject", { threadId, projectId }),
   listProcesses: () => ipcRenderer.invoke("agent:listProcesses"),
   pollProcess: (pid) => ipcRenderer.invoke("agent:pollProcess", pid),
   killProcess: (pid) => ipcRenderer.invoke("agent:killProcess", pid),
+  terminalCreate: (opts) => ipcRenderer.invoke("terminal:create", opts || {}),
+  terminalWrite: (id, data) =>
+    ipcRenderer.invoke("terminal:write", { id, data }),
+  terminalResize: (id, cols, rows) =>
+    ipcRenderer.invoke("terminal:resize", { id, cols, rows }),
+  terminalKill: (id) => ipcRenderer.invoke("terminal:kill", id),
+  terminalList: () => ipcRenderer.invoke("terminal:list"),
+  onTerminalData: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("terminal:data", listener);
+    return () => ipcRenderer.removeListener("terminal:data", listener);
+  },
+  onTerminalExit: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("terminal:exit", listener);
+    return () => ipcRenderer.removeListener("terminal:exit", listener);
+  },
   listCapabilities: () => ipcRenderer.invoke("agent:listCapabilities"),
   listArtifacts: () => ipcRenderer.invoke("agent:listArtifacts"),
   setCapabilityEnabled: (id, enabled) =>
     ipcRenderer.invoke("agent:setCapabilityEnabled", { id, enabled }),
   readWorkspacePreview: (filePath) =>
     ipcRenderer.invoke("agent:readWorkspacePreview", { path: filePath }),
+  listWorkspaceDir: (dirPath) =>
+    ipcRenderer.invoke("agent:listWorkspaceDir", { path: dirPath || "" }),
+  listWorkspaceChanges: () => ipcRenderer.invoke("agent:listWorkspaceChanges"),
   discoverDeliverables: (payload) =>
     ipcRenderer.invoke("agent:discoverDeliverables", payload || {}),
+  exportWorkspaceFile: (filePath) =>
+    ipcRenderer.invoke("agent:exportWorkspaceFile", { path: filePath }),
+  revealWorkspaceFile: (filePath) =>
+    ipcRenderer.invoke("agent:revealWorkspaceFile", { path: filePath }),
+  openWorkspaceFile: (filePath) =>
+    ipcRenderer.invoke("agent:openWorkspaceFile", { path: filePath }),
   resolveApproval: (approve, threadId) =>
     ipcRenderer.invoke("agent:resolveApproval", {
       approve: Boolean(approve),
@@ -46,5 +98,74 @@ contextBridge.exposeInMainWorld("electronAgent", {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on("messaging:event", listener);
     return () => ipcRenderer.removeListener("messaging:event", listener);
+  },
+  listProfiles: () => ipcRenderer.invoke("profiles:list"),
+  getProfile: (id) => ipcRenderer.invoke("profiles:get", id),
+  createProfile: (payload) => ipcRenderer.invoke("profiles:create", payload || {}),
+  updateProfileSoul: (payload) =>
+    ipcRenderer.invoke("profiles:updateSoul", payload || {}),
+  setDefaultProfile: (id) => ipcRenderer.invoke("profiles:setDefault", id),
+  switchProfile: (id) => ipcRenderer.invoke("profiles:switch", id),
+  listProjects: () => ipcRenderer.invoke("projects:list"),
+  createProject: (payload) =>
+    ipcRenderer.invoke("projects:create", payload || {}),
+  updateProject: (payload) =>
+    ipcRenderer.invoke("projects:update", payload || {}),
+  deleteProject: (id) => ipcRenderer.invoke("projects:delete", id),
+  setActiveProject: (id) => ipcRenderer.invoke("projects:setActive", id),
+  pickProjectFolder: () => ipcRenderer.invoke("projects:pickFolder"),
+  getGatewayStatus: () => ipcRenderer.invoke("gateway:getStatus"),
+  testLocalGateway: () => ipcRenderer.invoke("gateway:testLocal"),
+  setGatewayMode: (mode) => ipcRenderer.invoke("gateway:setMode", { mode }),
+  openGatewayLogs: () => ipcRenderer.invoke("gateway:openLogs"),
+
+  // Kanban
+  kanbanBoardsList: () => ipcRenderer.invoke("kanban:boards:list"),
+  kanbanBoardsCreate: (payload) =>
+    ipcRenderer.invoke("kanban:boards:create", payload || {}),
+  kanbanBoardsSwitch: (slug) => ipcRenderer.invoke("kanban:boards:switch", slug),
+  kanbanBoardsRename: (payload) =>
+    ipcRenderer.invoke("kanban:boards:rename", payload || {}),
+  kanbanBoardsUpdate: (payload) =>
+    ipcRenderer.invoke("kanban:boards:update", payload || {}),
+  kanbanBoardsArchive: (slug) => ipcRenderer.invoke("kanban:boards:archive", slug),
+  kanbanBoardsCurrent: () => ipcRenderer.invoke("kanban:boards:current"),
+  kanbanList: (payload) => ipcRenderer.invoke("kanban:list", payload || {}),
+  kanbanGet: (payload) => ipcRenderer.invoke("kanban:get", payload || {}),
+  kanbanCreate: (payload) => ipcRenderer.invoke("kanban:create", payload || {}),
+  kanbanUpdate: (payload) => ipcRenderer.invoke("kanban:update", payload || {}),
+  kanbanMove: (payload) => ipcRenderer.invoke("kanban:move", payload || {}),
+  kanbanDelete: (payload) => ipcRenderer.invoke("kanban:delete", payload || {}),
+  kanbanComment: (payload) => ipcRenderer.invoke("kanban:comment", payload || {}),
+  kanbanGetSettings: (payload) =>
+    ipcRenderer.invoke("kanban:getSettings", payload || {}),
+  kanbanSetSettings: (payload) =>
+    ipcRenderer.invoke("kanban:setSettings", payload || {}),
+  kanbanDispatchNow: (payload) =>
+    ipcRenderer.invoke("kanban:dispatchNow", payload || {}),
+  kanbanRequestReview: (payload) =>
+    ipcRenderer.invoke("kanban:requestReview", payload || {}),
+  kanbanSwarm: (payload) => ipcRenderer.invoke("kanban:swarm", payload || {}),
+  kanbanSchedule: (payload) =>
+    ipcRenderer.invoke("kanban:schedule", payload || {}),
+  kanbanComplete: (payload) =>
+    ipcRenderer.invoke("kanban:complete", payload || {}),
+  kanbanBlock: (payload) => ipcRenderer.invoke("kanban:block", payload || {}),
+  kanbanUnblock: (payload) =>
+    ipcRenderer.invoke("kanban:unblock", payload || {}),
+  onKanbanChanged: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("kanban:changed", listener);
+    return () => ipcRenderer.removeListener("kanban:changed", listener);
+  },
+  cronList: () => ipcRenderer.invoke("cron:list"),
+  cronCreate: (payload) => ipcRenderer.invoke("cron:create", payload || {}),
+  cronUpdate: (payload) => ipcRenderer.invoke("cron:update", payload || {}),
+  cronRemove: (id) => ipcRenderer.invoke("cron:remove", id),
+  cronTickNow: () => ipcRenderer.invoke("cron:tickNow"),
+  onCronChanged: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("cron:changed", listener);
+    return () => ipcRenderer.removeListener("cron:changed", listener);
   },
 });

@@ -14,6 +14,7 @@ import {
 import {
   looksLikeIncompleteReasoning,
   looksLikeProviderNotice,
+  resolveFinalAssistantText,
   sanitizeAssistantText,
 } from "../agent/sanitize-output.js";
 import { contentLooksLikeTextToolCall } from "../agent/parse-text-tool-calls.js";
@@ -61,10 +62,22 @@ export {
   isPlanApprovalInterrupt,
 } from "../agent/interrupt-utils.js";
 
+export type MultimodalUserPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export type RunAgentOptions = {
   agent: DeepAgent;
   prompt: string;
+  /**
+   * Optional multimodal user content (text + images). When set, this is sent
+   * to the model instead of a plain string (after botInstruction wrapping).
+   * Transcript still stores the text `prompt`.
+   */
+  userContent?: string | MultimodalUserPart[];
   threadId?: string;
+  /** Stamp session meta; null = global, undefined = leave existing. */
+  projectId?: string | null;
   autoApprove?: boolean;
   onEvent?: (event: AgentUiEvent) => void;
   /**
@@ -108,7 +121,8 @@ export type AgentUiEvent =
   | { type: "done"; text: string }
   | { type: "error"; message: string }
   | { type: "reflection"; memoryIds: string[] }
-  | { type: "warning"; message: string };
+  | { type: "warning"; message: string }
+  | { type: "pty"; text: string };
 
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -372,6 +386,13 @@ async function runOnce(
               name: call.name,
               input: call.input,
             });
+            if (call.name === "execute") {
+              emit(onEvent, {
+                type: "status",
+                phase: "pty",
+                detail: "PTY pool · running command",
+              });
+            }
             try {
               const out = await Promise.resolve(call.output);
               const text = truncate(out, 400);
@@ -381,10 +402,11 @@ async function runOnce(
                 output: text,
               });
               if (call.name === "execute") {
+                // Slot released back to the pool — resume thinking, not "shell busy".
                 emit(onEvent, {
                   type: "status",
-                  phase: "pty",
-                  detail: "shell finished",
+                  phase: "thinking",
+                  detail: "PTY pool · slot free",
                 });
               }
             } catch (err) {
@@ -393,6 +415,13 @@ async function runOnce(
                 name: call.name,
                 output: `error: ${err instanceof Error ? err.message : String(err)}`,
               });
+              if (call.name === "execute") {
+                emit(onEvent, {
+                  type: "status",
+                  phase: "thinking",
+                  detail: "PTY pool · slot free",
+                });
+              }
             }
           }
         })(),
@@ -445,7 +474,11 @@ export async function runAgentTurn(
 
   if (mem) {
     const modelName = process.env.AGENT_MODEL ?? "gpt-4o";
-    mem.sessionStore.startOrResume({ threadId, model: modelName });
+    mem.sessionStore.startOrResume({
+      threadId,
+      model: modelName,
+      projectId: options.projectId,
+    });
     mem.sessionStore.markTurnStart(options.prompt);
     mem.sessionStore.appendTranscript({
       threadId,
@@ -464,12 +497,38 @@ export async function runAgentTurn(
     ? `${options.botInstruction}\n\n[USER]\n${options.prompt}`
     : options.prompt;
 
+  const scopedUserContent: string | MultimodalUserPart[] = (() => {
+    const raw = options.userContent;
+    if (raw == null) return scopedUserPrompt;
+    if (typeof raw === "string") {
+      return options.botInstruction
+        ? `${options.botInstruction}\n\n[USER]\n${raw}`
+        : raw;
+    }
+    if (!Array.isArray(raw) || raw.length === 0) return scopedUserPrompt;
+    if (!options.botInstruction) return raw;
+    const parts = [...raw];
+    const firstText = parts.findIndex((p) => p.type === "text");
+    if (firstText >= 0) {
+      const t = parts[firstText] as { type: "text"; text: string };
+      parts[firstText] = {
+        type: "text",
+        text: `${options.botInstruction}\n\n[USER]\n${t.text}`,
+      };
+      return parts;
+    }
+    return [
+      { type: "text" as const, text: `${options.botInstruction}\n\n[USER]` },
+      ...parts,
+    ];
+  })();
+
   let finalText = "";
   let retryCount = 0;
   let inputPayload: Record<string, unknown> | Command = desktopPrep
     ? {
         messages: [
-          { role: "user", content: scopedUserPrompt },
+          { role: "user", content: scopedUserContent },
           {
             role: "assistant",
             content: desktopPrep.openedSummary,
@@ -478,9 +537,10 @@ export async function runAgentTurn(
         ],
       }
     : {
-        messages: [{ role: "user", content: scopedUserPrompt }],
+        messages: [{ role: "user", content: scopedUserContent }],
       };
 
+  let lastStreamedText = "";
   try {
     for (;;) {
       const { result, streamedText } = await runOnce(
@@ -489,6 +549,7 @@ export async function runAgentTurn(
         config,
         options.onEvent,
       );
+      lastStreamedText = streamedText;
       const interrupt = getInterruptPayload(result);
       if (interrupt) {
         const planGate = isPlanApprovalInterrupt(interrupt);
@@ -562,7 +623,7 @@ export async function runAgentTurn(
       break;
     }
 
-    const answer = finalText.trim();
+    const answer = resolveFinalAssistantText(finalText, lastStreamedText).trim();
     if (mem) {
       mem.sessionStore.markTurnComplete(answer);
       mem.sessionStore.appendTranscript({
@@ -570,46 +631,44 @@ export async function runAgentTurn(
         role: "assistant",
         content: answer,
       });
-
-      if (mem.enableReflection !== false) {
-        emit(options.onEvent, {
-          type: "status",
-          phase: "reflecting",
-          detail: "compressing turn into long-term memory…",
-        });
-        try {
-          const { storedIds } = await reflectAndStore({
-            store: mem.memoryStore,
-            sessionStore: mem.sessionStore,
-            embedder: mem.embedder,
-            model: mem.model,
-            agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
-            input: {
-              threadId,
-              userPrompt: options.prompt,
-              assistantResponse: answer || "(empty)",
-              hadError: false,
-              skipEpisode:
-                looksLikeIncompleteReasoning(answer) ||
-                contentLooksLikeTextToolCall(answer),
-            },
-          });
-          emit(options.onEvent, {
-            type: "reflection",
-            memoryIds: storedIds,
-          });
-        } catch {
-          // Reflection must not break the turn.
-        }
-      }
     }
 
+    // Unlock the UI as soon as the answer is ready. Reflection is background work.
     emit(options.onEvent, {
       type: "status",
       phase: "done",
       detail: "turn complete",
     });
     emit(options.onEvent, { type: "done", text: answer });
+
+    if (mem && mem.enableReflection !== false) {
+      void reflectAndStore({
+        store: mem.memoryStore,
+        sessionStore: mem.sessionStore,
+        embedder: mem.embedder,
+        model: mem.model,
+        agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+        input: {
+          threadId,
+          userPrompt: options.prompt,
+          assistantResponse: answer || "(empty)",
+          hadError: false,
+          skipEpisode:
+            looksLikeIncompleteReasoning(answer) ||
+            contentLooksLikeTextToolCall(answer),
+        },
+      })
+        .then(({ storedIds }) => {
+          emit(options.onEvent, {
+            type: "reflection",
+            memoryIds: storedIds,
+          });
+        })
+        .catch(() => {
+          // Reflection must not break the turn.
+        });
+    }
+
     return answer;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -627,28 +686,29 @@ export async function runAgentTurn(
         content: message,
       });
       if (mem.enableReflection !== false) {
-        try {
-          const { storedIds } = await reflectAndStore({
-            store: mem.memoryStore,
-            sessionStore: mem.sessionStore,
-            embedder: mem.embedder,
-            model: mem.model,
-            agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
-            input: {
-              threadId,
-              userPrompt: options.prompt,
-              assistantResponse: finalText || "(failed before response)",
-              hadError: true,
-              errorMessage: message,
-            },
+        void reflectAndStore({
+          store: mem.memoryStore,
+          sessionStore: mem.sessionStore,
+          embedder: mem.embedder,
+          model: mem.model,
+          agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+          input: {
+            threadId,
+            userPrompt: options.prompt,
+            assistantResponse: finalText || "(failed before response)",
+            hadError: true,
+            errorMessage: message,
+          },
+        })
+          .then(({ storedIds }) => {
+            emit(options.onEvent, {
+              type: "reflection",
+              memoryIds: storedIds,
+            });
+          })
+          .catch(() => {
+            // ignore
           });
-          emit(options.onEvent, {
-            type: "reflection",
-            memoryIds: storedIds,
-          });
-        } catch {
-          // ignore
-        }
       }
     }
     throw err;
@@ -838,33 +898,31 @@ async function finishDesktopTurn(
       role: "assistant",
       content: answer,
     });
-    if (mem.enableReflection !== false) {
-      emit(onEvent, {
-        type: "status",
-        phase: "reflecting",
-        detail: "compressing turn into long-term memory…",
-      });
-      try {
-        const { storedIds } = await reflectAndStore({
-          store: mem.memoryStore,
-          sessionStore: mem.sessionStore,
-          embedder: mem.embedder,
-          model: mem.model,
-          agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
-          input: {
-            threadId,
-            userPrompt: options.prompt,
-            assistantResponse: answer,
-            hadError,
-          },
-        });
-        emit(onEvent, { type: "reflection", memoryIds: storedIds });
-      } catch {
-        /* ignore */
-      }
-    }
   }
+
   emit(onEvent, { type: "status", phase: "done", detail: "turn complete" });
   emit(onEvent, { type: "token", text: answer });
   emit(onEvent, { type: "done", text: answer });
+
+  if (mem && mem.enableReflection !== false) {
+    void reflectAndStore({
+      store: mem.memoryStore,
+      sessionStore: mem.sessionStore,
+      embedder: mem.embedder,
+      model: mem.model,
+      agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+      input: {
+        threadId,
+        userPrompt: options.prompt,
+        assistantResponse: answer,
+        hadError,
+      },
+    })
+      .then(({ storedIds }) => {
+        emit(onEvent, { type: "reflection", memoryIds: storedIds });
+      })
+      .catch(() => {
+        /* ignore */
+      });
+  }
 }

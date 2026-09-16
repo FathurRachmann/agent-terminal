@@ -21,6 +21,8 @@ import {
   describeContextPolicy,
 } from "./context-policy.js";
 import { createSpecialistSubagents } from "./subagents.js";
+import { loadSkillSubagents } from "./skill-registry.js";
+import { createMultiTaskInjectMiddleware } from "./multi-task-inject-middleware.js";
 import { createNormalizeAiMessageMiddleware } from "./normalize-middleware.js";
 import { createCapabilityFilterMiddleware } from "./capability-filter-middleware.js";
 import {
@@ -42,6 +44,8 @@ import { createProcessManagementTools } from "./process-manage.js";
 import { createVaultManagementTools } from "./vault-manage.js";
 import { createPlaywrightTools } from "./playwright-tools.js";
 import { createVisionTools } from "./vision-tools.js";
+import { createDocumentTools } from "./document-tools.js";
+import { createGraphifyTools } from "./graphify-tools.js";
 import {
   createDesktopTools,
   isDesktopAutomationEnabled,
@@ -56,14 +60,32 @@ import {
   createPersistentCheckpointer,
   type EmbeddingClient,
 } from "../memory/index.js";
+import {
+  composeSystemPrompt,
+  ensureSoul,
+  readSoul,
+} from "./profiles/index.js";
 
 /** Virtual mount for on-demand skill discovery via ls/read_file (not auto-injected). */
 export const SKILLS_VIRTUAL_ROOT = "/skills/";
 export const SKILLS_DIR_RELATIVE = path.join(".agent", "skills");
-
+/** Virtual mount of profile home so AGENTS.md / skills stay profile-scoped. */
+export const PROFILE_VIRTUAL_ROOT = "/__profile__/";
 
 export type CreateAgentOptions = {
+  /** Project tree for PTY / filesystem tools. */
   workspaceRoot: string;
+  /**
+   * Extra sandbox roots (project folders). When set, these plus workspaceRoot
+   * become allowedRoots; workingDirectory remains workspaceRoot (primary).
+   */
+  allowedFolders?: string[];
+  /**
+   * Profile home for agent state (`.agent/`, SOUL.md).
+   * Defaults to workspaceRoot for CLI / legacy single-home mode.
+   */
+  profileHome?: string;
+  profileId?: string;
   autoApprove?: boolean;
   /**
    * Interrupt before `task_todos` so the UI can show the plan and require
@@ -74,6 +96,11 @@ export type CreateAgentOptions = {
   enableCheckpointer?: boolean;
   /** Auto-reflect after turns (default true). */
   enableReflection?: boolean;
+  /**
+   * After approved `task_todos`, run fixed parallel workers (explorer/coder/reviewer
+   * + skill agents) and merge into the tool result. Default true.
+   */
+  enableFixedOrchestration?: boolean;
 };
 
 let profilesRegistered = false;
@@ -96,6 +123,8 @@ export type AgentBundle = {
   embedder: EmbeddingClient;
   model: BaseChatModel;
   workspaceRoot: string;
+  profileHome: string;
+  profileId: string;
   contextPolicy: string;
   enableReflection: boolean;
   desktopEnabled: boolean;
@@ -109,15 +138,22 @@ export async function createTerminalAgent(
   ensureProfiles();
 
   const workspaceRoot = path.resolve(options.workspaceRoot);
-  fs.mkdirSync(path.join(workspaceRoot, ".agent", "context"), {
+  const profileHome = path.resolve(options.profileHome ?? workspaceRoot);
+  const profileId = options.profileId ?? "default";
+
+  fs.mkdirSync(path.join(profileHome, ".agent", "context"), {
     recursive: true,
   });
-  fs.mkdirSync(path.join(workspaceRoot, ".agent", "memory"), {
+  fs.mkdirSync(path.join(profileHome, ".agent", "memory"), {
     recursive: true,
   });
 
+  ensureSoul(profileHome);
+  const soul = readSoul(profileHome);
+  const systemPrompt = composeSystemPrompt(SYSTEM_PROMPT, soul);
+
   const memoryRelativePath = ".agent/AGENTS.md";
-  const memoryPath = path.join(workspaceRoot, memoryRelativePath);
+  const memoryPath = path.join(profileHome, memoryRelativePath);
   if (!fs.existsSync(memoryPath)) {
     fs.mkdirSync(path.dirname(memoryPath), { recursive: true });
     fs.writeFileSync(
@@ -128,10 +164,10 @@ export async function createTerminalAgent(
   }
 
   // Persistent Memory (infrastructure / durability)
-  const memoryStore = new PersistentMemoryStore(workspaceRoot);
+  const memoryStore = new PersistentMemoryStore(workspaceRoot, profileHome);
   memoryStore.syncRulesToAgentsMd(memoryPath);
 
-  const sessionStore = new SessionStore(workspaceRoot);
+  const sessionStore = new SessionStore(workspaceRoot, profileHome);
   const embedder = createEmbeddingClientOrFallback();
   const model = createRouterModel();
 
@@ -141,21 +177,28 @@ export async function createTerminalAgent(
     routerBaseUrl: process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1",
     contextWindowTokens: process.env.CONTEXT_WINDOW_TOKENS ?? "256000",
     workspaceRoot,
+    profileHome,
+    profileId,
     enableCheckpointer: options.enableCheckpointer ?? false,
     enableReflection: options.enableReflection ?? true,
   });
 
   const sandbox = new PtySandbox({
     workingDirectory: workspaceRoot,
+    initialAllowedRoots: options.allowedFolders,
     autoApproveDestructive: options.autoApprove ?? false,
     onOutput: options.onPtyOutput,
   });
 
-  const skillsDir = path.join(workspaceRoot, ".agent", "skills");
+  const skillsDir = path.join(profileHome, ".agent", "skills");
   fs.mkdirSync(skillsDir, { recursive: true });
   const backend = new CompositeBackend(sandbox, {
     [SKILLS_VIRTUAL_ROOT]: new FilesystemBackend({
       rootDir: skillsDir,
+      virtualMode: true,
+    }),
+    [PROFILE_VIRTUAL_ROOT]: new FilesystemBackend({
+      rootDir: profileHome,
       virtualMode: true,
     }),
   });
@@ -169,10 +212,10 @@ export async function createTerminalAgent(
     summaryPrompt: CONTEXT_SUMMARY_PROMPT,
   });
 
-  // Deep Agents file memory (always-on guidelines from AGENTS.md)
+  // Deep Agents file memory (always-on guidelines from profile AGENTS.md)
   const fileMemory = createMemoryMiddleware({
     backend,
-    sources: [memoryRelativePath],
+    sources: [`${PROFILE_VIRTUAL_ROOT}${memoryRelativePath}`],
   });
 
   // Long-Term Memory (cognitive / relevance) — semantic + lexical top-K
@@ -184,23 +227,25 @@ export async function createTerminalAgent(
 
   const desktopEnabled =
     isDesktopAutomationEnabled() && isDesktopAutomationSupported();
-  const capabilityFilter = resolveCapabilityFilter(workspaceRoot);
+  const capabilityFilter = resolveCapabilityFilter(profileHome);
   const desktopTools = desktopEnabled
     ? createDesktopTools(workspaceRoot)
     : [];
 
   const customTools = filterToolsByCapability(
     [
-      ...createMemoryTools(memoryStore, workspaceRoot, embedder),
+      ...createMemoryTools(memoryStore, profileHome, embedder),
       ...createWorkspaceAccessTools(sandbox),
       ...createTaskTools(workspaceRoot),
       ...createWebTools(),
       ...createOrchestrationTools(),
-      ...createSkillManagementTools(workspaceRoot),
+      ...createSkillManagementTools(profileHome),
       ...createProcessManagementTools(),
-      ...createVaultManagementTools(workspaceRoot),
+      ...createVaultManagementTools(profileHome),
       ...createPlaywrightTools(),
       ...createVisionTools(),
+      ...createDocumentTools(workspaceRoot),
+      ...createGraphifyTools(workspaceRoot),
       ...desktopTools,
     ],
     capabilityFilter.disabledToolNames,
@@ -214,10 +259,19 @@ export async function createTerminalAgent(
   const skillPermissions = buildDisabledSkillPermissions(
     capabilityFilter.disabledSkillFolders,
   );
+  const skillSubagents = loadSkillSubagents(skillsDir);
+  const multiTaskInjectMw = createMultiTaskInjectMiddleware({
+    workspaceRoot,
+    skillsRoot: skillsDir,
+    triggerOn: "task_todos",
+    enabled: options.enableFixedOrchestration !== false,
+  });
 
   // wrapModelCall order (last = closest to model):
   // summarization → fileMemory → longTerm → normalize → capabilityFilter → botScope → model
+  // wrapToolCall: multiTaskInject last so capability/bot-scope filters run first.
   // Skills are NOT auto-injected: agent must ls /skills/ and read only what it needs.
+  // Skill frontmatter `agent:` registers extra SubAgents for the `task` tool.
   const requirePlanApproval = options.requirePlanApproval !== false;
   const interruptOn: Record<string, boolean> = {
     ...(requirePlanApproval ? { task_todos: true } : {}),
@@ -244,12 +298,12 @@ export async function createTerminalAgent(
   const agent = await Promise.resolve(
     createDeepAgent({
       model,
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt,
       backend,
       permissions: skillPermissions.length ? skillPermissions : undefined,
       interruptOn: Object.keys(interruptOn).length ? interruptOn : undefined,
       tools: customTools,
-      subagents: createSpecialistSubagents(),
+      subagents: [...createSpecialistSubagents(), ...skillSubagents],
       middleware: [
         summarization,
         fileMemory,
@@ -257,9 +311,10 @@ export async function createTerminalAgent(
         normalize,
         capabilityFilterMw,
         botScopeMw,
+        multiTaskInjectMw,
       ],
       checkpointer: options.enableCheckpointer
-        ? createPersistentCheckpointer(workspaceRoot)
+        ? createPersistentCheckpointer(workspaceRoot, profileHome)
         : undefined,
       name: "terminal-agent",
     }),
@@ -273,6 +328,8 @@ export async function createTerminalAgent(
     embedder,
     model,
     workspaceRoot,
+    profileHome,
+    profileId,
     contextPolicy: describeContextPolicy(),
     enableReflection: options.enableReflection ?? true,
     desktopEnabled,

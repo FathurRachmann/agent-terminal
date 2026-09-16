@@ -30,13 +30,37 @@ describe("settings-store", () => {
         defaultRailOpen: false,
         defaultRailLayer: "canvas",
         compactActivity: true,
+        showFooterPhase: false,
+        showLearnedInFooter: true,
+        openChatPathsInCanvas: false,
+        preferStreamedAnswer: true,
       },
       env: { AGENT_MODEL: "test-model" },
     });
     const loaded = loadStoredSettings(root);
     assert.equal(loaded.agent.autoApproveDestructive, false);
     assert.equal(loaded.ui.defaultRailLayer, "canvas");
+    assert.equal(loaded.ui.showFooterPhase, false);
+    assert.equal(loaded.ui.openChatPathsInCanvas, false);
     assert.equal(loaded.env?.AGENT_MODEL, "test-model");
+  });
+
+  it("migrates legacy defaultRailLayer trace → canvas", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-settings-"));
+    const file = path.join(root, ".agent", "settings.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        agent: {},
+        ui: { defaultRailLayer: "trace" },
+      }),
+      "utf8",
+    );
+    const loaded = loadStoredSettings(root);
+    assert.equal(loaded.ui.defaultRailLayer, "canvas");
+    assert.equal(loaded.ui.showFooterPhase, true);
   });
 
   it("upserts env keys without wiping others", () => {

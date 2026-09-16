@@ -37,11 +37,18 @@ describe("fingerprintError", () => {
 });
 
 describe("isSelfHealEligibleError", () => {
-  it("allows code/process failures", () => {
+  it("blocks opaque provider TypeErrors that self-heal cannot fix", () => {
     assert.equal(
       isSelfHealEligibleError(
         "Cannot read properties of undefined (reading 'message')",
       ),
+      false,
+    );
+  });
+
+  it("allows ordinary code/process failures", () => {
+    assert.equal(
+      isSelfHealEligibleError("ENOENT: no such file or directory"),
       true,
     );
   });
@@ -61,9 +68,9 @@ describe("SelfHealController", () => {
       errorThreshold: 2,
       cooldownMs: 0,
     });
-    c.recordTurnError("boom reading 'message'");
+    c.recordTurnError("ENOENT: missing file boom");
     assert.equal(c.shouldAutoTrigger(true), false);
-    c.recordTurnError("boom reading 'message'");
+    c.recordTurnError("ENOENT: missing file boom");
     assert.equal(c.shouldAutoTrigger(true), true);
   });
 

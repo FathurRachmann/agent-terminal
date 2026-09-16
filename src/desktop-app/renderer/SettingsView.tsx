@@ -43,8 +43,12 @@ type SettingsSnapshot = {
   };
   ui: {
     defaultRailOpen: boolean;
-    defaultRailLayer: "trace" | "canvas";
+    defaultRailLayer: "canvas" | "files" | "trace";
     compactActivity: boolean;
+    showFooterPhase?: boolean;
+    showLearnedInFooter?: boolean;
+    openChatPathsInCanvas?: boolean;
+    preferStreamedAnswer?: boolean;
   };
   bots: BotDraft[];
   toolCatalog: Array<{ name: string; category: string; description: string }>;
@@ -60,22 +64,26 @@ type SettingsGroup =
   | "sandbox"
   | "memory"
   | "ui"
-  | "paths";
+  | "paths"
+  | "gateways";
 
 const GROUPS: Array<{ id: SettingsGroup; label: string; blurb: string }> = [
   { id: "model", label: "Model & API", blurb: "Gateway, model, embeddings" },
   { id: "agent", label: "Agent Behavior", blurb: "Approvals, reflection, checkpoints" },
   { id: "bots", label: "Bots", blurb: "Specialized sessions & tool scopes" },
+  { id: "gateways", label: "Gateways", blurb: "Local runtime connection" },
   { id: "desktop", label: "Desktop", blurb: "macOS automation allowlist" },
   { id: "sandbox", label: "Sandbox & PTY", blurb: "Shell pool, timeouts, folders" },
-  { id: "memory", label: "Memory", blurb: "AGENTS.md & reflection" },
-  { id: "ui", label: "Interface", blurb: "Activity rail defaults" },
+  { id: "memory", label: "Memory", blurb: "AGENTS.md, reflection & chat context" },
+  { id: "ui", label: "Interface", blurb: "Footer, chat paths, activity rail" },
   { id: "paths", label: "Paths & Files", blurb: "Where config lives on disk" },
 ];
 
 type Props = {
   onClose?: () => void;
   onOpenCapabilities?: () => void;
+  onUiSettingsSaved?: (ui: SettingsSnapshot["ui"]) => void;
+  initialGroup?: SettingsGroup;
 };
 
 function FieldLabel({
@@ -200,8 +208,13 @@ function SectionCard({
   );
 }
 
-export function SettingsView({ onClose, onOpenCapabilities }: Props) {
-  const [group, setGroup] = useState<SettingsGroup>("model");
+export function SettingsView({
+  onClose,
+  onOpenCapabilities,
+  onUiSettingsSaved,
+  initialGroup,
+}: Props) {
+  const [group, setGroup] = useState<SettingsGroup>(initialGroup ?? "model");
   const [snap, setSnap] = useState<SettingsSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -211,6 +224,12 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
   const [bots, setBots] = useState<BotDraft[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
   const [agentsMd, setAgentsMd] = useState("");
+  const [gatewayTest, setGatewayTest] = useState<string | null>(null);
+  const [encryptSecrets] = useState(false);
+
+  useEffect(() => {
+    if (initialGroup) setGroup(initialGroup);
+  }, [initialGroup]);
 
   // Draft fields
   const [agentModel, setAgentModel] = useState("");
@@ -229,10 +248,14 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
   const [ptyPoolSize, setPtyPoolSize] = useState(3);
   const [ptyShell, setPtyShell] = useState("");
   const [defaultRailOpen, setDefaultRailOpen] = useState(true);
-  const [defaultRailLayer, setDefaultRailLayer] = useState<"trace" | "canvas">(
-    "trace",
+  const [defaultRailLayer, setDefaultRailLayer] = useState<"canvas" | "files">(
+    "canvas",
   );
   const [compactActivity, setCompactActivity] = useState(false);
+  const [showFooterPhase, setShowFooterPhase] = useState(true);
+  const [showLearnedInFooter, setShowLearnedInFooter] = useState(true);
+  const [openChatPathsInCanvas, setOpenChatPathsInCanvas] = useState(true);
+  const [preferStreamedAnswer, setPreferStreamedAnswer] = useState(true);
 
   const hydrate = (s: SettingsSnapshot) => {
     setSnap(s);
@@ -257,8 +280,14 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
     setSelectedBotId((prev) => prev ?? s.bots.find((b) => b.id !== "general")?.id ?? s.bots[0]?.id ?? null);
     setAgentsMd(s.memory.agentsMd);
     setDefaultRailOpen(s.ui.defaultRailOpen);
-    setDefaultRailLayer(s.ui.defaultRailLayer);
+    setDefaultRailLayer(
+      s.ui.defaultRailLayer === "files" ? "files" : "canvas",
+    );
     setCompactActivity(s.ui.compactActivity);
+    setShowFooterPhase(s.ui.showFooterPhase !== false);
+    setShowLearnedInFooter(s.ui.showLearnedInFooter !== false);
+    setOpenChatPathsInCanvas(s.ui.openChatPathsInCanvas !== false);
+    setPreferStreamedAnswer(s.ui.preferStreamedAnswer !== false);
   };
 
   const refresh = async () => {
@@ -378,6 +407,10 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
           defaultRailOpen,
           defaultRailLayer,
           compactActivity,
+          showFooterPhase,
+          showLearnedInFooter,
+          openChatPathsInCanvas,
+          preferStreamedAnswer,
         },
         bots,
       };
@@ -387,7 +420,21 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
         setError(res.error ?? "Failed to save settings");
         return;
       }
-      if (res.snapshot) hydrate(res.snapshot);
+      if (res.snapshot) {
+        const snapUi = res.snapshot as SettingsSnapshot;
+        hydrate(snapUi);
+        onUiSettingsSaved?.(snapUi.ui);
+      } else {
+        onUiSettingsSaved?.({
+          defaultRailOpen,
+          defaultRailLayer,
+          compactActivity,
+          showFooterPhase,
+          showLearnedInFooter,
+          openChatPathsInCanvas,
+          preferStreamedAnswer,
+        });
+      }
       setApiKeyDraft("");
       if (res.reloaded) setNote("Saved — agent reloaded with new settings.");
       else if (res.reloadReason) setNote(`Saved. ${res.reloadReason}`);
@@ -846,25 +893,56 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
                   checked={defaultRailOpen}
                   onChange={setDefaultRailOpen}
                   label="Open activity rail by default"
+                  hint="Right sidebar for Canvas and Files."
                 />
-                <div>
-                  <FieldLabel>Default rail layer</FieldLabel>
-                  <select
-                    value={defaultRailLayer}
-                    onChange={(e) =>
-                      setDefaultRailLayer(e.target.value as "trace" | "canvas")
-                    }
-                    className="w-full rounded-lg border border-border bg-surface-1 px-3 py-2 text-[12px] text-fg outline-none"
-                  >
-                    <option value="trace">Trace</option>
-                    <option value="canvas">Canvas</option>
-                  </select>
-                </div>
+                <FieldLabel hint="Which tab opens when the rail is shown">
+                  Default rail tab
+                </FieldLabel>
+                <select
+                  value={defaultRailLayer}
+                  onChange={(e) =>
+                    setDefaultRailLayer(
+                      e.target.value === "files" ? "files" : "canvas",
+                    )
+                  }
+                  className="w-full rounded-lg border border-border bg-surface-1 px-3 py-2 text-[12px] text-fg outline-none focus:border-accent/50"
+                >
+                  <option value="canvas">Canvas</option>
+                  <option value="files">Files</option>
+                </select>
                 <Toggle
                   checked={compactActivity}
                   onChange={setCompactActivity}
                   label="Compact activity chips"
-                  hint="Preferensi UI (disimpan di settings.json)."
+                  hint="Shorter tool/status chips in chat."
+                />
+              </SectionCard>
+              <SectionCard title="Footer">
+                <Toggle
+                  checked={showFooterPhase}
+                  onChange={setShowFooterPhase}
+                  label="Show live phase"
+                  hint="Displays phase: thinking (and other phases) in the footer."
+                />
+                <Toggle
+                  checked={showLearnedInFooter}
+                  onChange={setShowLearnedInFooter}
+                  label="Show Learned memory button"
+                  hint="Footer icon opens a popover of learned rules."
+                />
+              </SectionCard>
+              <SectionCard title="Chat">
+                <Toggle
+                  checked={openChatPathsInCanvas}
+                  onChange={setOpenChatPathsInCanvas}
+                  label="Open file paths from chat in Canvas"
+                  hint="Clickable `path/to/file.md` chips open the right rail."
+                />
+                <Toggle
+                  checked={preferStreamedAnswer}
+                  onChange={setPreferStreamedAnswer}
+                  label="Prefer full streamed answer"
+                  hint="If the final payload is shorter than what streamed, keep the longer text."
                 />
               </SectionCard>
               <SectionCard title="Related">
@@ -882,12 +960,186 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
                 ) : null}
               </SectionCard>
             </div>
+          ) : group === "gateways" ? (
+            <div className="mx-auto flex max-w-2xl flex-col gap-4">
+              <SectionCard title="Gateway connection">
+                <p className="text-[11px] leading-relaxed text-muted">
+                  Local by default. Use remote when this app should drive an
+                  agent backend elsewhere. Gateway connections are machine-level;
+                  profiles are discovered from the gateways you connect.
+                </p>
+                <div className="grid gap-2">
+                  {(
+                    [
+                      {
+                        id: "local",
+                        title: "Local gateway",
+                        body: "Start a private agent backend in this app. This is the default and works offline.",
+                        enabled: true,
+                      },
+                      {
+                        id: "cloud",
+                        title: "Cloud",
+                        body: "Sign in once and pick from agents on your account — not available in this build.",
+                        enabled: false,
+                      },
+                      {
+                        id: "remote",
+                        title: "Remote gateway",
+                        body: "Connect this desktop shell to a remote agent backend — not available in this build.",
+                        enabled: false,
+                      },
+                      {
+                        id: "ssh",
+                        title: "Connect via SSH",
+                        body: "Launch the agent on a remote host over SSH and tunnel it here — not available in this build.",
+                        enabled: false,
+                      },
+                    ] as const
+                  ).map((mode) => (
+                    <div
+                      key={mode.id}
+                      className={`rounded-lg border px-3 py-3 ${
+                        mode.id === "local"
+                          ? "border-accent/50 bg-accent/10"
+                          : "border-border bg-surface-1 opacity-60"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[12px] font-semibold text-fg">
+                          {mode.title}
+                        </div>
+                        {mode.id === "local" ? (
+                          <span className="text-[10px] text-accent-soft">✓ Selected</span>
+                        ) : (
+                          <span className="text-[10px] text-muted">Unavailable</span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-[10.5px] leading-snug text-muted">
+                        {mode.body}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="rounded-lg bg-accent px-3 py-1.5 text-[11px] font-semibold text-white"
+                    onClick={async () => {
+                      const res = await window.electronAgent?.setGatewayMode?.(
+                        "local",
+                      );
+                      setNote(
+                        res?.ok
+                          ? "Local gateway mode saved."
+                          : res?.error ?? "Could not save gateway mode",
+                      );
+                    }}
+                  >
+                    Save and reconnect
+                  </button>
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Encrypt saved secrets with the OS keychain">
+                <p className="text-[11px] leading-relaxed text-muted">
+                  Off by default. When on, gateway tokens and sign-in credentials
+                  are encrypted with your system keychain. When off, they are
+                  stored as plain files readable only by your user account.
+                  Keychain encryption is not wired in this build yet.
+                </p>
+                <div className="flex items-center justify-between rounded-lg border border-border bg-surface-1 px-3 py-2">
+                  <span className="text-[11px] text-fg-dim">OS keychain</span>
+                  <span className="text-[11px] font-semibold text-muted">
+                    {encryptSecrets ? "On" : "Off"}
+                  </span>
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Diagnostics">
+                <p className="text-[11px] text-muted">
+                  Reveal desktop.log in your file manager — useful when the
+                  gateway fails to start.
+                </p>
+                <button
+                  type="button"
+                  className="self-start text-[11px] text-accent-soft hover:underline"
+                  onClick={async () => {
+                    const res = await window.electronAgent?.openGatewayLogs?.();
+                    setNote(
+                      res?.ok
+                        ? `Opened ${res.path}`
+                        : res?.error ?? "Could not open logs",
+                    );
+                  }}
+                >
+                  Open logs →
+                </button>
+              </SectionCard>
+
+              <SectionCard title="Registered gateways">
+                <p className="mb-2 text-[11px] leading-relaxed text-muted">
+                  Manage this device and every gateway it can reach. Profiles,
+                  chats, messaging, and cron jobs stay with their gateway.
+                </p>
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface-1 px-3 py-3">
+                  <div>
+                    <div className="text-[12px] font-semibold text-fg">
+                      This device
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      <span className="rounded bg-accent/20 px-1.5 py-0.5 text-[9px] font-semibold text-accent-soft">
+                        Current
+                      </span>
+                      <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[9px] text-muted">
+                        Primary
+                      </span>
+                      <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[9px] text-muted">
+                        App-managed
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[10px] text-muted">
+                      The agent runtime managed by this app.
+                      {snap.paths.profileHome
+                        ? ` Profile: ${snap.paths.profileId}`
+                        : ""}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md border border-border bg-surface-2 px-3 py-1.5 text-[11px] text-fg hover:border-accent/40"
+                    onClick={async () => {
+                      const res = await window.electronAgent?.testLocalGateway?.();
+                      setGatewayTest(
+                        res
+                          ? `${res.ok ? "OK" : "FAIL"} — ${res.detail}`
+                          : "No gateway bridge",
+                      );
+                    }}
+                  >
+                    Test
+                  </button>
+                </div>
+                {gatewayTest ? (
+                  <div className="text-[11px] text-fg-dim">{gatewayTest}</div>
+                ) : null}
+                <button
+                  type="button"
+                  disabled
+                  className="self-start rounded-md border border-border px-3 py-1.5 text-[11px] text-muted opacity-50"
+                >
+                  + Add connection
+                </button>
+              </SectionCard>
+            </div>
           ) : (
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
               <SectionCard title="Config files">
                 {(
                   [
                     ["Workspace", snap.paths.workspaceRoot],
+                    ["Profile home", snap.paths.profileHome],
+                    ["SOUL.md", snap.paths.soulPath],
                     [".env", snap.paths.envPath],
                     ["settings.json", snap.paths.settingsPath],
                     ["bots.json", snap.paths.botsPath],
@@ -904,9 +1156,9 @@ export function SettingsView({ onClose, onOpenCapabilities }: Props) {
                 ))}
               </SectionCard>
               <p className="text-[10px] text-muted">
-                Secrets disimpan di <code>.env</code>. Preferensi agent/UI di{" "}
-                <code>.agent/settings.json</code>. Jangan commit file berisi API
-                key.
+                Secrets disimpan di <code>.env</code> (profile). Preferensi
+                agent/UI di profile <code>.agent/settings.json</code>. Jangan
+                commit file berisi API key.
               </p>
             </div>
           )}

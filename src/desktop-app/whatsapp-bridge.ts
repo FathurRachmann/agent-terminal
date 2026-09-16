@@ -1,6 +1,11 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 import makeWASocket, {
   DisconnectReason,
+  downloadMediaMessage,
   extractMessageContent,
   getContentType,
   isLidUser,
@@ -20,6 +25,13 @@ import {
   whatsappAuthDir,
   type MessagingConfig,
 } from "./messaging-store.js";
+import {
+  attachmentKindFor,
+  finalizeAttachmentFile,
+  saveAttachmentBuffer,
+  waMediaFileName,
+  type InboundAttachment,
+} from "./inbound-attachments.js";
 
 export type WhatsAppConnectionStatus =
   | "disconnected"
@@ -42,9 +54,13 @@ export type WhatsAppInboundMessage = {
   jid: string;
   /** Phone / canonical identity for allowlist + thread ids when resolved. */
   identityJid: string;
+  /** All sender candidate JIDs (PN + LID) for role resolution. */
+  candidates?: string[];
   pushName?: string;
   text: string;
   messageId?: string;
+  /** Saved workspace attachments (images/docs from WA). */
+  attachments?: InboundAttachment[];
 };
 
 export type WhatsAppBridgeEvent =
@@ -60,6 +76,14 @@ export type WhatsAppBridgeEvent =
 
 type EmitFn = (event: WhatsAppBridgeEvent) => void;
 
+const MEDIA_CONTENT_TYPES = new Set([
+  "imageMessage",
+  "documentMessage",
+  "stickerMessage",
+  "videoMessage",
+  "audioMessage",
+]);
+
 function extractText(msg: WAMessage): string {
   const content = extractMessageContent(msg.message) ?? msg.message;
   if (!content || typeof content !== "object") return "";
@@ -71,11 +95,135 @@ function extractText(msg: WAMessage): string {
   if (img?.caption) return String(img.caption).trim();
   const vid = c.videoMessage as { caption?: string } | undefined;
   if (vid?.caption) return String(vid.caption).trim();
+  const doc = c.documentMessage as { caption?: string } | undefined;
+  if (doc?.caption) return String(doc.caption).trim();
   const btn = c.buttonsResponseMessage as { selectedDisplayText?: string } | undefined;
   if (btn?.selectedDisplayText) return String(btn.selectedDisplayText).trim();
   const list = c.listResponseMessage as { title?: string } | undefined;
   if (list?.title) return String(list.title).trim();
   return "";
+}
+
+function mediaMetaFromMessage(msg: WAMessage): {
+  type: string;
+  mime?: string;
+  fileName?: string;
+} | null {
+  const content = extractMessageContent(msg.message) ?? msg.message;
+  if (!content) return null;
+  const type = getContentType(content);
+  if (!type || !MEDIA_CONTENT_TYPES.has(type)) return null;
+  const c = content as Record<string, unknown>;
+  const node = c[type] as
+    | {
+        mimetype?: string | null;
+        fileName?: string | null;
+        title?: string | null;
+      }
+    | undefined;
+  return {
+    type,
+    mime: node?.mimetype ? String(node.mimetype) : undefined,
+    fileName: node?.fileName
+      ? String(node.fileName)
+      : node?.title
+        ? String(node.title)
+        : undefined,
+  };
+}
+
+const silentBaileysLogger = {
+  info() {},
+  warn() {},
+  error() {},
+  debug() {},
+  trace() {},
+  child() {
+    return this;
+  },
+  level: "silent",
+} as never;
+
+async function downloadInboundMedia(
+  msg: WAMessage,
+  sock: WASocket,
+  saveRoot: string,
+): Promise<InboundAttachment | null> {
+  const meta = mediaMetaFromMessage(msg);
+  if (!meta) return null;
+  const fileName = waMediaFileName(meta.type, meta.mime, meta.fileName);
+  const applyKind = (attachment: InboundAttachment): InboundAttachment => {
+    if (meta.type === "imageMessage" || meta.type === "stickerMessage") {
+      attachment.kind = "image";
+    } else {
+      attachment.kind = attachmentKindFor(attachment.basename, attachment.mime);
+    }
+    return attachment;
+  };
+
+  const downloadOpts = {
+    logger: silentBaileysLogger,
+    reuploadRequest: (m: WAMessage) => sock.updateMediaMessage(m),
+  };
+
+  // Prefer streaming to disk so large WA documents (up to 1 GiB) do not OOM.
+  try {
+    const tempAbs = path.join(
+      os.tmpdir(),
+      `wa-in-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`,
+    );
+    let stream: Readable;
+    try {
+      stream = (await downloadMediaMessage(
+        msg,
+        "stream",
+        {},
+        downloadOpts,
+      )) as Readable;
+    } catch {
+      stream = (await downloadMediaMessage(
+        msg,
+        "stream",
+        {},
+      )) as Readable;
+    }
+    await pipeline(stream, fs.createWriteStream(tempAbs));
+    const saved = finalizeAttachmentFile(saveRoot, {
+      tempAbsPath: tempAbs,
+      fileName,
+      mime: meta.mime,
+      source: "whatsapp",
+    });
+    if (!saved.ok) return null;
+    return applyKind(saved.attachment);
+  } catch {
+    /* fall through to buffer path for older media */
+  }
+
+  try {
+    let buffer: Buffer;
+    try {
+      buffer = (await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        downloadOpts,
+      )) as Buffer;
+    } catch {
+      buffer = (await downloadMediaMessage(msg, "buffer", {})) as Buffer;
+    }
+    if (!buffer?.length) return null;
+    const saved = saveAttachmentBuffer(saveRoot, {
+      buffer,
+      fileName,
+      mime: meta.mime,
+      source: "whatsapp",
+    });
+    if (!saved.ok) return null;
+    return applyKind(saved.attachment);
+  } catch {
+    return null;
+  }
 }
 
 function collectSenderCandidates(msg: WAMessage): string[] {
@@ -105,6 +253,10 @@ function phoneJidFromDigits(digits: string): string {
   return `${digits}@s.whatsapp.net`;
 }
 
+function pathResolveSafe(root: string): string {
+  return path.resolve(root);
+}
+
 export class WhatsAppBridge {
   private sock: WASocket | null = null;
   private starting = false;
@@ -116,11 +268,23 @@ export class WhatsAppBridge {
   private config: MessagingConfig;
   private readonly workspaceRoot: string;
   private readonly emit: EmitFn;
+  /** Where inbound WA media is written for the agent (project workspace). */
+  private mediaSaveRoot: string;
 
-  constructor(workspaceRoot: string, emit: EmitFn) {
+  constructor(
+    workspaceRoot: string,
+    emit: EmitFn,
+    mediaSaveRoot?: string,
+  ) {
     this.workspaceRoot = workspaceRoot;
+    this.mediaSaveRoot = mediaSaveRoot || workspaceRoot;
     this.emit = emit;
     this.config = loadMessagingConfig(workspaceRoot);
+  }
+
+  /** Update directory used to persist inbound media (e.g. active project root). */
+  setMediaSaveRoot(root: string) {
+    if (root?.trim()) this.mediaSaveRoot = pathResolveSafe(root);
   }
 
   reloadConfig(): MessagingConfig {
@@ -186,7 +350,7 @@ export class WhatsAppBridge {
             this.qrDataUrl = await qrcode.toDataURL(qr, {
               margin: 1,
               width: 280,
-              color: { dark: "#0b0f14", light: "#ffffff" },
+              color: { dark: "#0a0a0b", light: "#ffffff" },
             });
             this.setStatus("qr", null);
             this.emit({ type: "qr", payload: { qrDataUrl: this.qrDataUrl } });
@@ -343,6 +507,62 @@ export class WhatsAppBridge {
   }
 
   /**
+   * Send a workspace file as a WhatsApp document (agent → user).
+   * Prefer `filePath` for large files (streams from disk, up to ~1 GiB).
+   */
+  async sendDocument(
+    jid: string,
+    options: {
+      buffer?: Buffer;
+      filePath?: string;
+      fileName: string;
+      mimetype: string;
+      caption?: string;
+    },
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (!this.sock || this.status !== "connected") {
+      return { ok: false, error: "WhatsApp is not connected." };
+    }
+    const documentPayload =
+      options.filePath && options.filePath.trim()
+        ? { url: options.filePath }
+        : options.buffer;
+    if (!documentPayload) {
+      return { ok: false, error: "No document payload (filePath or buffer)." };
+    }
+    try {
+      await this.stopTyping(jid);
+      await this.sock.sendMessage(jid, {
+        document: documentPayload,
+        mimetype: options.mimetype || "application/octet-stream",
+        fileName: options.fileName,
+        caption: options.caption?.slice(0, 1000) || undefined,
+      });
+      this.emit({
+        type: "message_out",
+        payload: {
+          jid,
+          text: `[document] ${options.fileName}`,
+          ok: true,
+        },
+      });
+      return { ok: true };
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      this.emit({
+        type: "message_out",
+        payload: {
+          jid,
+          text: `[document] ${options.fileName}`,
+          ok: false,
+          error,
+        },
+      });
+      return { ok: false, error };
+    }
+  }
+
+  /**
    * Resolve WhatsApp @lid senders to phone JIDs using message alts + Baileys LID map.
    * Prefer phone identity for allowlist/thread; keep chat JID for replies.
    */
@@ -417,7 +637,14 @@ export class WhatsAppBridge {
     if (msg.key.fromMe) return;
 
     const text = extractText(msg);
-    if (!text) {
+    const sock = this.sock;
+    const attachments: InboundAttachment[] = [];
+    if (sock && mediaMetaFromMessage(msg)) {
+      const saved = await downloadInboundMedia(msg, sock, this.mediaSaveRoot);
+      if (saved) attachments.push(saved);
+    }
+
+    if (!text && attachments.length === 0) {
       const jid = msg.key.remoteJid || "unknown";
       const type = msg.message ? getContentType(msg.message) : undefined;
       if (type) {
@@ -454,9 +681,11 @@ export class WhatsAppBridge {
       payload: {
         jid: replyJid,
         identityJid,
+        candidates,
         pushName: msg.pushName || undefined,
         text,
         messageId: msg.key.id || undefined,
+        attachments: attachments.length ? attachments : undefined,
       },
     });
   }
