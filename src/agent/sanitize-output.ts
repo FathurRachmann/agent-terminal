@@ -6,7 +6,15 @@
 import { isJunkGuideline as isJunkStandardGuideline } from "../memory/guideline.js";
 
 const COT_OPENERS =
-  /^(okay[,.]?\s+)?let'?s\s+(break\s+down|think|analyze|reason|start)|^(first|now)[,.]?\s+i\s+need\s+to\b|^the\s+user\s+(provided|asked|wants)\b/i;
+  /^(okay[,.]?\s+)?let'?s\s+(break\s+down|think|analyze|reason|start)|^(first|now)[,.]?\s+i\s+(need\s+to|should|can|will|am\s+going\s+to)\b|^the\s+user\s+(provided|asked|wants|greeted|said|wrote|sent|messaged)\b|^(first|okay|so)[,.]?\s+the\s+user\b|^i\s+(should|can|will|need\s+to)\s+(start\s+by\s+)?(explore|exploring|check|checking|list|listing|look|looking|use|using|run|running)\b/i;
+
+/** Model narrates how it will reply instead of actually replying. */
+const RESPONSE_PLANNING =
+  /\b(my response should|i('ll| will) (respond|go with|make sure|keep it)|i\s+need\s+to\s+remember\s+to\s+keep\s+my\s+response|respond in (english|indonesian|bahasa)|avoiding any lengthy|match the user'?s language|the response should be|keep (my response|it) (friendly|concise|short|natural)|adheres? to (the )?(guidelines|system prompt|soul)|from (past interactions|memory and guidelines)|looking back[,.]?\s+the guidelines|typically for .+ users)\b/i;
+
+/** Model narrates intended tool use instead of calling tools / answering. */
+const TOOL_PLAN_NARRATION =
+  /\b(i\s+(can|should|will|need\s+to)\s+use\s+(the\s+)?(available\s+)?(tools?|[`']?(ls|read_file|execute|glob|grep|eslint|tslint))|i('ll| will)\s+start\s+by\s+(listing|exploring|checking|using)|use\s+the\s+[`']?ls[`']?\s+command|start\s+by\s+(listing|exploring)\b|first[,.]?\s+i\s+should\s+start\s+by|check\s+if\s+there'?s\s+a\s+[`']?readme|using\s+[`']?(ls|read_file|glob|grep|execute)[`']?)\b/i;
 
 export function stripThinkBlocks(text: string): string {
   let out = text
@@ -32,7 +40,75 @@ export function isJunkGuideline(text: string): boolean {
   if (!t || /^none\b/i.test(t)) return true;
   if (/^<\/?think>$/i.test(t)) return true;
   if (COT_OPENERS.test(t)) return true;
+  if (RESPONSE_PLANNING.test(t) && t.length > 120) return true;
   return isJunkStandardGuideline(t);
+}
+
+/** True when the model is drafting how to answer instead of answering. */
+export function looksLikeResponsePlanning(text: string): boolean {
+  const t = stripThinkBlocks(text).trim();
+  if (!t || t.length < 80) return false;
+  const opens =
+    COT_OPENERS.test(t) ||
+    /^(first|okay|so)[,.]?\s+the\s+user\b/i.test(t);
+  const plans = RESPONSE_PLANNING.test(t);
+  if (!(opens || plans)) return false;
+  // Short real replies that happen to mention "response" are OK.
+  if (t.length < 160 && /^(halo|hai|hi|hello|hey|ya|iya|oke|siap)\b/i.test(t)) {
+    return false;
+  }
+  // Planning monologues are usually long and self-referential.
+  const metaHits = (
+    t.match(
+      /\b(my response|i('ll| will| should)|guidelines|system prompt|soul\.md|keep it (friendly|concise)|respond in)\b/gi,
+    ) ?? []
+  ).length;
+  return plans || (opens && metaHits >= 2 && t.length > 180);
+}
+
+/**
+ * Pull a short quoted reply the model planned but never delivered.
+ * e.g. … Something like "Halo! Ada yang bisa saya bantu?" would be perfect …
+ */
+export function salvageUserFacingAnswer(text: string): string | null {
+  const t = stripThinkBlocks(text).trim();
+  if (!t || !looksLikeResponsePlanning(t)) return null;
+
+  const quotes = [
+    ...t.matchAll(/["“]([^"”\n]{3,160})["”]/g),
+    ...t.matchAll(/'([^'\n]{3,120})'/g),
+  ]
+    .map((m) => String(m[1] || "").trim())
+    .filter(Boolean);
+
+  const score = (q: string): number => {
+    let s = 0;
+    if (/^(halo|hai|hi|hello|hey|pagi|siang|sore)\b/i.test(q)) s += 5;
+    if (/[!?]$/.test(q)) s += 2;
+    if (q.length <= 100) s += 2;
+    if (/\b(should|guidelines|response|typically|english|indonesian)\b/i.test(q))
+      s -= 4;
+    if (/^(okay|first|the user)\b/i.test(q)) s -= 5;
+    return s;
+  };
+
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const q of quotes) {
+    let sc = score(q);
+    // Prefer replies matching the user's language when the monologue mentions it.
+    if (
+      /\bindonesian|bahasa\b/i.test(t) &&
+      /[àáâãäåèéêëìíîïòóôõöùúûüńç]|halo|hai|pagi|siang|sore|bantu/i.test(q)
+    ) {
+      sc += 3;
+    }
+    if (sc >= bestScore && sc >= 4) {
+      bestScore = sc;
+      best = q;
+    }
+  }
+  return best;
 }
 
 /**
@@ -41,6 +117,8 @@ export function isJunkGuideline(text: string): boolean {
 export function looksLikeIncompleteReasoning(text: string): boolean {
   const t = stripThinkBlocks(text).trim();
   if (!t) return true;
+  if (looksLikeToolPlanNarration(t)) return true;
+  if (looksLikeResponsePlanning(t)) return true;
   if (COT_OPENERS.test(t)) {
     if (/[,:;]\s*$/.test(t)) return true;
     if (/\b(however|but|so|therefore|next)\s*,?\s*$/i.test(t)) return true;
@@ -48,8 +126,38 @@ export function looksLikeIncompleteReasoning(text: string): boolean {
     const hasStructure =
       /^#{1,3}\s|^\s*[-*]\s|`[^`]+`|\/[\w./-]+|\.ts\b|\.md\b/m.test(t);
     if (!hasStructure && t.length > 280) return true;
+    // Long first-person planning monologue without a clear answer.
+    if (
+      /\bi\s+(should|can|will|need to)\b/i.test(t) &&
+      t.length > 220 &&
+      !/^(ya|iya|bisa|sudah|oke|siap|berikut|hasil|halo|hai|hi|hello)\b/i.test(t)
+    ) {
+      return true;
+    }
   }
   return false;
+}
+
+/** Narrates ls/read_file plans instead of returning evidence-based answers. */
+export function looksLikeToolPlanNarration(text: string): boolean {
+  const t = stripThinkBlocks(text).trim();
+  if (!t || t.length < 40) return false;
+  const firstShould = /first[,.]?\s+i\s+should\b/i.test(t);
+  const futureToolPlan =
+    TOOL_PLAN_NARRATION.test(t) ||
+    firstShould ||
+    (/\b(i\s+(can|should|will|need\s+to)|i('ll| will))\b/i.test(t) &&
+      /[`'](ls|read_file|execute|glob|grep|eslint|tslint)[`']/i.test(t));
+  if (!futureToolPlan && !COT_OPENERS.test(t)) return false;
+  // Real answers that mention tools in past tense / with results are OK.
+  if (
+    /\b(i\s+(ran|listed|found|read|checked)|saya\s+(sudah|melihat|menemukan|cek)|hasil\s+ls|isi\s+(folder|project)|berikut\s+(struktur|isi))\b/i.test(
+      t,
+    )
+  ) {
+    return false;
+  }
+  return futureToolPlan;
 }
 
 /** Router/provider notices (model sunset, switch model, Antigravity, etc.). */
@@ -63,22 +171,39 @@ export function looksLikeProviderNotice(text: string): boolean {
 
 /** Prefer reasoning-panel styling over a chat bubble. */
 export function shouldRenderAsReasoning(text: string): boolean {
+  if (salvageUserFacingAnswer(text)) return false;
   return looksLikeProviderNotice(text) || looksLikeIncompleteReasoning(text);
 }
 
 export function sanitizeAssistantText(text: string): string {
-  return stripThinkBlocks(text);
+  const stripped = stripThinkBlocks(text);
+  const salvaged = salvageUserFacingAnswer(stripped);
+  return salvaged ?? stripped;
 }
 
-/** Prefer the longest sanitized user-facing answer (stream draft vs done payload). */
+/**
+ * Merge streamed draft vs done payload.
+ * Prefer a complete answer over incomplete CoT; otherwise keep the longer text
+ * (helps when the done payload was truncated).
+ */
 export function resolveFinalAssistantText(
   eventText: string | undefined,
   draft: string,
 ): string {
-  const fromEvent = sanitizeAssistantText(String(eventText ?? "")).trim();
-  const fromDraft = sanitizeAssistantText(draft).trim();
+  const rawEvent = stripThinkBlocks(String(eventText ?? "")).trim();
+  const rawDraft = stripThinkBlocks(draft).trim();
+  const salvaged =
+    salvageUserFacingAnswer(rawEvent) || salvageUserFacingAnswer(rawDraft);
+  if (salvaged) return salvaged;
+
+  const fromEvent = rawEvent;
+  const fromDraft = rawDraft;
   if (!fromEvent && !fromDraft) return "";
   if (!fromEvent) return fromDraft;
   if (!fromDraft) return fromEvent;
+  const eventBad = looksLikeIncompleteReasoning(fromEvent);
+  const draftBad = looksLikeIncompleteReasoning(fromDraft);
+  if (draftBad && !eventBad) return fromEvent;
+  if (eventBad && !draftBad) return fromDraft;
   return fromDraft.length > fromEvent.length ? fromDraft : fromEvent;
 }

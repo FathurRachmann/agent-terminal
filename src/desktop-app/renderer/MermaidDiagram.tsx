@@ -8,6 +8,9 @@ import {
 import { CodeBlock } from "./CodeBlock.js";
 import { CopyButton } from "./CopyButton.js";
 import { loadMermaid, renderMermaidForExport } from "./mermaid-loader.js";
+import { normalizeMermaidSource } from "./mermaid-normalize.js";
+
+export { normalizeMermaidSource } from "./mermaid-normalize.js";
 
 type Props = {
   code: string;
@@ -28,6 +31,7 @@ export function MermaidDiagram({ code, filename }: Props) {
   const [layer, setLayer] = useState<"diagram" | "source">("diagram");
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [renderCode, setRenderCode] = useState("");
   const [busy, setBusy] = useState(true);
   const trimmed = code.replace(/\n$/, "");
 
@@ -35,13 +39,29 @@ export function MermaidDiagram({ code, filename }: Props) {
     let cancelled = false;
     setBusy(true);
     setError(null);
+    setRenderCode(trimmed);
     void (async () => {
       try {
         const mermaid = await loadMermaid();
-        const id = `mmd-${reactId}-${Math.random().toString(36).slice(2, 8)}`;
-        const { svg: rendered } = await mermaid.render(id, trimmed);
+        const renderOnce = async (source: string) => {
+          const id = `mmd-${reactId}-${Math.random().toString(36).slice(2, 8)}`;
+          const { svg: rendered } = await mermaid.render(id, source);
+          return { rendered, source };
+        };
+
+        const normalized = normalizeMermaidSource(trimmed);
+        // Prefer normalized source first — LLMs often emit fixable syntax.
+        let result: { rendered: string; source: string };
+        try {
+          result = await renderOnce(normalized);
+        } catch (normalizedErr) {
+          if (normalized === trimmed) throw normalizedErr;
+          result = await renderOnce(trimmed);
+        }
+
         if (!cancelled) {
-          setSvg(rendered);
+          setSvg(result.rendered);
+          setRenderCode(result.source);
           setBusy(false);
         }
       } catch (e) {
@@ -59,7 +79,8 @@ export function MermaidDiagram({ code, filename }: Props) {
   }, [trimmed, reactId]);
 
   const copyPreview = async () => {
-    const ok = await copyMermaidSourceAsImage(trimmed, renderMermaidForExport);
+    const source = renderCode || trimmed;
+    const ok = await copyMermaidSourceAsImage(source, renderMermaidForExport);
     if (ok) return true;
     const live = svgHostRef.current?.querySelector("svg");
     if (live) {
@@ -71,7 +92,7 @@ export function MermaidDiagram({ code, filename }: Props) {
 
   return (
     <div className="mb-3 overflow-hidden rounded-[10px] border border-border bg-surface-1 shadow-[0_8px_24px_rgba(0,0,0,0.4)]">
-      <div className="flex items-center justify-between gap-2 border-b border-border bg-gradient-to-b from-surface-3 to-surface-2 px-3 py-2">
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-linear-to-b from-surface-3 to-surface-2 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="text-[9.5px] font-semibold tracking-wide text-accent uppercase">
             Diagram
@@ -109,7 +130,9 @@ export function MermaidDiagram({ code, filename }: Props) {
             }
             disabled={layer === "diagram" && (!svg || busy)}
             onCopy={() =>
-              layer === "diagram" ? copyPreview() : copyText(trimmed)
+              layer === "diagram"
+                ? copyPreview()
+                : copyText(renderCode || trimmed)
             }
           />
         </div>
@@ -139,7 +162,7 @@ export function MermaidDiagram({ code, filename }: Props) {
       ) : (
         <div className="p-0">
           <CodeBlock
-            code={trimmed}
+            code={renderCode || trimmed}
             language="mermaid"
             filename={filename || "diagram.mmd"}
             hideCopy

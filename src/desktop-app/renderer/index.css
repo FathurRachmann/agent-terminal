@@ -62,12 +62,15 @@ html[data-theme="light"] {
     -webkit-font-smoothing: antialiased;
   }
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 5px;
+    height: 5px;
   }
   ::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--color-border-strong) 80%, transparent);
-    border-radius: 8px;
+    background: color-mix(in srgb, var(--color-border-strong) 70%, transparent);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--color-border-strong) 100%, transparent);
   }
   ::-webkit-scrollbar-track {
     background: transparent;
@@ -183,6 +186,27 @@ html[data-theme="light"] {
 }
 .layout-resize-handle {
   background: transparent;
+}
+.mention-chip {
+  display: inline;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  color: color-mix(in srgb, var(--color-accent) 85%, var(--color-fg));
+  font-weight: 600;
+  padding: 0.05em 0.28em;
+}
+.mention-mirror {
+  color: var(--color-fg);
+}
+.mention-textarea {
+  /* Keep caret visible while glyphs come from the mirror highlight layer. */
+  caret-color: var(--color-fg);
+}
+.mention-textarea::placeholder {
+  color: var(--color-muted);
+  opacity: 1;
 }
 .composer-shell {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;

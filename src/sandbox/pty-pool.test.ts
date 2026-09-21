@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { PtySandbox, resolvePoolSize } from "./pty-sandbox.js";
 
 describe("resolvePoolSize", () => {
-  it("defaults to 3 and clamps", () => {
+  it("defaults to 3 and clamps to max 10", () => {
     const prev = process.env.PTY_POOL_SIZE;
     delete process.env.PTY_POOL_SIZE;
     try {
@@ -14,7 +14,9 @@ describe("resolvePoolSize", () => {
       assert.equal(resolvePoolSize(1), 1);
       assert.equal(resolvePoolSize(3), 3);
       assert.equal(resolvePoolSize(8), 8);
-      assert.equal(resolvePoolSize(99), 8);
+      assert.equal(resolvePoolSize(10), 10);
+      assert.equal(resolvePoolSize(11), 10);
+      assert.equal(resolvePoolSize(99), 10);
       assert.equal(resolvePoolSize(0), 1);
     } finally {
       if (prev === undefined) delete process.env.PTY_POOL_SIZE;
@@ -41,6 +43,17 @@ describe("PtySandbox pool", () => {
     dirs.push(dir);
     const sandbox = new PtySandbox({ workingDirectory: dir, poolSize: 3 });
     assert.equal(sandbox.getPoolSize(), 3);
+    sandbox.dispose();
+  });
+
+  it("ensurePoolSize grows without shrinking busy slots", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pty-pool-"));
+    dirs.push(dir);
+    const sandbox = new PtySandbox({ workingDirectory: dir, poolSize: 3 });
+    assert.equal(sandbox.getPoolSize(), 3);
+    assert.equal(sandbox.ensurePoolSize(10), 10);
+    assert.equal(sandbox.getPoolSize(), 10);
+    assert.equal(sandbox.ensurePoolSize(4), 10); // already at 10
     sandbox.dispose();
   });
 

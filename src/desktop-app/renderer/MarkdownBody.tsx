@@ -3,6 +3,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlock, parseFenceMeta } from "./CodeBlock.js";
 import { looksLikeMermaid, MermaidDiagram } from "./MermaidDiagram.js";
+import {
+  recoverMermaidCodeFence,
+  repairMermaidMarkdown,
+} from "./mermaid-markdown-repair.js";
 import { DbSchemaDiagram, looksLikeSqlSchema } from "./DbSchemaDiagram.js";
 import { looksLikeWorkspacePath } from "./activity-artifact.js";
 
@@ -90,12 +94,15 @@ function buildMdComponents(
           ? (props as { node?: { data?: { meta?: string } } }).node?.data?.meta
           : undefined;
       const { language, filename } = parseFenceMeta(className, meta);
+      const recovered = recoverMermaidCodeFence(language, text);
+      const mermaidCode = recovered?.code ?? text;
+      const mermaidLang = recovered?.language ?? language;
       if (
-        language === "mermaid" ||
-        language === "mmd" ||
-        looksLikeMermaid(text)
+        mermaidLang === "mermaid" ||
+        mermaidLang === "mmd" ||
+        looksLikeMermaid(mermaidCode)
       ) {
-        return <MermaidDiagram code={text} filename={filename} />;
+        return <MermaidDiagram code={mermaidCode} filename={filename} />;
       }
       const sqlLang = [
         "sql",
@@ -149,10 +156,11 @@ export function MarkdownBody({
     () => buildMdComponents(onOpenPath),
     [onOpenPath],
   );
+  const repaired = useMemo(() => repairMermaidMarkdown(text), [text]);
   return (
     <div className="md-body break-words text-xs leading-relaxed text-fg">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-        {text}
+        {repaired}
       </ReactMarkdown>
     </div>
   );

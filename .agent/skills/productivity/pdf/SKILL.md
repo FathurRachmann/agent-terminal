@@ -34,6 +34,7 @@ Create PDFs from structured specs, build and fill AcroForm forms (with layout li
 - Python 3.10+ with `pypdf`, `reportlab`, `pdfplumber`:
   `python -m pip install pypdf reportlab pdfplumber`
 - Optional, for page rasterization (`pdf_page_image.py`, overlay rendering): `python -m pip install pypdfium2`, or poppler's `pdftoppm` on PATH. Scripts fall back pypdfium2 → pdftoppm and report `{"rendered": false, "missing": [...]}` (exit 0) when neither exists.
+- Optional, for Mermaid diagrams in `pdf_create.py` (`type: mermaid`): Node + Playwright, with Chrome/Edge preferred. If launch fails: install Chrome or run `npx playwright install chromium`.
 - Each helper script checks imports lazily and prints an install hint if a dependency is missing.
 
 ## How to Run
@@ -68,7 +69,8 @@ python scripts/pdf_meta.py doc.pdf --list-attachments | --extract-attachments di
 
 | Task | Tool | Command / API |
 |---|---|---|
-| Create doc (headings, tables, images) | reportlab platypus | `pdf_create.py spec.json -o out.pdf` |
+| Create doc (headings, tables, images, mermaid diagrams) | reportlab + playwright | `pdf_create.py spec.json -o out.pdf` |
+| Render Mermaid → PNG only | playwright | `node scripts/mermaid_to_png.mjs --input d.mmd --output d.png` |
 | Build fillable form | reportlab acroForm | `pdf_make_form.py formspec.json -o form.pdf` |
 | Lint form layout / overlay image | pure python + PIL | `pdf_form_layout.py formspec.json [--render-overlay o.png]` |
 | Per-page text | pdfplumber | `pdf_read.py f.pdf --text` |
@@ -87,7 +89,9 @@ python scripts/pdf_meta.py doc.pdf --list-attachments | --extract-attachments di
 ## Procedure
 
 1. **Inspect first.** Run `pdf_read.py file.pdf --meta`. Check `encrypted` (if true, decrypt first with `pdf_secure.py --decrypt`) and `likely_scanned_pages`. If pages are image-only, export them with `pdf_page_image.py --pages <scanned> --dpi 300 --out-dir imgs/` and hand the PNGs to the `references/ocr-extraction.md` skill — do not report empty text as "no content".
-2. **Create.** Write a JSON spec with `write_file` (elements: `heading`, `paragraph`, `table`, `image`, `pagebreak`; optional `title`/`author` metadata; page numbers are added automatically), then run `pdf_create.py`. Verify visually with `vision_analyze` on a rendered page image if layout matters.
+2. **Create.** Write a JSON spec with `write_file` (elements: `heading`, `paragraph`, `table`, `image`, `mermaid`, `pagebreak`; optional `title`/`author` metadata; page numbers are added automatically), then run `pdf_create.py`. Verify visually with `vision_analyze` on a rendered page image if layout matters.
+   - **Diagrams (CRITICAL):** Never paste Mermaid / sequenceDiagram / flowchart source as a paragraph. Use `{"type":"mermaid","code":"...","width":480}` so it renders to a PNG diagram, or pre-render with `node scripts/mermaid_to_png.mjs` and embed via `{"type":"image","path":"..."}`.
+   - **Tables:** Always use `{"type":"table","rows":[...],"header":true}` — borders are black 0.5pt by default. Do not fake tables with spaces/ASCII.
 3. **Extract.** `--text` gives a JSON list of per-page strings; `--tables` gives row arrays per page and can also emit CSV files. Read results with `read_file`; never eyeball a binary PDF directly.
 4. **Manipulate.** `pdf_merge.py` concatenates and can add one bookmark per source file; `pdf_split.py` handles page ranges (1-based, e.g. `1-3,5,9-`), rotation in 90° steps, and `--compress`. Watermark by preparing a single-page stamp PDF (e.g. via `pdf_create.py`) and overlaying it with `pdf_watermark.py`; for one-liner stamps ("sign here", diagonal DRAFT, corner labels) use `pdf_stamp.py` with text or an image at explicit coordinates.
 5. **Build forms.** Write one form-spec JSON (fields with `label_box`/`entry_box` in PDF points — see `references/forms.md`), lint it with `pdf_form_layout.py` and fix every reported problem, optionally review the `--render-overlay` PNG with `vision_analyze`, then build with `pdf_make_form.py` and confirm with `pdf_read.py --fields`.
@@ -98,6 +102,8 @@ python scripts/pdf_meta.py doc.pdf --list-attachments | --extract-attachments di
 
 ## Pitfalls
 
+- **Mermaid in PDF:** Pasting `sequenceDiagram` / `flowchart` source text into the PDF is wrong — readers see code, not a diagram. Always use element type `mermaid` (or a rendered PNG `image`).
+- **Table borders:** Specs must use type `table` (not markdown pipes in a paragraph). `pdf_create.py` draws black 0.5pt BOX + INNERGRID automatically.
 - **Scanned PDFs**: empty `extract_text()` plus page images means there is no text layer. Route to `references/ocr-extraction.md`; do not fabricate text.
 - **Flattening limits**: `pdf_fill_form.py --flatten` uses pypdf's flatten support, which converts widget appearances into page content. It is reliable for plain text fields and checkboxes but can drop or misrender exotic widgets (rich text, custom appearance streams, some radio groups). Verify the flattened output visually with `vision_analyze`; for bulletproof flattening use an external renderer (e.g. Ghostscript or `pdftoppm`+reassembly) as a fallback.
 - **NeedAppearances**: after filling, viewers only render values if appearance streams exist. The fill script sets the AcroForm `NeedAppearances` flag so conforming viewers regenerate them; some minimal viewers ignore it — flatten if display fidelity matters.

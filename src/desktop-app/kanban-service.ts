@@ -40,6 +40,10 @@ import { UI_COLUMNS } from "../agent/kanban/types.js";
 export type KanbanServiceDeps = {
   getMainWindow: () => BrowserWindow | null;
   isAgentReady: () => boolean;
+  /** Active profile home (for project registry). */
+  getProfileHome: () => string;
+  /** Agent application root (for working/project/<name>). */
+  getArtifactHome: () => string;
   runWorkerTurn: (opts: {
     boardSlug: string;
     taskId: string;
@@ -50,6 +54,8 @@ export type KanbanServiceDeps = {
     goalMode: boolean;
     goalMaxTurns: number;
     store: KanbanStore;
+    projectId?: string | null;
+    artifactDir?: string | null;
   }) => Promise<void>;
 };
 
@@ -508,14 +514,15 @@ async function spawnWorker(
   });
 
   let workspaceCwd = process.cwd();
+  let artifactDir: string | null = null;
   try {
-    const ws = resolveWorkspace(
-      req.task,
-      req.boardSlug,
-      undefined,
-      settings.defaultWorkdir || undefined,
-    );
+    const ws = resolveWorkspace(req.task, req.boardSlug, {
+      defaultWorkdir: settings.defaultWorkdir || undefined,
+      profileHome: deps.getProfileHome(),
+      artifactHome: deps.getArtifactHome(),
+    });
     workspaceCwd = ws.cwd;
+    artifactDir = ws.artifactDir ?? null;
   } catch (err) {
     store.recordSpawnFailed(
       req.task.id,
@@ -531,6 +538,9 @@ async function spawnWorker(
     mode: req.mode,
     reviewRound: req.reviewRound,
     reviewLens: req.reviewLens,
+    projectId: req.task.projectId,
+    workspaceCwd,
+    artifactDir,
   });
 
   try {
@@ -552,6 +562,8 @@ async function spawnWorker(
             goalMode: true,
             goalMaxTurns: req.task.goalMaxTurns,
             store,
+            projectId: req.task.projectId,
+            artifactDir,
           });
           return store.getTask(req.task.id)?.result ?? "turn finished";
         },
@@ -567,6 +579,8 @@ async function spawnWorker(
         goalMode: false,
         goalMaxTurns: req.task.goalMaxTurns,
         store,
+        projectId: req.task.projectId,
+        artifactDir,
       });
       // Protocol violation if still running after clean exit
       const after = store.getTask(req.task.id);

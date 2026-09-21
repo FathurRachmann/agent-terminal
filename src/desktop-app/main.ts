@@ -8,6 +8,12 @@ import type { AgentUiEvent } from "../cli/run-agent.js";
 import { getBots, getBot, initializeBots, botThreadId, isBotThreadId, isSpecializedBot, parseBotIdFromThread } from "../agent/bot-manager.js";
 import { buildBotScopeInstruction } from "../agent/bot-scope-middleware.js";
 import {
+  resolveWorkingScope,
+  workingScopeAbs,
+  workingScopeInstruction,
+  type WorkingScope,
+} from "../agent/working-paths.js";
+import {
   registerKanbanIpc,
   startCronScheduler,
   startKanbanDispatcher,
@@ -59,6 +65,10 @@ import {
   type ProjectRecord,
 } from "../agent/projects/index.js";
 import {
+  isWorkspaceThreadId,
+  registerWorkspaceIpc,
+} from "./workspace-service.js";
+import {
   loadMessagingConfig,
   resolveWhatsAppAccessRole,
   saveMessagingConfig,
@@ -87,6 +97,10 @@ import {
   AGENT_PREVIEW_SCHEME,
   decodeAgentPreviewUrl,
 } from "./preview-protocol.js";
+import { installMainProcessCrashGuards } from "./main-process-guards.js";
+
+// Catch undici/fetch aborts before Electron paints a fatal dialog.
+installMainProcessCrashGuards();
 
 // Must run before app is ready — enables iframe/video PDF & media streaming in Canvas.
 protocol.registerSchemesAsPrivileged([
@@ -106,6 +120,7 @@ protocol.registerSchemesAsPrivileged([
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let mainWindow: BrowserWindow | null = null;
+let workspacesWindow: BrowserWindow | null = null;
 let agentBundle: AgentBundle | null = null;
 let agentBootError: string | null = null;
 /** Threads currently executing a turn (supports parallel sessions). */
@@ -154,6 +169,70 @@ function effectiveAllowedFolders(): string[] | undefined {
   return [...project.folders];
 }
 
+/**
+ * Roots for Open / Save as / reveal of agent deliverables.
+ * Always includes Agent artifact home so working/global|bots|project resolve.
+ */
+function deliverySearchRoots(): string[] {
+  const roots = [
+    ...(effectiveAllowedFolders() ?? []),
+    effectiveWorkspaceRoot(),
+    artifactHomeRoot(),
+  ].filter(Boolean);
+  return [...new Set(roots.map((r) => path.resolve(r)))];
+}
+
+/** Artifact root is always the Agent application repo. */
+function artifactHomeRoot(): string {
+  return workspaceRoot;
+}
+
+function turnWorkingScope(opts?: {
+  threadId?: string | null;
+  botId?: string | null;
+  workspaceId?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+}): WorkingScope {
+  const threadId = opts?.threadId ?? activeThreadId;
+  const botSession = isBotThreadId(threadId);
+  const project = getActiveProject(agentStateRoot());
+  return resolveWorkingScope({
+    threadId,
+    botId:
+      opts?.botId ??
+      (botSession ? activeBotId || parseBotIdFromThread(threadId) : null),
+    workspaceId: opts?.workspaceId ?? null,
+    projectId:
+      opts?.projectId !== undefined
+        ? opts.projectId
+        : botSession
+          ? null
+          : activeProjectId,
+    projectName:
+      opts?.projectName !== undefined
+        ? opts.projectName
+        : botSession
+          ? null
+          : project?.name ?? null,
+  });
+}
+
+function ensureTurnWorkingDirs(scope: WorkingScope): {
+  absDir: string;
+  uploadsAbsDir: string;
+  nudge: string;
+} {
+  const { absDir, uploadsAbsDir } = workingScopeAbs(artifactHomeRoot(), scope);
+  fs.mkdirSync(absDir, { recursive: true });
+  fs.mkdirSync(uploadsAbsDir, { recursive: true });
+  return {
+    absDir,
+    uploadsAbsDir,
+    nudge: workingScopeInstruction(scope, absDir),
+  };
+}
+
 function isAbsInsideAnyRoot(abs: string, roots: string[]): boolean {
   const resolved = path.resolve(abs);
   for (const root of roots) {
@@ -172,12 +251,7 @@ function registerAgentPreviewProtocol() {
       if (!abs) {
         return new Response("Bad preview URL", { status: 400 });
       }
-      const roots = [
-        ...(effectiveAllowedFolders() ?? []),
-        effectiveWorkspaceRoot(),
-        workspaceRoot,
-        agentStateRoot(),
-      ].filter(Boolean);
+      const roots = deliverySearchRoots();
       if (!isAbsInsideAnyRoot(abs, roots)) {
         return new Response("Forbidden", { status: 403 });
       }
@@ -218,7 +292,9 @@ function selectBotWithoutScopeMutation(botId: string) {
 }
 
 function listGeneralSessions() {
-  return listSessionsSafe().filter((s) => !isBotThreadId(s.threadId));
+  return listSessionsSafe().filter(
+    (s) => !isBotThreadId(s.threadId) && !isWorkspaceThreadId(s.threadId),
+  );
 }
 
 function resolveRendererHtml(): string {
@@ -243,8 +319,91 @@ function emitToRenderer(event: AgentUiEvent) {
   if (event.type === "error" && typeof event.message === "string") {
     selfHeal.recordTurnError(event.message, "turn");
   }
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("agent:event", event);
+  for (const win of [mainWindow, workspacesWindow]) {
+    if (!win || win.isDestroyed()) continue;
+    win.webContents.send("agent:event", event);
+  }
+}
+
+/** Prefer the IPC sender's window so dialogs aren't hidden behind Workspaces. */
+function dialogParent(
+  event?: { sender?: Electron.WebContents } | null,
+): BrowserWindow | undefined {
+  try {
+    const fromSender = event?.sender
+      ? BrowserWindow.fromWebContents(event.sender)
+      : null;
+    if (fromSender && !fromSender.isDestroyed()) return fromSender;
+  } catch {
+    /* ignore */
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+  if (workspacesWindow && !workspacesWindow.isDestroyed()) return workspacesWindow;
+  return undefined;
+}
+
+function workspacesWindowUrl(): string {
+  const devUrl = process.env.VITE_DEV_SERVER_URL?.trim();
+  if (devUrl) {
+    const base = devUrl.replace(/\/$/, "");
+    return `${base}/?view=workspaces`;
+  }
+  // file:// load — hash works without a server
+  return "";
+}
+
+async function openWorkspacesWindow(): Promise<{
+  ok: boolean;
+  error?: string;
+}> {
+  if (workspacesWindow && !workspacesWindow.isDestroyed()) {
+    if (workspacesWindow.isMinimized()) workspacesWindow.restore();
+    workspacesWindow.focus();
+    return { ok: true };
+  }
+
+  workspacesWindow = new BrowserWindow({
+    width: 1280,
+    height: 840,
+    minWidth: 900,
+    minHeight: 600,
+    title: "Workspaces — Agent Desktop",
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 16, y: 18 },
+    backgroundColor: "#0a0a0b",
+    webPreferences: {
+      preload: resolvePreload(),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+    },
+  });
+
+  workspacesWindow.on("closed", () => {
+    workspacesWindow = null;
+  });
+
+  const dev = workspacesWindowUrl();
+  if (dev) {
+    try {
+      await workspacesWindow.loadURL(dev);
+      return { ok: true };
+    } catch (err) {
+      console.error("Workspaces window: Vite unreachable, falling back", err);
+    }
+  }
+
+  try {
+    await workspacesWindow.loadFile(resolveRendererHtml(), {
+      query: { view: "workspaces" },
+    });
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    workspacesWindow.close();
+    workspacesWindow = null;
+    return { ok: false, error: message };
+  }
 }
 
 function emitTerminalData(sessionId: string, data: string) {
@@ -340,6 +499,7 @@ async function runSelfHealTurn(opts: {
         embedder: agentBundle.embedder,
         model: agentBundle.model,
         workspaceRoot: agentBundle.workspaceRoot,
+        profileHome: agentBundle.profileHome,
         enableReflection: agentBundle.enableReflection,
       },
       onEvent: (ev) =>
@@ -393,10 +553,10 @@ function ensureWhatsAppBridge(): WhatsAppBridge {
           void handleWhatsAppInbound(ev.payload);
         }
       },
-      effectiveWorkspaceRoot(),
+      artifactHomeRoot() || effectiveWorkspaceRoot(),
     );
   } else {
-    whatsappBridge.setMediaSaveRoot(effectiveWorkspaceRoot());
+    whatsappBridge.setMediaSaveRoot(artifactHomeRoot());
   }
   return whatsappBridge;
 }
@@ -511,6 +671,7 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
         embedder: agentBundle.embedder,
         model: agentBundle.model,
         workspaceRoot: agentBundle.workspaceRoot,
+        profileHome: agentBundle.profileHome,
         enableReflection: agentBundle.enableReflection,
       },
       onEvent: (ev) => {
@@ -545,7 +706,7 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
         [text],
         writtenDuringTurn,
       ).slice(0, 3);
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       for (const rel of paths) {
         const file = prepareFileForDelivery(roots, rel);
         if (!file.ok) {
@@ -602,7 +763,9 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
   const { createTerminalAgent } = await import("../agent/create-agent.js");
   syncActiveProjectFromDisk();
   const toolRoot = effectiveWorkspaceRoot();
-  const allowedFolders = effectiveAllowedFolders();
+  const artifactHome = workspaceRoot;
+  const projectFolders = effectiveAllowedFolders() ?? [];
+  const allowedFolders = [...new Set([...projectFolders, artifactHome])];
   localGateway.markStarting({
     profileId,
     profileHome: agentStateRoot(),
@@ -615,6 +778,7 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
     const next = await createTerminalAgent({
       workspaceRoot: toolRoot,
       allowedFolders,
+      artifactHome,
       profileHome: agentStateRoot(),
       profileId,
       autoApprove: prefs.agent.autoApproveDestructive,
@@ -717,6 +881,8 @@ app.whenReady().then(async () => {
   const kanbanDeps = {
     getMainWindow: () => mainWindow,
     isAgentReady: () => Boolean(agentBundle) && !agentBootError,
+    getProfileHome: () => profileHome || workspaceRoot,
+    getArtifactHome: () => workspaceRoot,
     runWorkerTurn: async (opts: {
       boardSlug: string;
       taskId: string;
@@ -727,6 +893,8 @@ app.whenReady().then(async () => {
       goalMode: boolean;
       goalMaxTurns: number;
       store: ReturnType<typeof openBoardStore>;
+      projectId?: string | null;
+      artifactDir?: string | null;
     }) => {
       const threadId = `kanban-${opts.boardSlug}-${opts.taskId}`;
       if (busyThreadIds.has(threadId)) {
@@ -736,16 +904,25 @@ app.whenReady().then(async () => {
       try {
         process.env.AGENT_KANBAN_TASK = opts.taskId;
         process.env.AGENT_KANBAN_BOARD = opts.boardSlug;
+        if (opts.projectId) {
+          process.env.AGENT_KANBAN_PROJECT = opts.projectId;
+        }
         const model = createRouterModel();
+        // Confine FS tools to the project (or scratch) cwd. Artifact dir is
+        // mentioned in the prompt; keep virtual root at workspaceCwd.
         const backend = new FilesystemBackend({
           rootDir: opts.workspaceCwd,
           virtualMode: true,
         });
+        const scopeHint = opts.projectId
+          ? ` You are bound to project ${opts.projectId}. Stay inside ${opts.workspaceCwd}${opts.artifactDir ? ` (artifacts: ${opts.artifactDir})` : ""}.`
+          : "";
         const worker = await Promise.resolve(
           createDeepAgent({
             model,
             systemPrompt:
-              "You are a Kanban worker. Use kanban_* tools to read and close out your assigned task. Prefer concrete evidence in summaries.",
+              "You are a Kanban worker. Use kanban_* tools to read and close out your assigned task. Prefer concrete evidence in summaries." +
+              scopeHint,
             backend,
             tools: opts.tools as never[],
             name: `kanban-worker-${opts.taskId}`,
@@ -774,6 +951,7 @@ app.whenReady().then(async () => {
       } finally {
         delete process.env.AGENT_KANBAN_TASK;
         delete process.env.AGENT_KANBAN_BOARD;
+        delete process.env.AGENT_KANBAN_PROJECT;
         busyThreadIds.delete(threadId);
       }
     },
@@ -979,6 +1157,22 @@ app.whenReady().then(async () => {
     return getWorkspaceGitSummary(effectiveWorkspaceRoot());
   });
 
+  ipcMain.handle("agent:listGitBranches", async () => {
+    const { listWorkspaceBranches } = await import("./workspace-git.js");
+    return listWorkspaceBranches(effectiveWorkspaceRoot());
+  });
+
+  ipcMain.handle(
+    "agent:checkoutGitBranch",
+    async (_event, payload?: { branch?: string }) => {
+      const { checkoutWorkspaceBranch } = await import("./workspace-git.js");
+      return checkoutWorkspaceBranch(
+        effectiveWorkspaceRoot(),
+        String(payload?.branch || ""),
+      );
+    },
+  );
+
   ipcMain.handle("agent:listProcesses", async () => {
     const { listManagedProcesses } = await import("../agent/process-manage.js");
     return { processes: listManagedProcesses() };
@@ -1098,7 +1292,7 @@ app.whenReady().then(async () => {
       const { readWorkspacePreviewMulti } = await import("./workspace-preview.js");
       const filePath = String(payload?.path || "").trim();
       if (!filePath) return { ok: false, error: "path required" };
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       return readWorkspacePreviewMulti(roots, filePath);
     },
   );
@@ -1107,7 +1301,7 @@ app.whenReady().then(async () => {
     "agent:listWorkspaceDir",
     async (_event, payload: { path?: string } = {}) => {
       const { listWorkspaceDirMulti } = await import("./workspace-preview.js");
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       return listWorkspaceDirMulti(roots, String(payload?.path || ""));
     },
   );
@@ -1136,21 +1330,22 @@ app.whenReady().then(async () => {
 
   ipcMain.handle(
     "agent:exportWorkspaceFile",
-    async (_event, payload: { path?: string }) => {
+    async (event, payload: { path?: string }) => {
       const { resolveExistingWorkspaceFile } = await import(
         "./file-delivery.js"
       );
       const filePath = String(payload?.path || "").trim();
       if (!filePath) return { ok: false, error: "path required" };
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       const resolved = resolveExistingWorkspaceFile(roots, filePath);
       if (!resolved.ok) return resolved;
       const opts = {
         title: "Save file as",
         defaultPath: resolved.basename,
       };
-      const result = mainWindow
-        ? await dialog.showSaveDialog(mainWindow, opts)
+      const parent = dialogParent(event);
+      const result = parent
+        ? await dialog.showSaveDialog(parent, opts)
         : await dialog.showSaveDialog(opts);
       if (result.canceled || !result.filePath) {
         return { ok: false, error: "canceled" };
@@ -1175,7 +1370,7 @@ app.whenReady().then(async () => {
       );
       const filePath = String(payload?.path || "").trim();
       if (!filePath) return { ok: false, error: "path required" };
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       const resolved = resolveExistingWorkspaceFile(roots, filePath);
       if (!resolved.ok) return resolved;
       shell.showItemInFolder(resolved.abs);
@@ -1191,7 +1386,7 @@ app.whenReady().then(async () => {
       );
       const filePath = String(payload?.path || "").trim();
       if (!filePath) return { ok: false, error: "path required" };
-      const roots = effectiveAllowedFolders() ?? [effectiveWorkspaceRoot()];
+      const roots = deliverySearchRoots();
       const resolved = resolveExistingWorkspaceFile(roots, filePath);
       if (!resolved.ok) return resolved;
       const err = await shell.openPath(resolved.abs);
@@ -1213,6 +1408,7 @@ app.whenReady().then(async () => {
     const sessions = listGeneralSessions();
     if (
       !isBotThreadId(activeThreadId) &&
+      !isWorkspaceThreadId(activeThreadId) &&
       !sessions.some((s) => s.threadId === activeThreadId)
     ) {
       sessions.unshift({
@@ -1221,6 +1417,8 @@ app.whenReady().then(async () => {
         preview: "(current session)",
         turnCount: 0,
         projectId: activeProjectId,
+        workspaceId: null,
+        chatId: null,
       });
     }
     return {
@@ -1457,14 +1655,57 @@ app.whenReady().then(async () => {
     return bridge.logout();
   });
 
-  async function activateProjectAndReboot(projectId: string | null) {
-    if (busyThreadIds.size > 0) {
+  async function activateProjectAndReboot(
+    projectId: string | null,
+    opts?: { force?: boolean },
+  ) {
+    const target =
+      projectId === null || projectId === undefined || projectId === ""
+        ? null
+        : String(projectId).trim() || null;
+
+    // Already on this project — do not dispose terminals / reboot agent / mint a
+    // new desktop thread (that felt like the chat room "refreshing" on a loop).
+    if (activeProjectId === target && agentBundle) {
       return {
-        ok: false as const,
-        error: "Finish or wait for running turns before switching projects.",
+        ok: true as const,
+        registry: loadProjectRegistry(agentStateRoot()),
+        project: getActiveProject(agentStateRoot()),
+        activeProjectId,
+        threadId: activeThreadId,
+        workspaceRoot: effectiveWorkspaceRoot(),
+        projectFolders: effectiveAllowedFolders() ?? null,
+        projects: listProjectSummaries(agentStateRoot()),
+        reused: true as const,
       };
     }
-    const result = setActiveProject(agentStateRoot(), projectId);
+
+    if (busyThreadIds.size > 0) {
+      if (!opts?.force) {
+        const busy = listBusyThreadIds();
+        return {
+          ok: false as const,
+          error:
+            "Finish or wait for running turns before switching projects." +
+            (busy.length ? `\nBusy: ${busy.join(", ")}` : ""),
+          busyThreadIds: busy,
+        };
+      }
+      // Force-switch: drop HITL waiters and clear the busy set so reboot can proceed.
+      for (const tid of [...busyThreadIds]) {
+        const pending = pendingApprovals.get(tid);
+        if (pending) {
+          pendingApprovals.delete(tid);
+          try {
+            pending({ decisions: [{ type: "reject" }] });
+          } catch {
+            /* ignore */
+          }
+        }
+        busyThreadIds.delete(tid);
+      }
+    }
+    const result = setActiveProject(agentStateRoot(), target);
     if (!result.ok) return result;
     activeProjectId = result.registry.activeProjectId;
     terminalService.disposeAll();
@@ -1486,6 +1727,43 @@ app.whenReady().then(async () => {
       projects: listProjectSummaries(agentStateRoot()),
     };
   }
+
+  registerWorkspaceIpc({
+    agentStateRoot,
+    getBundle: () => agentBundle,
+    emitToRenderer,
+    listBusyThreadIds,
+    markThreadBusy: (id) => {
+      busyThreadIds.add(id);
+    },
+    markThreadIdle: (id) => {
+      busyThreadIds.delete(id);
+    },
+    activateProjectAndReboot,
+    getActiveThreadId: () => activeThreadId,
+    setActiveThreadId: (id) => {
+      activeThreadId = id;
+    },
+    loadStoredAutoApprove: () =>
+      loadStoredSettings(agentStateRoot()).agent.autoApproveDestructive,
+    requestApproval: (threadId) =>
+      new Promise((resolve) => {
+        pendingApprovals.set(threadId, resolve);
+      }),
+    clearPendingApproval: (threadId) => {
+      const pending = pendingApprovals.get(threadId);
+      if (pending) {
+        pendingApprovals.delete(threadId);
+        pending({ decisions: [{ type: "reject" }] });
+      }
+    },
+    restoreBotScope: () => {
+      applyBotScope(activeBotId);
+    },
+    getGlobalActiveProjectId: () => activeProjectId,
+  });
+
+  ipcMain.handle("workspaces:openWindow", async () => openWorkspacesWindow());
 
   ipcMain.handle("projects:list", async () => {
     syncActiveProjectFromDisk();
@@ -1602,25 +1880,48 @@ app.whenReady().then(async () => {
     };
   });
 
-  ipcMain.handle("projects:setActive", async (_event, id?: string | null) => {
-    const target =
-      id === null || id === undefined || id === ""
-        ? null
-        : String(id).trim();
-    return activateProjectAndReboot(target);
-  });
+  ipcMain.handle(
+    "projects:setActive",
+    async (
+      _event,
+      idOrPayload?:
+        | string
+        | null
+        | { id?: string | null; force?: boolean },
+      maybeOpts?: { force?: boolean },
+    ) => {
+      let raw: string | null | undefined;
+      let force = false;
+      if (
+        idOrPayload &&
+        typeof idOrPayload === "object" &&
+        !Array.isArray(idOrPayload)
+      ) {
+        raw = idOrPayload.id;
+        force = Boolean(idOrPayload.force);
+      } else {
+        raw = idOrPayload as string | null | undefined;
+        force = Boolean(maybeOpts?.force);
+      }
+      const target =
+        raw === null || raw === undefined || raw === ""
+          ? null
+          : String(raw).trim();
+      return activateProjectAndReboot(target, { force });
+    },
+  );
 
-  ipcMain.handle("projects:pickFolder", async () => {
+  ipcMain.handle("projects:pickFolder", async (event) => {
     const opts = {
       properties: ["openDirectory", "createDirectory"] as Array<
         "openDirectory" | "createDirectory"
       >,
       title: "Add project folder",
     };
-    const result =
-      mainWindow && !mainWindow.isDestroyed()
-        ? await dialog.showOpenDialog(mainWindow, opts)
-        : await dialog.showOpenDialog(opts);
+    const parent = dialogParent(event);
+    const result = parent
+      ? await dialog.showOpenDialog(parent, opts)
+      : await dialog.showOpenDialog(opts);
     if (result.canceled || !result.filePaths[0]) {
       return { ok: false, cancelled: true };
     }
@@ -1858,11 +2159,18 @@ app.whenReady().then(async () => {
     files: Array<ReturnType<typeof serializeImportedAttachment>>;
   }> => {
     const { importLocalAttachment } = await import("./inbound-attachments.js");
-    const root = effectiveWorkspaceRoot();
+    const root = artifactHomeRoot();
+    const scope = turnWorkingScope();
     const files: Array<ReturnType<typeof serializeImportedAttachment>> = [];
     const errors: string[] = [];
     for (const p of filePaths) {
-      const imported = importLocalAttachment(root, p, "desktop");
+      const imported = importLocalAttachment(
+        root,
+        p,
+        "desktop",
+        undefined,
+        scope.uploadsRelDir,
+      );
       if (!imported.ok) {
         errors.push(`${path.basename(p)}: ${imported.error}`);
         continue;
@@ -1886,7 +2194,7 @@ app.whenReady().then(async () => {
   ipcMain.handle(
     "agent:pickAttachments",
     async (
-      _event,
+      event,
       options?: {
         imagesOnly?: boolean;
         directories?: boolean;
@@ -1897,10 +2205,10 @@ app.whenReady().then(async () => {
           properties: ["openDirectory"] as Array<"openDirectory">,
           title: "Attach folder",
         };
-        const dirResult =
-          mainWindow && !mainWindow.isDestroyed()
-            ? await dialog.showOpenDialog(mainWindow, dirOpts)
-            : await dialog.showOpenDialog(dirOpts);
+        const parent = dialogParent(event);
+        const dirResult = parent
+          ? await dialog.showOpenDialog(parent, dirOpts)
+          : await dialog.showOpenDialog(dirOpts);
         if (dirResult.canceled || !dirResult.filePaths.length) {
           return { ok: false, cancelled: true, files: [] as never[] };
         }
@@ -1961,10 +2269,10 @@ app.whenReady().then(async () => {
               },
             ],
       };
-      const result =
-        mainWindow && !mainWindow.isDestroyed()
-          ? await dialog.showOpenDialog(mainWindow, opts)
-          : await dialog.showOpenDialog(opts);
+      const parent = dialogParent(event);
+      const result = parent
+        ? await dialog.showOpenDialog(parent, opts)
+        : await dialog.showOpenDialog(opts);
       if (result.canceled || !result.filePaths.length) {
         return { ok: false, cancelled: true, files: [] as never[] };
       }
@@ -2009,11 +2317,13 @@ app.whenReady().then(async () => {
         return { ok: false, error: "Invalid attachment data", file: null };
       }
       const { saveAttachmentBuffer } = await import("./inbound-attachments.js");
-      const saved = saveAttachmentBuffer(effectiveWorkspaceRoot(), {
+      const scope = turnWorkingScope();
+      const saved = saveAttachmentBuffer(artifactHomeRoot(), {
         buffer,
         fileName,
         mime,
         source: "desktop",
+        uploadsRelDir: scope.uploadsRelDir,
       });
       if (!saved.ok) {
         return { ok: false, error: saved.error, file: null };
@@ -2064,7 +2374,7 @@ app.whenReady().then(async () => {
     const attachments: InboundAttachment[] = [];
     for (const ref of attachmentRefs) {
       const resolved = resolveWorkspaceUploadAttachment(
-        effectiveWorkspaceRoot(),
+        artifactHomeRoot(),
         ref,
       );
       if (resolved.ok) attachments.push(resolved.attachment);
@@ -2094,6 +2404,8 @@ app.whenReady().then(async () => {
 
     const turnThreadId = activeThreadId;
     const turnBotId = activeBotId;
+    const scope = turnWorkingScope({ threadId: turnThreadId, botId: turnBotId });
+    const { nudge: workingScopeNudge } = ensureTurnWorkingDirs(scope);
     if (busyThreadIds.has(turnThreadId)) {
       return {
         ok: false,
@@ -2153,6 +2465,7 @@ app.whenReady().then(async () => {
         prompt: composedPrompt,
         userContent,
         botInstruction,
+        workingScopeNudge,
         threadId: turnThreadId,
         projectId: isBotThreadId(turnThreadId) ? null : activeProjectId,
         autoApprove: loadStoredSettings(agentStateRoot()).agent.autoApproveDestructive,
@@ -2168,6 +2481,7 @@ app.whenReady().then(async () => {
           embedder: agentBundle.embedder,
           model: agentBundle.model,
           workspaceRoot: agentBundle.workspaceRoot,
+          profileHome: agentBundle.profileHome,
           enableReflection: agentBundle.enableReflection,
         },
         onEvent: (ev) =>

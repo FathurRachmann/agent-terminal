@@ -96,6 +96,157 @@ export async function getWorkspaceGitSummary(
   }
 }
 
+export type WorkspaceGitBranch = {
+  name: string;
+  current: boolean;
+  remote: boolean;
+};
+
+export type WorkspaceGitBranchesResult =
+  | { ok: true; current: string | null; branches: WorkspaceGitBranch[] }
+  | { ok: false; error: string; current: string | null; branches: WorkspaceGitBranch[] };
+
+/** Local + remote-tracking branch names for the project rail picker. */
+export async function listWorkspaceBranches(
+  workspaceRoot: string,
+): Promise<WorkspaceGitBranchesResult> {
+  if (!workspaceRoot) {
+    return { ok: false, error: "no workspace", current: null, branches: [] };
+  }
+  try {
+    await git(workspaceRoot, ["rev-parse", "--is-inside-work-tree"]);
+  } catch {
+    return { ok: false, error: "not a git repo", current: null, branches: [] };
+  }
+
+  try {
+    const current =
+      (await git(workspaceRoot, ["branch", "--show-current"]).catch(() => "")) ||
+      null;
+    const raw = await git(workspaceRoot, [
+      "for-each-ref",
+      "--format=%(refname:short)|%(HEAD)",
+      "refs/heads",
+      "refs/remotes",
+    ]);
+    const seen = new Set<string>();
+    const branches: WorkspaceGitBranch[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      const [nameRaw, headMark] = line.split("|");
+      const name = (nameRaw || "").trim();
+      if (!name || name.endsWith("/HEAD")) continue;
+      // Remote-tracking only — local `feature/foo` stays local.
+      const isRemote =
+        name.startsWith("origin/") || name.startsWith("remotes/");
+      if (name.startsWith("origin/")) {
+        const local = name.slice("origin/".length);
+        if (seen.has(local)) continue;
+      }
+      if (seen.has(name)) continue;
+      seen.add(name);
+      branches.push({
+        name,
+        current: headMark === "*" || name === current,
+        remote: isRemote,
+      });
+    }
+    // Mark current explicitly for local branch
+    for (const b of branches) {
+      if (current && b.name === current) b.current = true;
+    }
+    branches.sort((a, b) => {
+      if (a.current !== b.current) return a.current ? -1 : 1;
+      if (a.remote !== b.remote) return a.remote ? 1 : -1;
+      return a.name.localeCompare(b.name);
+    });
+    return { ok: true, current, branches };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      current: null,
+      branches: [],
+    };
+  }
+}
+
+export type CheckoutBranchResult =
+  | { ok: true; branch: string }
+  | { ok: false; error: string };
+
+/** Switch to a local branch, or create tracking branch from origin/<name>. */
+export async function checkoutWorkspaceBranch(
+  workspaceRoot: string,
+  branchName: string,
+): Promise<CheckoutBranchResult> {
+  const target = String(branchName || "").trim();
+  if (!workspaceRoot) return { ok: false, error: "no workspace" };
+  if (!target) return { ok: false, error: "branch required" };
+  if (target.includes("..") || /[\s\\]/.test(target)) {
+    return { ok: false, error: "invalid branch name" };
+  }
+
+  try {
+    await git(workspaceRoot, ["rev-parse", "--is-inside-work-tree"]);
+  } catch {
+    return { ok: false, error: "not a git repo" };
+  }
+
+  try {
+    const dirty = await git(workspaceRoot, ["status", "--porcelain"]).catch(
+      () => "",
+    );
+    if (dirty.trim()) {
+      return {
+        ok: false,
+        error:
+          "Working tree dirty — commit or stash changes before switching branch.",
+      };
+    }
+
+    // Local branch exists?
+    const locals = await git(workspaceRoot, ["branch", "--list", target]).catch(
+      () => "",
+    );
+    if (locals.trim()) {
+      await git(workspaceRoot, ["checkout", target]);
+      return { ok: true, branch: target };
+    }
+
+    // origin/foo → checkout -b foo --track origin/foo
+    const remoteName = target.startsWith("origin/")
+      ? target
+      : `origin/${target}`;
+    const remotes = await git(workspaceRoot, [
+      "branch",
+      "-r",
+      "--list",
+      remoteName,
+    ]).catch(() => "");
+    if (remotes.trim()) {
+      const localName = target.startsWith("origin/")
+        ? target.slice("origin/".length)
+        : target;
+      await git(workspaceRoot, [
+        "checkout",
+        "-B",
+        localName,
+        "--track",
+        remoteName,
+      ]);
+      return { ok: true, branch: localName };
+    }
+
+    return { ok: false, error: `Unknown branch: ${target}` };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export type WorkspaceChangeEntry = {
   path: string;
   status: string;

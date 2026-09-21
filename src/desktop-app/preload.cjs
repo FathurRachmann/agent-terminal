@@ -26,6 +26,9 @@ contextBridge.exposeInMainWorld("electronAgent", {
   selfHealStatus: () => ipcRenderer.invoke("agent:selfHealStatus"),
   getStatus: () => ipcRenderer.invoke("agent:getStatus"),
   getGitSummary: () => ipcRenderer.invoke("agent:getGitSummary"),
+  listGitBranches: () => ipcRenderer.invoke("agent:listGitBranches"),
+  checkoutGitBranch: (branch) =>
+    ipcRenderer.invoke("agent:checkoutGitBranch", { branch }),
   getBots: () => ipcRenderer.invoke("agent:getBots"),
   setActiveBot: (botId) => ipcRenderer.invoke("agent:setActiveBot", botId),
   getLearnedRules: () => ipcRenderer.invoke("agent:getLearnedRules"),
@@ -112,8 +115,49 @@ contextBridge.exposeInMainWorld("electronAgent", {
   updateProject: (payload) =>
     ipcRenderer.invoke("projects:update", payload || {}),
   deleteProject: (id) => ipcRenderer.invoke("projects:delete", id),
-  setActiveProject: (id) => ipcRenderer.invoke("projects:setActive", id),
+  setActiveProject: (id, opts) =>
+    ipcRenderer.invoke("projects:setActive", {
+      id: id ?? null,
+      force: Boolean(opts && opts.force),
+    }),
   pickProjectFolder: () => ipcRenderer.invoke("projects:pickFolder"),
+
+  // Workspaces (divisions)
+  listWorkspaces: () => ipcRenderer.invoke("workspaces:list"),
+  createWorkspace: (payload) =>
+    ipcRenderer.invoke("workspaces:create", payload || {}),
+  updateWorkspace: (payload) =>
+    ipcRenderer.invoke("workspaces:update", payload || {}),
+  deleteWorkspace: (id) => ipcRenderer.invoke("workspaces:delete", id),
+  getWorkspace: (id) => ipcRenderer.invoke("workspaces:get", id),
+  assignWorkspaceProject: (payload) =>
+    ipcRenderer.invoke("workspaces:assignProject", payload || {}),
+  unassignWorkspaceProject: (payload) =>
+    ipcRenderer.invoke("workspaces:unassignProject", payload || {}),
+  setWorkspaceActiveProject: (payload) =>
+    ipcRenderer.invoke("workspaces:setActiveProject", payload || {}),
+  listWorkspaceBots: (workspaceId) =>
+    ipcRenderer.invoke("workspaces:listBots", workspaceId),
+  createWorkspaceBot: (payload) =>
+    ipcRenderer.invoke("workspaces:createBot", payload || {}),
+  updateWorkspaceBot: (payload) =>
+    ipcRenderer.invoke("workspaces:updateBot", payload || {}),
+  deleteWorkspaceBot: (payload) =>
+    ipcRenderer.invoke("workspaces:deleteBot", payload || {}),
+  listWorkspaceChats: (workspaceId) =>
+    ipcRenderer.invoke("workspaces:listChats", workspaceId),
+  createWorkspaceChat: (payload) =>
+    ipcRenderer.invoke("workspaces:createChat", payload || {}),
+  updateWorkspaceChat: (payload) =>
+    ipcRenderer.invoke("workspaces:updateChat", payload || {}),
+  deleteWorkspaceChat: (payload) =>
+    ipcRenderer.invoke("workspaces:deleteChat", payload || {}),
+  openWorkspaceChat: (payload) =>
+    ipcRenderer.invoke("workspaces:openChat", payload || {}),
+  sendWorkspaceGroupPrompt: (payload) =>
+    ipcRenderer.invoke("workspaces:sendGroupPrompt", payload || {}),
+  openWorkspacesWindow: () => ipcRenderer.invoke("workspaces:openWindow"),
+
   getGatewayStatus: () => ipcRenderer.invoke("gateway:getStatus"),
   testLocalGateway: () => ipcRenderer.invoke("gateway:testLocal"),
   setGatewayMode: (mode) => ipcRenderer.invoke("gateway:setMode", { mode }),

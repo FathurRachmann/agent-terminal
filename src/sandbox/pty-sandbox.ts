@@ -7,18 +7,24 @@ import {
   type FileDownloadResponse,
   type FileUploadResponse,
 } from "deepagents";
-import { checkCommand, checkCommandWorkspaceAccess, isPathInsideAnyRoot } from "./guardrails.js";
+import { checkCommand, checkCommandWorkspaceAccess } from "./guardrails.js";
 import { registerPtyBackgroundProcess } from "../agent/process-manage.js";
+import { resolveWorkingAwarePath } from "../agent/working-paths.js";
 
 export type PtySandboxOptions = {
   workingDirectory: string;
   /** Extra allowed roots beyond workingDirectory (e.g. project folders). */
   initialAllowedRoots?: string[];
+  /**
+   * Agent repo root where `working/global|bots|project/...` artifacts live.
+   * Relative paths starting with `working/` resolve here instead of cwd.
+   */
+  artifactHome?: string;
   timeoutMs?: number;
   shell?: string;
   cols?: number;
   rows?: number;
-  /** Parallel interactive shells (default 3, env PTY_POOL_SIZE, max 8). */
+  /** Parallel interactive shells (default 3, env PTY_POOL_SIZE, max 10). */
   poolSize?: number;
   /** When true, destructive commands that normally need approval are allowed. */
   autoApproveDestructive?: boolean;
@@ -29,7 +35,10 @@ const AWAITING_INPUT_RE =
   /(\[y\/N\]|\[Y\/n\]|\(y\/n\)|password:|passphrase:|Continue\?|Overwrite\?|\(yes\/no\)|Press RETURN|More\?|--More--)\s*$/i;
 
 const DEFAULT_POOL = 3;
-const MAX_POOL = 8;
+/** Max shells for group-chat parallel bots (3 per bot × several bots). */
+export const MAX_POOL = 10;
+/** Pool size used for workspace group turns. */
+export const GROUP_CHAT_PTY_POOL = 10;
 
 export function resolvePoolSize(requested?: number): number {
   const fromEnv = Number(process.env.PTY_POOL_SIZE);
@@ -190,13 +199,15 @@ export class PtySandbox extends BaseSandbox {
   readonly id: string;
   private workingDirectory: string;
   private allowedRoots: string[];
+  /** Agent root for remapping working/* artifact paths. */
+  private readonly artifactHome: string | null;
   private readonly timeoutMs: number;
   private readonly shellPath: string;
   private readonly cols: number;
   private readonly rows: number;
   private readonly autoApproveDestructive: boolean;
   private readonly onOutput?: (chunk: string) => void;
-  private readonly poolSize: number;
+  private poolSize: number;
   private readonly sessions: PtySession[];
   private readonly waitQueue: Array<(session: PtySession) => void> = [];
   private lastSession: PtySession | null = null;
@@ -210,10 +221,31 @@ export class PtySandbox extends BaseSandbox {
   constructor(options: PtySandboxOptions) {
     super();
     this.workingDirectory = path.resolve(options.workingDirectory);
+    this.artifactHome = options.artifactHome
+      ? path.resolve(options.artifactHome)
+      : null;
     const extras = (options.initialAllowedRoots ?? [])
       .map((r) => path.resolve(r))
       .filter((r) => r && r !== this.workingDirectory);
+    if (
+      this.artifactHome &&
+      this.artifactHome !== this.workingDirectory &&
+      !extras.includes(this.artifactHome)
+    ) {
+      extras.push(this.artifactHome);
+    }
     this.allowedRoots = [this.workingDirectory, ...extras];
+    // Ensure scoped working dirs exist under Agent root.
+    if (this.artifactHome) {
+      for (const sub of ["global", "bots"]) {
+        fs.mkdirSync(path.join(this.artifactHome, "working", sub), {
+          recursive: true,
+        });
+      }
+      fs.mkdirSync(path.join(this.artifactHome, "working", "project"), {
+        recursive: true,
+      });
+    }
     this.timeoutMs = options.timeoutMs ?? Number(process.env.PTY_TIMEOUT_MS ?? 60_000);
     this.shellPath = options.shell ?? defaultShell();
     this.cols = options.cols ?? 120;
@@ -233,6 +265,23 @@ export class PtySandbox extends BaseSandbox {
   }
 
   getPoolSize(): number {
+    return this.poolSize;
+  }
+
+  /**
+   * Grow the pool up to `wanted` (clamped by MAX_POOL) without killing busy slots.
+   * Used by workspace group turns so several bots can share up to 10 shells.
+   */
+  ensurePoolSize(wanted: number): number {
+    if (this.disposed) {
+      throw new Error("PtySandbox has been disposed");
+    }
+    const target = resolvePoolSize(wanted);
+    while (this.sessions.length < target) {
+      const id = this.sessions.length;
+      this.sessions.push(this.createSession(id));
+    }
+    this.poolSize = Math.max(this.poolSize, this.sessions.length);
     return this.poolSize;
   }
 
@@ -257,11 +306,26 @@ export class PtySandbox extends BaseSandbox {
   }
 
   isPathAllowed(candidate: string): boolean {
-    return isPathInsideAnyRoot(
-      this.allowedRoots,
-      candidate,
-      this.workingDirectory,
-    );
+    const resolved = this.resolveFsPath(candidate);
+    return this.allowedRoots.some((root) => {
+      const realRoot = path.resolve(root);
+      const rel = path.relative(realRoot, resolved);
+      return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+    });
+  }
+
+  /** Resolve tool paths; remap working/* onto artifactHome when set. */
+  resolveFsPath(filePath: string): string {
+    if (this.artifactHome) {
+      return resolveWorkingAwarePath(
+        this.artifactHome,
+        this.workingDirectory,
+        filePath,
+      );
+    }
+    return path.isAbsolute(filePath)
+      ? path.resolve(filePath)
+      : path.resolve(this.workingDirectory, filePath);
   }
 
   /**
@@ -554,7 +618,7 @@ export class PtySandbox extends BaseSandbox {
           results.push({ path: filePath, error: "permission_denied" });
           continue;
         }
-        const fullPath = path.resolve(this.workingDirectory, filePath);
+        const fullPath = this.resolveFsPath(filePath);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, content);
         results.push({ path: filePath, error: null });
@@ -584,7 +648,7 @@ export class PtySandbox extends BaseSandbox {
           });
           continue;
         }
-        const fullPath = path.resolve(this.workingDirectory, filePath);
+        const fullPath = this.resolveFsPath(filePath);
         if (!fs.existsSync(fullPath)) {
           results.push({
             path: filePath,

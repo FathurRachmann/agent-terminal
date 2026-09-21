@@ -21,7 +21,7 @@ export const UI_COLUMNS: KanbanStatus[] = [
   "done",
 ];
 
-export type WorkspaceKind = "scratch" | "dir" | "worktree";
+export type WorkspaceKind = "scratch" | "dir" | "worktree" | "project";
 
 export type BoardMeta = {
   slug: string;
@@ -73,6 +73,8 @@ export type KanbanTask = {
   assignee: string | null;
   tenant: string | null;
   priority: number;
+  /** Desktop project registry id — worker CWD = project primary folder. */
+  projectId: string | null;
   workspaceKind: WorkspaceKind;
   workspacePath: string | null;
   branch: string | null;
@@ -149,6 +151,8 @@ export type CreateTaskInput = {
   tenant?: string | null;
   priority?: number;
   parents?: string[];
+  /** Bind task to a desktop project (simkopdes, …). Implies project-scoped CWD. */
+  projectId?: string | null;
   workspaceKind?: WorkspaceKind;
   workspacePath?: string | null;
   branch?: string | null;
@@ -171,6 +175,7 @@ export type SwarmSpec = {
   verifier: string;
   synthesizer: string;
   tenant?: string | null;
+  projectId?: string | null;
 };
 
 export type TaskDetail = {

@@ -1,5 +1,7 @@
 /** Detect previewable file artifacts from Live activity / tool events. */
 
+import { restoreAbsolutePathPrefix } from "../path-normalize.js";
+
 export type PreviewKind =
   | "markdown"
   | "code"
@@ -222,7 +224,7 @@ export function looksLikeWorkspacePath(raw: string): boolean {
 
 export function inferPreviewKind(ext: string): PreviewKind {
   const e = ext.toLowerCase();
-  if (e === "md" || e === "mdx" || e === "markdown") return "markdown";
+  if (e === "md" || e === "mdx" || e === "markdown" || e === "mmd") return "markdown";
   if (e === "html" || e === "htm") return "html";
   if (e === "csv" || e === "tsv") return "csv";
   if (e === "xlsx" || e === "xls" || e === "xlsm" || e === "sheet" || e === "ods") {
@@ -339,8 +341,9 @@ export function extractResultPathsFromText(text: string): string[] {
       .replace(/\\/g, "/");
     if (!t) return "";
     if (t.includes("/")) {
-      // Drop leading prose before the first path-looking segment
-      const idx = t.search(/(?:\.\.?\/|[A-Za-z0-9_.-]+\/)/);
+      // Drop leading prose before the first path-looking segment.
+      // Include a leading `/` so absolute Unix paths are not truncated to Users/...
+      const idx = t.search(/(?:\/|\.\.?\/|[A-Za-z0-9_.-]+\/)/);
       if (idx > 0) t = t.slice(idx);
       return t;
     }
@@ -354,8 +357,10 @@ export function extractResultPathsFromText(text: string): string[] {
   };
 
   const push = (raw: string, quoted = false) => {
-    let p = quoted ? refineQuoted(raw) : String(raw || "").trim().replace(/\\/g, "/");
-    p = p.replace(/[.,;:!?)\]}]+$/g, "");
+    let p = quoted
+      ? refineQuoted(raw)
+      : String(raw || "").trim().replace(/\\/g, "/");
+    p = restoreAbsolutePathPrefix(p.replace(/[.,;:!?)\]}]+$/g, ""));
     if (!p || seen.has(p)) return;
     const kind = inferPreviewKind(extensionOf(p));
     if (canvasResultRank(kind) < 60) return;

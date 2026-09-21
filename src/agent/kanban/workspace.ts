@@ -4,19 +4,53 @@ import { execFileSync } from "node:child_process";
 import type { KanbanStore } from "./store.js";
 import { boardAttachmentsDir, boardWorkspacesDir } from "./paths.js";
 import type { KanbanTask, WorkspaceKind } from "./types.js";
+import {
+  loadProjectRegistry,
+  primaryFolderOf,
+} from "../projects/registry.js";
+import {
+  resolveWorkingScope,
+  workingScopeAbs,
+} from "../working-paths.js";
 
 export type ResolvedWorkspace = {
   kind: WorkspaceKind;
   cwd: string;
   ephemeral: boolean;
+  projectId?: string | null;
+  /** Agent-root artifact dir for this project (working/project/<name>). */
+  artifactDir?: string | null;
+};
+
+export type ResolveWorkspaceOptions = {
+  root?: string;
+  defaultWorkdir?: string;
+  /** Profile home for project registry. */
+  profileHome?: string;
+  /** Agent application root for working/project/<name> artifacts. */
+  artifactHome?: string;
 };
 
 export function resolveWorkspace(
   task: KanbanTask,
   boardSlug: string,
-  root?: string,
+  rootOrOpts?: string | ResolveWorkspaceOptions,
   defaultWorkdir?: string,
 ): ResolvedWorkspace {
+  const opts: ResolveWorkspaceOptions =
+    typeof rootOrOpts === "string" || rootOrOpts === undefined
+      ? { root: rootOrOpts, defaultWorkdir }
+      : {
+          ...rootOrOpts,
+          defaultWorkdir: rootOrOpts.defaultWorkdir ?? defaultWorkdir,
+        };
+  const root = opts.root;
+
+  // Project-bound tasks always run inside the project's primary folder.
+  if (task.projectId?.trim() || task.workspaceKind === "project") {
+    return resolveProjectWorkspace(task, opts);
+  }
+
   if (task.workspaceKind === "dir") {
     const dir = task.workspacePath?.trim();
     if (!dir || !path.isAbsolute(dir)) {
@@ -36,7 +70,7 @@ export function resolveWorkspace(
   if (task.workspaceKind === "worktree") {
     const base =
       task.workspacePath?.trim() ||
-      defaultWorkdir?.trim() ||
+      opts.defaultWorkdir?.trim() ||
       process.cwd();
     const absBase = path.isAbsolute(base) ? base : path.resolve(base);
     const wtPath =
@@ -61,12 +95,57 @@ export function resolveWorkspace(
   }
 
   // scratch
-  const scratch = path.join(
-    boardWorkspacesDir(boardSlug, root),
-    task.id,
-  );
+  const scratch = path.join(boardWorkspacesDir(boardSlug, root), task.id);
   fs.mkdirSync(scratch, { recursive: true });
   return { kind: "scratch", cwd: scratch, ephemeral: true };
+}
+
+function resolveProjectWorkspace(
+  task: KanbanTask,
+  opts: ResolveWorkspaceOptions,
+): ResolvedWorkspace {
+  const projectId = (task.projectId || "").trim();
+  if (!projectId) {
+    throw new Error("project workspace requires projectId");
+  }
+  const profileHome = opts.profileHome?.trim();
+  if (!profileHome) {
+    throw new Error(
+      `project workspace requires profileHome to resolve project ${projectId}`,
+    );
+  }
+  const reg = loadProjectRegistry(profileHome);
+  const project = reg.projects.find((p) => p.id === projectId);
+  if (!project) {
+    throw new Error(`Unknown project: ${projectId}`);
+  }
+  const primary = primaryFolderOf(project) || project.folders[0];
+  if (!primary || !path.isAbsolute(primary)) {
+    throw new Error(`Project ${projectId} has no absolute primary folder`);
+  }
+  if (!fs.existsSync(primary)) {
+    throw new Error(`Project folder does not exist: ${primary}`);
+  }
+
+  let artifactDir: string | null = null;
+  const artifactHome = opts.artifactHome?.trim();
+  if (artifactHome) {
+    const scope = resolveWorkingScope({
+      projectId: project.id,
+      projectName: project.name,
+    });
+    const { absDir } = workingScopeAbs(artifactHome, scope);
+    fs.mkdirSync(absDir, { recursive: true });
+    artifactDir = absDir;
+  }
+
+  return {
+    kind: "project",
+    cwd: primary,
+    ephemeral: false,
+    projectId: project.id,
+    artifactDir,
+  };
 }
 
 export function copyArtifactsToAttachments(

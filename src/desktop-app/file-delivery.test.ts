@@ -51,6 +51,63 @@ describe("file-delivery", () => {
     );
   });
 
+  it("preserves absolute Unix paths from backticks", () => {
+    const paths = collectDeliverablePaths([
+      "Saved at `/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf`",
+    ]);
+    assert.equal(
+      paths[0],
+      "/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf",
+    );
+  });
+
+  it("restores absolute path when leading slash was stripped", () => {
+    const paths = collectDeliverablePaths(
+      [],
+      ["Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf"],
+    );
+    assert.equal(
+      paths[0],
+      "/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf",
+    );
+  });
+
+  it("resolves basename under working/project/<name>/", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "file-del-"));
+    try {
+      const dir = path.join(root, "working", "project", "simkopdes");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "FSD_SIMKOPDES_FINAL.pdf"), "%PDF");
+      const resolved = resolveExistingWorkspaceFile(
+        [root],
+        "FSD_SIMKOPDES_FINAL.pdf",
+      );
+      assert.equal(resolved.ok, true);
+      if (!resolved.ok) return;
+      assert.equal(resolved.basename, "FSD_SIMKOPDES_FINAL.pdf");
+      assert.ok(resolved.abs.includes(path.join("working", "project", "simkopdes")));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves absolute path under artifact home root", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "file-del-"));
+    try {
+      const dir = path.join(root, "working", "project", "simkopdes");
+      fs.mkdirSync(dir, { recursive: true });
+      const abs = path.join(dir, "FSD_SIMKOPDES_FINAL.pdf");
+      fs.writeFileSync(abs, "%PDF");
+      const stripped = abs.replace(/^\//, "");
+      const resolved = resolveExistingWorkspaceFile([root], stripped);
+      assert.equal(resolved.ok, true);
+      if (!resolved.ok) return;
+      assert.equal(resolved.abs, abs);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("resolves basename fallback under working/", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "file-del-"));
     try {

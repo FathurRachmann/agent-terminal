@@ -109,6 +109,10 @@ export async function decomposeTriageTask(
       body: child.body ?? "",
       assignee,
       tenant: task.tenant,
+      projectId: task.projectId,
+      workspaceKind: task.workspaceKind,
+      workspacePath: task.workspacePath,
+      branch: task.branch,
       parents: parentIds,
       status: "todo",
     });

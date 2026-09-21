@@ -9,7 +9,11 @@ import {
   formatPlanApprovalMarkdown,
   parseTaskPlanArgs,
 } from "./plan-approval.js";
-import { collectDeliverablePaths } from "../file-delivery-shared.js";
+import { buildDeliverableFileChips } from "../deliverable-chips.js";
+import {
+  resolveArtifactsFromTool,
+  shouldAutoFocusCanvas,
+} from "./activity-artifact.js";
 
 export type DesktopAgentEvent = AgentUiEvent & { threadId?: string };
 
@@ -174,25 +178,12 @@ export function reduceSessionEvent(
       });
     }
     if (finalText) {
-      const paths = collectDeliverablePaths(
-        [finalText],
-        next.pendingDeliverables,
-      ).slice(0, 5);
-      const existing = new Set(
-        items.filter((i) => i.kind === "file").map((i) => i.path),
+      items.push(
+        ...buildDeliverableFileChips([finalText], next.pendingDeliverables, at, {
+          limit: 5,
+          idPrefix: `file-${id}`,
+        }),
       );
-      for (const p of paths) {
-        if (existing.has(p)) continue;
-        existing.add(p);
-        items.push({
-          id: `file-${id}-${p}`,
-          kind: "file",
-          path: p,
-          basename: p.split(/[/\\]/).pop() || p,
-          at,
-          note: "Open in app, or Save as… to download a copy",
-        });
-      }
     }
     next = {
       ...next,
@@ -200,6 +191,7 @@ export function reduceSessionEvent(
       draftAnswer: "",
       phase: "done",
       loading: false,
+      pendingDeliverables: [],
     };
   }
 
@@ -251,6 +243,29 @@ export function reduceSessionEvent(
         { id: `t-${id}`, kind: "trace", event: synthetic, at },
       ],
     };
+
+    const artifacts = resolveArtifactsFromTool({
+      name: event.name,
+      input,
+      output: event.output,
+    });
+    const isFileWrite =
+      event.name === "write_file" ||
+      event.name === "write" ||
+      event.name === "edit_file" ||
+      event.name === "edit";
+    if (isFileWrite) {
+      const deliverables = [...next.pendingDeliverables];
+      for (const a of artifacts) {
+        if (
+          shouldAutoFocusCanvas(a.kind) &&
+          !deliverables.includes(a.path)
+        ) {
+          deliverables.push(a.path);
+        }
+      }
+      next = { ...next, pendingDeliverables: deliverables };
+    }
 
     if (event.name === "task_plan") {
       const parsed = parseTaskPlanArgs(input);

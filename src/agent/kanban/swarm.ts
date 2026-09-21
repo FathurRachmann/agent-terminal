@@ -32,6 +32,7 @@ export function createSwarm(
     body: spec.body ?? spec.title,
     assignee: null,
     tenant: spec.tenant ?? null,
+    projectId: spec.projectId ?? null,
     status: "done",
   });
   store.addComment(
@@ -53,6 +54,7 @@ export function createSwarm(
       body: `Contribute to swarm "${spec.title}". Read blackboard comments on parent ${root.id}.\n\n${spec.body ?? ""}`,
       assignee,
       tenant: spec.tenant ?? null,
+      projectId: spec.projectId ?? null,
       parents: [root.id],
       status: "todo",
     }),
@@ -63,6 +65,7 @@ export function createSwarm(
     body: `Verify all worker deliverables for "${spec.title}". Use independent review lenses. Parents: ${workerTasks.map((t) => t.id).join(", ")}.`,
     assignee: spec.verifier.trim(),
     tenant: spec.tenant ?? null,
+    projectId: spec.projectId ?? null,
     parents: workerTasks.map((t) => t.id),
     status: "todo",
   });
@@ -72,6 +75,7 @@ export function createSwarm(
     body: `Synthesize the verified swarm result for "${spec.title}". Parent verifier: ${verifier.id}.`,
     assignee: spec.synthesizer.trim(),
     tenant: spec.tenant ?? null,
+    projectId: spec.projectId ?? null,
     parents: [verifier.id],
     status: "todo",
   });

@@ -223,42 +223,65 @@ export function createNormalizeAiMessageMiddleware() {
   return createMiddleware({
     name: "NormalizeAiMessageMiddleware",
     wrapModelCall: async (request, handler) => {
-      let response: unknown;
-      try {
-        response = await handler(request);
-      } catch (err) {
-        throw rewriteProviderSdkCrash(err);
-      }
-      if (isCommand(response)) return response;
-      try {
-        const normalized = normalizeToAiMessage(response as BaseMessage);
-        // Guarantee instanceof AIMessage for middleware validators (avoid cross-copy duck types).
-        if (
-          AIMessageChunk.isInstance(normalized) ||
-          AIMessage.isInstance(normalized)
-        ) {
-          return normalized;
+      const maxAttempts = 3;
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const response = await handler(request);
+          if (isCommand(response)) return response;
+          try {
+            const normalized = normalizeToAiMessage(response as BaseMessage);
+            // Guarantee instanceof AIMessage for middleware validators (avoid cross-copy duck types).
+            if (
+              AIMessageChunk.isInstance(normalized) ||
+              AIMessage.isInstance(normalized)
+            ) {
+              return normalized;
+            }
+            return new AIMessage({ content: String(normalized ?? "") });
+          } catch (err) {
+            // Normalization bugs are not transient — don't retry.
+            throw rewriteProviderSdkCrash(err);
+          }
+        } catch (err) {
+          lastErr = err;
+          if (
+            isMalformedProviderSdkError(err) &&
+            attempt < maxAttempts
+          ) {
+            await sleep(350 * attempt);
+            continue;
+          }
+          throw rewriteProviderSdkCrash(err);
         }
-        return new AIMessage({ content: String(normalized ?? "") });
-      } catch (err) {
-        throw rewriteProviderSdkCrash(err);
       }
+      throw rewriteProviderSdkCrash(lastErr);
     },
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Detect OpenAI-SDK TypeError when the router returns a broken error body. */
+export function isMalformedProviderSdkError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /cannot read propert(?:y|ies) of undefined \(reading ['"]message['"]\)/i.test(
+      msg,
+    ) || /malformed error payload \(missing error\.message\)/i.test(msg)
+  );
 }
 
 /** 9router / OpenAI SDK sometimes throws TypeError on malformed error payloads. */
 export function rewriteProviderSdkCrash(err: unknown): Error {
   const msg = err instanceof Error ? err.message : String(err);
-  if (
-    /cannot read propert(?:y|ies) of undefined \(reading ['"]message['"]\)/i.test(
-      msg,
-    )
-  ) {
+  if (isMalformedProviderSdkError(err)) {
     return new Error(
       "Model/provider returned a malformed error payload (missing error.message). " +
-        "Retry the turn, or check ROUTER_BASE_URL / AGENT_MODEL health. " +
-        `Original: ${msg}`,
+        "Often transient under parallel bot load — retry the turn, or check ROUTER_BASE_URL / AGENT_MODEL health. " +
+        `Original: ${msg.replace(/^Model\/provider returned a malformed error payload[^.]+\.\s*/i, "")}`,
     );
   }
   return err instanceof Error ? err : new Error(msg);

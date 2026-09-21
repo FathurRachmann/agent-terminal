@@ -14,9 +14,11 @@ import {
 import {
   looksLikeIncompleteReasoning,
   looksLikeProviderNotice,
+  looksLikeToolPlanNarration,
   resolveFinalAssistantText,
   sanitizeAssistantText,
 } from "../agent/sanitize-output.js";
+import { isMalformedProviderSdkError } from "../agent/normalize-middleware.js";
 import { contentLooksLikeTextToolCall } from "../agent/parse-text-tool-calls.js";
 import {
   parseDesktopIntent,
@@ -45,6 +47,8 @@ export type MemoryRuntime = {
   embedder: EmbeddingClient;
   model: BaseChatModel;
   workspaceRoot: string;
+  /** Profile home for AGENTS.md / reflection sync. Falls back to workspaceRoot. */
+  profileHome?: string;
   enableReflection?: boolean;
 };
 
@@ -76,8 +80,16 @@ export type RunAgentOptions = {
    */
   userContent?: string | MultimodalUserPart[];
   threadId?: string;
+  /**
+   * LangGraph checkpointer thread id. Defaults to `threadId`.
+   * Workspace parallel bots use `${groupThreadId}__${botId}` here while
+   * keeping `threadId` as the shared group transcript id.
+   */
+  checkpointThreadId?: string;
   /** Stamp session meta; null = global, undefined = leave existing. */
   projectId?: string | null;
+  workspaceId?: string | null;
+  chatId?: string | null;
   autoApprove?: boolean;
   onEvent?: (event: AgentUiEvent) => void;
   /**
@@ -97,6 +109,17 @@ export type RunAgentOptions = {
    * the transcript stores the raw user `prompt`.
    */
   botInstruction?: string;
+  /**
+   * Injected each turn — tells the model which working/<scope>/ folder to use.
+   * Combined with botInstruction when both are set.
+   */
+  workingScopeNudge?: string;
+  /** Extra transcript meta for assistant messages (workspace group bots). */
+  assistantMeta?: Record<string, unknown>;
+  /** Tags for reflection isolation (workspace:/bot:). */
+  memoryScopeTags?: string[];
+  /** When true, do not append the user prompt to the transcript (multi-bot follow-ups). */
+  skipUserTranscript?: boolean;
 };
 
 export type AgentPhase =
@@ -455,6 +478,7 @@ export async function runAgentTurn(
   options: RunAgentOptions,
 ): Promise<string> {
   const threadId = options.threadId ?? `thread-${Date.now()}`;
+  const checkpointThreadId = options.checkpointThreadId ?? threadId;
   const mem = options.memory;
   const userOnEvent = options.onEvent;
   const onEvent: RunAgentOptions["onEvent"] = (event) => {
@@ -468,7 +492,7 @@ export async function runAgentTurn(
   options = { ...options, threadId, onEvent };
 
   const config = {
-    configurable: { thread_id: threadId },
+    configurable: { thread_id: checkpointThreadId },
     recursionLimit: 80,
   };
 
@@ -478,13 +502,17 @@ export async function runAgentTurn(
       threadId,
       model: modelName,
       projectId: options.projectId,
+      workspaceId: options.workspaceId,
+      chatId: options.chatId,
     });
-    mem.sessionStore.markTurnStart(options.prompt);
-    mem.sessionStore.appendTranscript({
-      threadId,
-      role: "user",
-      content: options.prompt,
-    });
+    if (!options.skipUserTranscript) {
+      mem.sessionStore.markTurnStart(options.prompt, threadId);
+      mem.sessionStore.appendTranscript({
+        threadId,
+        role: "user",
+        content: options.prompt,
+      });
+    }
   }
 
   // Deterministic Chrome/desktop path — open URL first; continue LLM for leftovers.
@@ -493,32 +521,35 @@ export async function runAgentTurn(
     return desktopPrep.answer;
   }
 
-  const scopedUserPrompt = options.botInstruction
-    ? `${options.botInstruction}\n\n[USER]\n${options.prompt}`
+  const turnPrefix = [options.workingScopeNudge, options.botInstruction]
+    .map((s) => String(s || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+
+  const scopedUserPrompt = turnPrefix
+    ? `${turnPrefix}\n\n[USER]\n${options.prompt}`
     : options.prompt;
 
   const scopedUserContent: string | MultimodalUserPart[] = (() => {
     const raw = options.userContent;
     if (raw == null) return scopedUserPrompt;
     if (typeof raw === "string") {
-      return options.botInstruction
-        ? `${options.botInstruction}\n\n[USER]\n${raw}`
-        : raw;
+      return turnPrefix ? `${turnPrefix}\n\n[USER]\n${raw}` : raw;
     }
     if (!Array.isArray(raw) || raw.length === 0) return scopedUserPrompt;
-    if (!options.botInstruction) return raw;
+    if (!turnPrefix) return raw;
     const parts = [...raw];
     const firstText = parts.findIndex((p) => p.type === "text");
     if (firstText >= 0) {
       const t = parts[firstText] as { type: "text"; text: string };
       parts[firstText] = {
         type: "text",
-        text: `${options.botInstruction}\n\n[USER]\n${t.text}`,
+        text: `${turnPrefix}\n\n[USER]\n${t.text}`,
       };
       return parts;
     }
     return [
-      { type: "text" as const, text: `${options.botInstruction}\n\n[USER]` },
+      { type: "text" as const, text: `${turnPrefix}\n\n[USER]` },
       ...parts,
     ];
   })();
@@ -543,12 +574,30 @@ export async function runAgentTurn(
   let lastStreamedText = "";
   try {
     for (;;) {
-      const { result, streamedText } = await runOnce(
-        options.agent,
-        inputPayload,
-        config,
-        options.onEvent,
-      );
+      let result: Awaited<ReturnType<typeof runOnce>>["result"];
+      let streamedText = "";
+      try {
+        ({ result, streamedText } = await runOnce(
+          options.agent,
+          inputPayload,
+          config,
+          options.onEvent,
+        ));
+      } catch (invokeErr) {
+        if (
+          isMalformedProviderSdkError(invokeErr) &&
+          retryCount < RETRY_MAX
+        ) {
+          retryCount++;
+          emit(options.onEvent, {
+            type: "warning",
+            message: `Provider error payload malformed (attempt ${retryCount}/${RETRY_MAX}). Retrying…`,
+          });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        }
+        throw invokeErr;
+      }
       lastStreamedText = streamedText;
       const interrupt = getInterruptPayload(result);
       if (interrupt) {
@@ -597,6 +646,39 @@ export async function runAgentTurn(
       if (finalText && !streamedText) {
         emit(options.onEvent, { type: "token", text: finalText });
       }
+
+      // One auto-retry when the model dumps reply-planning CoT instead of answering.
+      if (
+        finalText &&
+        looksLikeIncompleteReasoning(finalText) &&
+        !isModelAvailabilityError(finalText) &&
+        retryCount < 1
+      ) {
+        retryCount++;
+        const toolPlan = looksLikeToolPlanNarration(finalText);
+        emit(options.onEvent, {
+          type: "warning",
+          message: toolPlan
+            ? "Model narrated tools instead of calling them — retrying with forced tool use…"
+            : "Model leaked planning text — retrying for a direct user-facing answer…",
+        });
+        inputPayload = {
+          messages: [
+            { role: "user", content: scopedUserContent },
+            { role: "assistant", content: finalText },
+            {
+              role: "user",
+              content: toolPlan
+                ? "STOP narrating. Call tools NOW (at least `ls`), then reply ONLY with a short final answer in the user's language based on tool results. No English planning. No \"I should use…\". No \"I need to remember…\"."
+                : "Stop planning out loud. Reply with ONLY the final user-facing answer in the user's language. No analysis of the greeting, no guidelines commentary, no 'my response should…'.",
+            },
+          ],
+        };
+        finalText = "";
+        lastStreamedText = "";
+        continue;
+      }
+
       if (looksLikeIncompleteReasoning(finalText)) {
         emit(options.onEvent, {
           type: "warning",
@@ -625,11 +707,12 @@ export async function runAgentTurn(
 
     const answer = resolveFinalAssistantText(finalText, lastStreamedText).trim();
     if (mem) {
-      mem.sessionStore.markTurnComplete(answer);
+      mem.sessionStore.markTurnComplete(answer, threadId);
       mem.sessionStore.appendTranscript({
         threadId,
         role: "assistant",
         content: answer,
+        meta: options.assistantMeta,
       });
     }
 
@@ -647,12 +730,13 @@ export async function runAgentTurn(
         sessionStore: mem.sessionStore,
         embedder: mem.embedder,
         model: mem.model,
-        agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+        agentsMdPath: agentsMdPathFor(mem.profileHome ?? mem.workspaceRoot),
         input: {
           threadId,
           userPrompt: options.prompt,
           assistantResponse: answer || "(empty)",
           hadError: false,
+          scopeTags: options.memoryScopeTags,
           skipEpisode:
             looksLikeIncompleteReasoning(answer) ||
             contentLooksLikeTextToolCall(answer),
@@ -679,7 +763,7 @@ export async function runAgentTurn(
     });
     emit(options.onEvent, { type: "error", message });
     if (mem) {
-      mem.sessionStore.markTurnError(message);
+      mem.sessionStore.markTurnError(message, threadId);
       mem.sessionStore.appendTranscript({
         threadId,
         role: "error",
@@ -691,13 +775,14 @@ export async function runAgentTurn(
           sessionStore: mem.sessionStore,
           embedder: mem.embedder,
           model: mem.model,
-          agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+          agentsMdPath: agentsMdPathFor(mem.profileHome ?? mem.workspaceRoot),
           input: {
             threadId,
             userPrompt: options.prompt,
             assistantResponse: finalText || "(failed before response)",
             hadError: true,
             errorMessage: message,
+            scopeTags: options.memoryScopeTags,
           },
         })
           .then(({ storedIds }) => {
@@ -892,11 +977,12 @@ async function finishDesktopTurn(
   const mem = options.memory;
   const onEvent = options.onEvent;
   if (mem) {
-    mem.sessionStore.markTurnComplete(answer);
+    mem.sessionStore.markTurnComplete(answer, threadId);
     mem.sessionStore.appendTranscript({
       threadId,
       role: "assistant",
       content: answer,
+      meta: options.assistantMeta,
     });
   }
 
@@ -910,12 +996,13 @@ async function finishDesktopTurn(
       sessionStore: mem.sessionStore,
       embedder: mem.embedder,
       model: mem.model,
-      agentsMdPath: agentsMdPathFor(mem.workspaceRoot),
+          agentsMdPath: agentsMdPathFor(mem.profileHome ?? mem.workspaceRoot),
       input: {
         threadId,
         userPrompt: options.prompt,
         assistantResponse: answer,
         hadError,
+        scopeTags: options.memoryScopeTags,
       },
     })
       .then(({ storedIds }) => {

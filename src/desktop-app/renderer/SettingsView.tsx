@@ -824,14 +824,14 @@ export function SettingsView({
                   />
                 </div>
                 <div>
-                  <FieldLabel hint="Parallel shell slots (1–16)">
+                  <FieldLabel hint="Parallel shell slots (1–10)">
                     Pool size
                   </FieldLabel>
                   <NumberInput
                     value={ptyPoolSize}
                     onChange={setPtyPoolSize}
                     min={1}
-                    max={16}
+                    max={10}
                   />
                 </div>
                 <div>

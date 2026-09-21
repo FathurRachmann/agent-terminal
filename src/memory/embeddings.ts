@@ -61,6 +61,19 @@ export function createEmbeddingClient(): EmbeddingClient {
           .slice()
           .sort((a, b) => a.index - b.index)
           .map((d) => d.embedding);
+      } catch (err) {
+        // undici often throws TypeError("terminated") on abort/TLS drop.
+        const name = err instanceof Error ? err.name : "";
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          name === "AbortError" ||
+          /aborted|terminated|econnreset|socket hang up|fetch failed/i.test(msg)
+        ) {
+          throw new Error(
+            `Embeddings request aborted or network dropped (${timeoutMs}ms): ${msg}`,
+          );
+        }
+        throw err;
       } finally {
         clearTimeout(timer);
       }

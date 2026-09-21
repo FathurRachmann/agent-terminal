@@ -24,9 +24,10 @@ function extractLastUserText(messages: unknown[]): string {
         (msg as { role: string }).role === "user");
     if (!isHuman) continue;
     const content = msg.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content
+    let raw = "";
+    if (typeof content === "string") raw = content;
+    else if (Array.isArray(content)) {
+      raw = content
         .map((part) => {
           if (typeof part === "string") return part;
           if (part && typeof part === "object" && "text" in part) {
@@ -36,8 +37,18 @@ function extractLastUserText(messages: unknown[]): string {
         })
         .join(" ");
     }
+    return stripTurnPrefixes(raw);
   }
   return "";
+}
+
+/** Drop injected working-scope / bot instruction wrappers for RAG query. */
+function stripTurnPrefixes(text: string): string {
+  const t = String(text || "");
+  const userMarker = t.lastIndexOf("\n[USER]\n");
+  if (userMarker >= 0) return t.slice(userMarker + "\n[USER]\n".length).trim();
+  if (t.startsWith("[USER]\n")) return t.slice("[USER]\n".length).trim();
+  return t.trim();
 }
 
 /**
@@ -46,7 +57,14 @@ function extractLastUserText(messages: unknown[]): string {
  */
 export function createLongTermMemoryMiddleware(
   store: PersistentMemoryStore,
-  options?: { limit?: number; embedder?: EmbeddingClient },
+  options?: {
+    limit?: number;
+    embedder?: EmbeddingClient;
+    /** When set, only memories matching these tags (all must match) are retrieved. */
+    requiredTags?: string[];
+    /** Mutable getter so desktop can switch workspace bot scope per turn. */
+    getRequiredTags?: () => string[] | undefined;
+  },
 ) {
   const limit = options?.limit ?? 8;
   const embedder = options?.embedder;
@@ -60,13 +78,23 @@ export function createLongTermMemoryMiddleware(
         return handler(request);
       }
 
+      const required =
+        options?.getRequiredTags?.() ?? options?.requiredTags ?? undefined;
+
       // Prefer AGENTS.md for always-on rules/prefs (avoids double injection).
       // Long-term RAG is for episodes/facts/errors.
       const candidates = store
         .listWithEmbeddings({ limit: 400 })
-        .filter((m) => m.kind !== "preference" && m.kind !== "rule");
-      // Chat-context facts are durable corrections / "ingat…" — keep them eligible
-      // for RAG (they are kind=fact with tag chat-context).
+        .filter((m) => m.kind !== "preference" && m.kind !== "rule")
+        .filter((m) => {
+          if (!required || required.length === 0) {
+            // Unscoped turns: exclude workspace/bot-private memories
+            return !m.tags.some(
+              (t) => t.startsWith("workspace:") || t.startsWith("bot:"),
+            );
+          }
+          return required.every((tag) => m.tags.includes(tag));
+        });
       let queryEmbedding: number[] | null = null;
       if (embedder) {
         try {

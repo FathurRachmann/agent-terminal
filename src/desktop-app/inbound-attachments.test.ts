@@ -37,7 +37,7 @@ describe("inbound-attachments", () => {
       assert.equal(saved.ok, true);
       if (!saved.ok) return;
       assert.equal(saved.attachment.kind, "file");
-      assert.ok(saved.attachment.relPath.startsWith("working/uploads/"));
+      assert.ok(saved.attachment.relPath.startsWith("working/global/uploads/"));
       assert.equal(
         fs.readFileSync(saved.attachment.absPath, "utf8"),
         "hello",
@@ -140,12 +140,12 @@ describe("inbound-attachments", () => {
   it("composes default prompt when text empty", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "in-att-"));
     try {
-      const pdfPath = path.join(root, "working", "uploads", "x.pdf");
+      const pdfPath = path.join(root, "working", "global", "uploads", "x.pdf");
       fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
       fs.writeFileSync(pdfPath, "%PDF-1.4 fake");
       const att = {
         absPath: pdfPath,
-        relPath: "working/uploads/x.pdf",
+        relPath: "working/global/uploads/x.pdf",
         basename: "x.pdf",
         mime: "application/pdf",
         size: 12,

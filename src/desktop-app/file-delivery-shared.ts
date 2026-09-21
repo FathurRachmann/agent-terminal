@@ -1,7 +1,50 @@
 import { extractResultPathsFromText } from "./renderer/activity-artifact.js";
+import { restoreAbsolutePathPrefix } from "./path-normalize.js";
+
+export { restoreAbsolutePathPrefix } from "./path-normalize.js";
 
 /** Max WhatsApp / chat document payload we will send or accept (1 GiB). */
 export const WA_DOCUMENT_MAX_BYTES = 1024 * 1024 * 1024;
+
+/** Extensions that deserve an in-chat "File from agent" card when mentioned. */
+const CHAT_CHIP_EXTS = new Set([
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "xlsm",
+  "csv",
+  "tsv",
+  "ppt",
+  "pptx",
+  "md",
+  "markdown",
+  "mmd",
+  "txt",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "svg",
+  "zip",
+  "rar",
+  "7z",
+  "tar",
+  "gz",
+  "html",
+  "htm",
+  "json",
+  "dbml",
+  "sql",
+  "mp4",
+  "mp3",
+  "wav",
+  "odt",
+  "ods",
+  "rtf",
+]);
 
 const MIME_BY_EXT: Record<string, string> = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -57,6 +100,67 @@ export function isDeliverableChatPath(filePath: string): boolean {
 }
 
 /**
+ * Reject prose false-positives: product names (Next.js), domains (a.go.id),
+ * globs (*.js), and bare source filenames mentioned in architecture writeups.
+ */
+export function isProseFalsePositivePath(filePath: string): boolean {
+  const p = String(filePath || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!p) return true;
+  if (/[*?]/.test(p)) return true;
+  if (/^https?:\/\//i.test(p)) return true;
+
+  const base = p.split("/").pop() || p;
+  if (
+    /^(next|node|vue|nuxt|remix|react|angular|svelte|express|nest|deno|bun)\.js$/i.test(
+      base,
+    )
+  ) {
+    return true;
+  }
+
+  // Domain-like: simkopdes.go.id / example.com (2+ dots, no slash)
+  if (!p.includes("/") && /^[\w-]+(?:\.[\w-]+){2,}$/i.test(p)) return true;
+
+  // Bare source/config names in prose — only real when under a directory path.
+  if (!p.includes("/")) {
+    if (/\.(js|jsx|ts|tsx|mjs|cjs|css|scss|less|map|lock|vue)$/i.test(base)) {
+      return true;
+    }
+    if (/^(cloudbuild|dockerfile|makefile|procfile|package)(\.|$)/i.test(base)) {
+      return true;
+    }
+    if (/\.ya?ml$/i.test(base)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Paths safe to show as in-chat file chips (not every `.js` mention in prose).
+ * Always prefer `working/` / absolute artifact paths / document-like extensions.
+ */
+export function isChatFileChipPath(filePath: string): boolean {
+  const p = String(filePath || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (!isDeliverableChatPath(p)) return false;
+  if (isProseFalsePositivePath(p)) return false;
+
+  const base = p.split("/").pop() || p;
+  const dot = base.lastIndexOf(".");
+  const ext = dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
+  if (!CHAT_CHIP_EXTS.has(ext)) return false;
+
+  if (/^working\//i.test(p) || p.includes("/working/")) return true;
+  if (p.startsWith("/")) return true;
+  if (p.includes("/")) return true;
+  // Bare `report.pdf` / `diagram.mmd` OK; bare `middleware.js` already rejected.
+  return true;
+}
+
+/**
  * Broader path scrape for delivery — any extension inside quotes/backticks,
  * plus unquoted paths with a file extension.
  */
@@ -65,10 +169,12 @@ export function extractAnyFilePathsFromText(text: string): string[] {
   const found: string[] = [];
   const seen = new Set<string>();
   const push = (raw: string) => {
-    let p = String(raw || "")
-      .trim()
-      .replace(/\\/g, "/")
-      .replace(/[.,;:!?)\]}]+$/g, "");
+    let p = restoreAbsolutePathPrefix(
+      String(raw || "")
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/[.,;:!?)\]}]+$/g, ""),
+    );
     if (!p || seen.has(p)) return;
     if (!isDeliverableChatPath(p)) return;
     seen.add(p);
@@ -82,8 +188,9 @@ export function extractAnyFilePathsFromText(text: string): string[] {
   while ((m = dqRe.exec(text)) !== null) push(m[1] || "");
   const sqRe = /'([^'\n]+?\.[a-z0-9]{1,16})'/gi;
   while ((m = sqRe.exec(text)) !== null) push(m[1] || "");
+  // Prefer capturing a leading `/` so absolute paths stay absolute.
   const unquoted =
-    /(?:^|[\s"'=`(,\[{])((?:\.?\.?\/)?[\w./\\-]+\.[a-z0-9]{1,16})/gi;
+    /(?:^|[\s"'=`(,\[{])((?:\/|\.?\.?\/)?[\w./\\-]+\.[a-z0-9]{1,16})/gi;
   while ((m = unquoted.exec(text)) !== null) push(m[1] || "");
 
   return found.filter((p) => {
@@ -108,9 +215,10 @@ export function collectDeliverablePaths(
   const seen = new Set<string>();
   const out: string[] = [];
   const push = (p: string) => {
-    const norm = p.trim().replace(/\\/g, "/");
+    const norm = restoreAbsolutePathPrefix(p.trim().replace(/\\/g, "/"));
     if (!norm || seen.has(norm)) return;
     if (!isDeliverableChatPath(norm)) return;
+    if (isProseFalsePositivePath(norm)) return;
     seen.add(norm);
     out.push(norm);
   };
@@ -118,6 +226,28 @@ export function collectDeliverablePaths(
     for (const p of extractResultPathsFromText(t)) push(p);
     for (const p of extractAnyFilePathsFromText(t)) push(p);
   }
-  for (const p of extraPaths) push(p);
+  for (const p of extraPaths) {
+    const norm = restoreAbsolutePathPrefix(p.trim().replace(/\\/g, "/"));
+    if (!norm || seen.has(norm)) continue;
+    if (!isDeliverableChatPath(norm)) continue;
+    // Explicit write/edit paths always allowed even if prose filter would reject.
+    seen.add(norm);
+    out.push(norm);
+  }
   return out;
+}
+
+/** Paths for in-chat file cards — stricter than WhatsApp path scrape. */
+export function collectChatFileChipPaths(
+  texts: string[],
+  extraPaths: string[] = [],
+): string[] {
+  const extras = new Set(
+    extraPaths.map((p) =>
+      restoreAbsolutePathPrefix(p.trim().replace(/\\/g, "/")),
+    ),
+  );
+  return collectDeliverablePaths(texts, extraPaths).filter(
+    (p) => extras.has(p) || isChatFileChipPath(p),
+  );
 }

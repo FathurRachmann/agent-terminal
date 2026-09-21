@@ -104,7 +104,21 @@ export function createKanbanWorkerTools(ctx: KanbanToolContext): unknown[] {
   );
 
   const kanbanCreate = tool(
-    async ({ title, body, assignee, parents, triage, goal_mode, tenant }) => {
+    async ({
+      title,
+      body,
+      assignee,
+      parents,
+      triage,
+      goal_mode,
+      tenant,
+      project_id,
+    }) => {
+      const parentTask = ctx.store.getTask(ctx.taskId);
+      const projectId =
+        typeof project_id === "string" && project_id.trim()
+          ? project_id.trim()
+          : (parentTask?.projectId ?? null);
       const task = ctx.store.createTask({
         title,
         body,
@@ -113,13 +127,20 @@ export function createKanbanWorkerTools(ctx: KanbanToolContext): unknown[] {
         triage: Boolean(triage),
         goalMode: Boolean(goal_mode),
         tenant: tenant ?? null,
+        projectId,
+        workspaceKind: projectId
+          ? "project"
+          : (parentTask?.workspaceKind ?? "scratch"),
+        workspacePath: projectId ? null : (parentTask?.workspacePath ?? null),
+        branch: parentTask?.branch ?? null,
       });
       ctx.store.recomputeReady();
       return JSON.stringify(task);
     },
     {
       name: "kanban_create",
-      description: "Create a new task on the current board.",
+      description:
+        "Create a new task on the current board. Inherits project scope from the current task unless project_id is set.",
       schema: z.object({
         title: z.string(),
         body: z.string().optional(),
@@ -128,6 +149,10 @@ export function createKanbanWorkerTools(ctx: KanbanToolContext): unknown[] {
         triage: z.boolean().optional(),
         goal_mode: z.boolean().optional(),
         tenant: z.string().optional(),
+        project_id: z
+          .string()
+          .optional()
+          .describe("Desktop project id to bind (e.g. simkopdes)"),
       }),
     },
   );
@@ -289,11 +314,29 @@ export function buildWorkerPrompt(options: {
   mode: "implement" | "review";
   reviewRound?: number;
   reviewLens?: string;
+  projectId?: string | null;
+  workspaceCwd?: string;
+  artifactDir?: string | null;
 }): string {
+  const scopeLines: string[] = [];
+  if (options.projectId) {
+    scopeLines.push(
+      `[PROJECT SCOPE] Bound to desktop project \`${options.projectId}\`.`,
+      `You may ONLY read/write under the project workspace: ${options.workspaceCwd ?? "(cwd)"}`,
+      "Do not touch other projects or the Agent scratch board folders.",
+    );
+    if (options.artifactDir) {
+      scopeLines.push(
+        `Generated docs/PDFs/scratch artifacts go under: ${options.artifactDir}`,
+      );
+    }
+  }
+
   if (options.mode === "review") {
     return [
       `You are a Kanban review worker for task ${options.taskId} on board ${options.boardSlug}.`,
       `Review round: ${options.reviewRound ?? 1}. Lead with the ${options.reviewLens ?? "artifact"} lens.`,
+      ...scopeLines,
       "Call kanban_show first. Do not edit implementation files.",
       "Choose exactly one terminal action: kanban_complete (approve), kanban_request_changes, or kanban_block (escalate).",
       "Load and follow the sdlc-review skill procedure.",
@@ -301,6 +344,7 @@ export function buildWorkerPrompt(options: {
   }
   return [
     `Work kanban task ${options.taskId} on board ${options.boardSlug}.`,
+    ...scopeLines,
     "Call kanban_show first, then do the work.",
     "When finished call kanban_complete(summary=...) or kanban_block(reason=...).",
     "For engineering work that needs independent verification, call kanban_request_review(reviewer=...).",

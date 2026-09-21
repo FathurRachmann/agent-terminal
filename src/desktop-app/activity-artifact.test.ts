@@ -87,6 +87,16 @@ describe("activity artifacts", () => {
     assert.ok(!paths.includes("DIANDRA.doc"));
   });
 
+  it("keeps leading slash on absolute backtick paths", () => {
+    const paths = extractResultPathsFromText(
+      "Dokumen: `/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf`",
+    );
+    assert.equal(
+      paths[0],
+      "/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf",
+    );
+  });
+
   it("parses csv preview grids", () => {
     const { headers, rows } = parseDelimitedPreview("a,b\n1,2\n3,4");
     assert.deepEqual(headers, ["a", "b"]);

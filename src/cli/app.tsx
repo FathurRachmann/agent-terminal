@@ -247,6 +247,7 @@ function App({ workspaceRoot, autoApprove, initialPrompt }: Props) {
           embedder: bundle.embedder,
           model: bundle.model,
           workspaceRoot: bundle.workspaceRoot,
+          profileHome: bundle.profileHome,
           enableReflection: bundle.enableReflection,
         },
       });

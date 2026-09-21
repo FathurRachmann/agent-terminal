@@ -7,6 +7,7 @@ import {
   discoverDeliverables,
   listWorkspaceDir,
   readWorkspacePreview,
+  wrapMermaidForMarkdownPreview,
 } from "./workspace-preview.js";
 
 describe("workspace preview", () => {
@@ -18,6 +19,27 @@ describe("workspace preview", () => {
       } catch {
         /* ignore */
       }
+    }
+  });
+
+  it("wraps raw .mmd as mermaid markdown for canvas", async () => {
+    assert.match(
+      wrapMermaidForMarkdownPreview("flowchart TD\n  A-->B", "mmd"),
+      /```mermaid/,
+    );
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "prev-"));
+    dirs.push(root);
+    fs.writeFileSync(
+      path.join(root, "flow.mmd"),
+      "flowchart TD\n  A[Start] --> B[End]\n",
+      "utf8",
+    );
+    const res = await readWorkspacePreview(root, "flow.mmd");
+    assert.equal(res.ok, true);
+    if (res.ok) {
+      assert.equal(res.kind, "markdown");
+      assert.match(res.text ?? "", /```mermaid/);
+      assert.match(res.text ?? "", /flowchart TD/);
     }
   });
 

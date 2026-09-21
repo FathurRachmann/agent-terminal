@@ -59,6 +59,7 @@ function rowToTask(row: TaskRow): KanbanTask {
     assignee: asNullableString(row.assignee),
     tenant: asNullableString(row.tenant),
     priority: asNumber(row.priority, 0),
+    projectId: asNullableString(row.project_id),
     workspaceKind: (asString(row.workspace_kind) || "scratch") as WorkspaceKind,
     workspacePath: asNullableString(row.workspace_path),
     branch: asNullableString(row.branch),
@@ -218,6 +219,16 @@ export class KanbanStore {
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
       );
     `);
+    this.ensureColumn("tasks", "project_id", "project_id TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, ddl: string): void {
+    const cols = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
   }
 
   close(): void {
@@ -366,16 +377,23 @@ export class KanbanStore {
         ? input.assignee
         : this.getSettings().defaultAssignee || null;
     const skills = JSON.stringify(input.skills ?? []);
+    const projectId = input.projectId?.trim() || null;
+    const workspaceKind: WorkspaceKind = projectId
+      ? "project"
+      : (input.workspaceKind ?? "scratch");
+    const workspacePath = projectId
+      ? (input.workspacePath ?? null)
+      : (input.workspacePath ?? null);
 
     this.db
       .prepare(
         `INSERT INTO tasks (
           id, title, body, status, assignee, tenant, priority,
-          workspace_kind, workspace_path, branch, scheduled_at,
+          project_id, workspace_kind, workspace_path, branch, scheduled_at,
           goal_mode, goal_max_turns, idempotency_key,
           max_runtime_seconds, max_retries, skills_json,
           model_override, provider_override, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -385,8 +403,9 @@ export class KanbanStore {
         assignee || null,
         input.tenant ?? null,
         input.priority ?? 0,
-        input.workspaceKind ?? "scratch",
-        input.workspacePath ?? null,
+        projectId,
+        workspaceKind,
+        workspacePath,
         input.branch ?? null,
         input.scheduledAt ?? null,
         input.goalMode ? 1 : 0,
@@ -406,6 +425,7 @@ export class KanbanStore {
       status,
       parents: input.parents ?? [],
       tenant: input.tenant ?? null,
+      projectId,
     });
 
     for (const parentId of input.parents ?? []) {
@@ -430,6 +450,7 @@ export class KanbanStore {
       scheduledAt: string | null;
       goalMode: boolean;
       goalMaxTurns: number;
+      projectId: string | null;
       workspaceKind: WorkspaceKind;
       workspacePath: string | null;
       branch: string | null;
@@ -441,6 +462,12 @@ export class KanbanStore {
   ): KanbanTask {
     const existing = this.getTask(id);
     if (!existing) throw new Error(`Task ${id} not found`);
+
+    const nextProjectId =
+      patch.projectId !== undefined ? patch.projectId : existing.projectId;
+    const nextWorkspaceKind: WorkspaceKind = nextProjectId
+      ? "project"
+      : (patch.workspaceKind ?? existing.workspaceKind);
 
     const next = {
       title: patch.title ?? existing.title,
@@ -457,7 +484,8 @@ export class KanbanStore {
           : existing.scheduledAt,
       goalMode: patch.goalMode ?? existing.goalMode,
       goalMaxTurns: patch.goalMaxTurns ?? existing.goalMaxTurns,
-      workspaceKind: patch.workspaceKind ?? existing.workspaceKind,
+      projectId: nextProjectId,
+      workspaceKind: nextWorkspaceKind,
       workspacePath:
         patch.workspacePath !== undefined
           ? patch.workspacePath
@@ -483,7 +511,7 @@ export class KanbanStore {
         `UPDATE tasks SET
           title=?, body=?, status=?, assignee=?, tenant=?, priority=?,
           result=?, scheduled_at=?, goal_mode=?, goal_max_turns=?,
-          workspace_kind=?, workspace_path=?, branch=?,
+          project_id=?, workspace_kind=?, workspace_path=?, branch=?,
           model_override=?, provider_override=?, skills_json=?, metadata_json=?,
           updated_at=?
          WHERE id=?`,
@@ -499,6 +527,7 @@ export class KanbanStore {
         next.scheduledAt,
         next.goalMode ? 1 : 0,
         next.goalMaxTurns,
+        next.projectId,
         next.workspaceKind,
         next.workspacePath,
         next.branch,

@@ -2,13 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   mimeForPath,
+  restoreAbsolutePathPrefix,
   WA_DOCUMENT_MAX_BYTES,
 } from "./file-delivery-shared.js";
 
 export {
+  collectChatFileChipPaths,
   collectDeliverablePaths,
+  isChatFileChipPath,
   isDeliverableChatPath,
+  isProseFalsePositivePath,
   mimeForPath,
+  restoreAbsolutePathPrefix,
   WA_DOCUMENT_MAX_BYTES,
 } from "./file-delivery-shared.js";
 
@@ -48,47 +53,89 @@ function findByBasename(
     return false;
   };
 
-  const preferSubs = ["working", path.join("working", "uploads"), ""];
+  const preferSubs = [
+    "working",
+    path.join("working", "global"),
+    path.join("working", "bots"),
+    path.join("working", "project"),
+    path.join("working", "uploads"),
+    path.join("working", "global", "uploads"),
+    path.join("working", "bots", "uploads"),
+    "",
+  ];
+  type Hit = { abs: string; basename: string; size: number; mtimeMs: number; rank: number };
+  const hits: Hit[] = [];
+  let rank = 0;
   for (const root of roots) {
     for (const sub of preferSubs) {
       const dir = sub ? path.join(root, sub) : root;
-      const hit = tryStatFile(path.join(dir, base));
-      if (hit && isInsideRoot(root, hit.abs)) return hit;
+      const abs = path.join(dir, base);
+      try {
+        const st = fs.statSync(abs);
+        if (st.isFile() && isInsideRoot(root, abs)) {
+          hits.push({
+            abs,
+            basename: path.basename(abs),
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+            rank,
+          });
+        }
+      } catch {
+        /* miss */
+      }
+      rank += 1;
     }
-    // one-level scan of working/ (+ one nested folder)
+    // Scan working/ up to working/project/<name>/file (depth 3).
     const working = path.join(root, "working");
     try {
       if (!fs.existsSync(working) || !fs.statSync(working).isDirectory()) {
         continue;
       }
-      for (const name of fs.readdirSync(working)) {
-        const child = path.join(working, name);
-        let st: fs.Stats;
-        try {
-          st = fs.statSync(child);
-        } catch {
-          continue;
-        }
-        if (st.isFile() && matchesName(name) && isInsideRoot(root, child)) {
-          return { abs: child, basename: name, size: st.size };
-        }
-        if (!st.isDirectory()) continue;
-        try {
-          for (const nestedName of fs.readdirSync(child)) {
-            if (!matchesName(nestedName)) continue;
-            const nested = path.join(child, nestedName);
-            const hit = tryStatFile(nested);
-            if (hit && isInsideRoot(root, hit.abs)) return hit;
+      const queue = [working];
+      let depth = 0;
+      while (queue.length && depth < 3) {
+        const levelCount = queue.length;
+        for (let i = 0; i < levelCount; i++) {
+          const dir = queue.shift()!;
+          let entries: string[];
+          try {
+            entries = fs.readdirSync(dir);
+          } catch {
+            continue;
           }
-        } catch {
-          /* ignore */
+          for (const name of entries) {
+            const child = path.join(dir, name);
+            let st: fs.Stats;
+            try {
+              st = fs.lstatSync(child);
+            } catch {
+              continue;
+            }
+            if (st.isSymbolicLink()) continue;
+            if (st.isFile() && matchesName(name) && isInsideRoot(root, child)) {
+              hits.push({
+                abs: child,
+                basename: name,
+                size: st.size,
+                mtimeMs: st.mtimeMs,
+                rank: 1000 + depth,
+              });
+            }
+            if (st.isDirectory()) queue.push(child);
+          }
         }
+        depth += 1;
       }
     } catch {
       /* ignore */
     }
   }
-  return null;
+  if (!hits.length) return null;
+  // Prefer declared directory rank; use mtime only to break ties among same-rank hits.
+  hits.sort((a, b) => a.rank - b.rank || b.mtimeMs - a.mtimeMs);
+  const best = hits[0]!;
+  return { abs: best.abs, basename: best.basename, size: best.size };
 }
 
 /**
@@ -100,7 +147,9 @@ export function resolveExistingWorkspaceFile(
   roots: string[],
   requestedPath: string,
 ): { ok: true; abs: string; basename: string; size: number } | { ok: false; error: string } {
-  const trimmed = String(requestedPath || "").trim().replace(/\\/g, "/");
+  const trimmed = restoreAbsolutePathPrefix(
+    String(requestedPath || "").trim().replace(/\\/g, "/"),
+  );
   if (!trimmed) return { ok: false, error: "path required" };
   const resolvedRoots = [
     ...new Set(roots.map((r) => path.resolve(r)).filter(Boolean)),
@@ -111,6 +160,8 @@ export function resolveExistingWorkspaceFile(
   if (path.isAbsolute(trimmed)) {
     candidates.push(path.resolve(trimmed));
   } else {
+    // Leading `/` may have been stripped (`var/folders/...` or `Users/...`).
+    candidates.push(path.resolve("/", trimmed));
     for (const root of resolvedRoots) {
       candidates.push(path.resolve(root, trimmed));
     }

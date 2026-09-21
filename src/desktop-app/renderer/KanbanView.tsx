@@ -18,6 +18,7 @@ type KanbanTask = {
   assignee: string | null;
   tenant: string | null;
   priority: number;
+  projectId?: string | null;
   result: string | null;
   scheduledAt: string | null;
   goalMode: boolean;
@@ -71,7 +72,8 @@ type NewTaskForm = {
   title: string;
   body: string;
   priority: number;
-  workspaceKind: "scratch" | "dir" | "worktree";
+  /** Empty = scratch board folder; otherwise desktop project id. */
+  projectId: string;
   assignee: string;
   skills: string;
   modelOverride: string;
@@ -82,7 +84,7 @@ const emptyForm = (assignee = ""): NewTaskForm => ({
   title: "",
   body: "",
   priority: 0,
-  workspaceKind: "scratch",
+  projectId: "",
   assignee,
   skills: "",
   modelOverride: "",
@@ -179,6 +181,9 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
   const [byStatus, setByStatus] = useState<Record<string, KanbanTask[]>>({});
   const [settings, setSettings] = useState<BoardSettings | null>(null);
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
+  const [projects, setProjects] = useState<
+    Array<{ id: string; name: string; primaryFolder?: string | null }>
+  >([]);
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
@@ -217,6 +222,16 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
         profiles?: ProfileRow[];
       };
       if (prof?.profiles) setProfiles(prof.profiles);
+
+      const proj = (await ea.listProjects?.()) as {
+        ok?: boolean;
+        projects?: Array<{
+          id: string;
+          name: string;
+          primaryFolder?: string | null;
+        }>;
+      };
+      if (proj?.ok && proj.projects) setProjects(proj.projects);
 
       if (selectedId) {
         const d = (await ea.kanbanGet?.({
@@ -301,7 +316,8 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
         title: form.title.trim(),
         body: form.body.trim(),
         priority: form.priority,
-        workspaceKind: form.workspaceKind,
+        projectId: form.projectId.trim() || null,
+        workspaceKind: form.projectId.trim() ? "project" : "scratch",
         assignee: form.assignee || null,
         skills,
         modelOverride: form.modelOverride || null,
@@ -328,6 +344,7 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
         assignee: editTask.assignee,
         priority: editTask.priority,
         goalMode: editTask.goalMode,
+        projectId: editTask.projectId ?? null,
       },
     });
     setEditTask(null);
@@ -394,6 +411,11 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
           <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-muted">
             <span className="font-mono">{task.id}</span>
             {task.assignee && <span>@{task.assignee}</span>}
+            {task.projectId && (
+              <span className="text-accent-soft" title="Project-scoped workspace">
+                ⌂ {task.projectId}
+              </span>
+            )}
             {task.goalMode && <span className="text-accent-soft">goal</span>}
             {task.scheduledAt && Date.parse(task.scheduledAt) > Date.now() && (
               <span className="text-warn">
@@ -789,6 +811,31 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
                 />
               </div>
             </div>
+            <div className="mb-2">
+              <FieldLabel>Project scope</FieldLabel>
+              <select
+                className="w-full rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm"
+                value={editTask.projectId ?? ""}
+                onChange={(e) =>
+                  setEditTask((t) =>
+                    t
+                      ? {
+                          ...t,
+                          projectId: e.target.value || null,
+                          workspaceKind: e.target.value ? "project" : "scratch",
+                        }
+                      : t,
+                  )
+                }
+              >
+                <option value="">scratch · isolated</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name || p.id}
+                  </option>
+                ))}
+              </select>
+            </div>
             <label className="mb-3 flex items-center gap-2 text-sm text-fg-dim">
               <Toggle
                 on={editTask.goalMode}
@@ -935,22 +982,31 @@ export function KanbanView({ onClose }: { onClose: () => void }) {
                   />
                 </div>
                 <div>
-                  <FieldLabel>Workspace</FieldLabel>
+                  <FieldLabel>Project scope</FieldLabel>
                   <select
                     className="w-full rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-sm"
-                    value={form.workspaceKind}
+                    value={form.projectId}
                     onChange={(e) =>
                       setForm((f) => ({
                         ...f,
-                        workspaceKind: e.target
-                          .value as NewTaskForm["workspaceKind"],
+                        projectId: e.target.value,
                       }))
                     }
                   >
-                    <option value="scratch">scratch · board default</option>
-                    <option value="worktree">worktree</option>
-                    <option value="dir">dir (absolute path)</option>
+                    <option value="">scratch · isolated board folder</option>
+                    {projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name || p.id}
+                        {p.primaryFolder
+                          ? ` · ${p.primaryFolder.split(/[/\\]/).pop()}`
+                          : ""}
+                      </option>
+                    ))}
                   </select>
+                  <div className="mt-1 text-[10px] leading-snug text-muted">
+                    Project-bound tasks run only inside that project folder.
+                    Child tasks inherit the same scope.
+                  </div>
                 </div>
               </div>
               <div>

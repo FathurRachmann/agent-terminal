@@ -81,6 +81,11 @@ export type CreateAgentOptions = {
    */
   allowedFolders?: string[];
   /**
+   * Agent application root — `working/global|bots|project/...` artifacts live here.
+   * Defaults to profileHome ?? workspaceRoot.
+   */
+  artifactHome?: string;
+  /**
    * Profile home for agent state (`.agent/`, SOUL.md).
    * Defaults to workspaceRoot for CLI / legacy single-home mode.
    */
@@ -115,6 +120,39 @@ function ensureProfiles(): void {
   profilesRegistered = true;
 }
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
+export type MemoryScopeController = {
+  getRequiredTags: () => string[] | undefined;
+  setRequiredTags: (tags: string[] | undefined) => void;
+  /** Run async work with per-task tags (safe for parallel workspace bots). */
+  runWithTags: <T>(
+    tags: string[] | undefined,
+    fn: () => Promise<T>,
+  ) => Promise<T>;
+};
+
+const memoryScopeAls = new AsyncLocalStorage<string[] | undefined>();
+
+export function createMemoryScopeController(): MemoryScopeController {
+  let required: string[] | undefined;
+  return {
+    getRequiredTags: () => {
+      const fromAls = memoryScopeAls.getStore();
+      if (fromAls !== undefined) return fromAls;
+      return required;
+    },
+    setRequiredTags: (tags) => {
+      required = tags && tags.length > 0 ? [...tags] : undefined;
+    },
+    runWithTags: (tags, fn) => {
+      const scoped =
+        tags && tags.length > 0 ? [...tags] : undefined;
+      return memoryScopeAls.run(scoped, fn);
+    },
+  };
+}
+
 export type AgentBundle = {
   agent: DeepAgent;
   sandbox: PtySandbox;
@@ -123,6 +161,8 @@ export type AgentBundle = {
   embedder: EmbeddingClient;
   model: BaseChatModel;
   workspaceRoot: string;
+  /** Agent repo root for working/global|bots|project artifacts. */
+  artifactHome: string;
   profileHome: string;
   profileId: string;
   contextPolicy: string;
@@ -130,6 +170,8 @@ export type AgentBundle = {
   desktopEnabled: boolean;
   /** Mutable allowlist for specialized bot sessions (null = general / all tools). */
   botScope: BotScopeController;
+  /** Mutable RAG filter for workspace/bot memory isolation. */
+  memoryScope: MemoryScopeController;
 };
 
 export async function createTerminalAgent(
@@ -139,6 +181,9 @@ export async function createTerminalAgent(
 
   const workspaceRoot = path.resolve(options.workspaceRoot);
   const profileHome = path.resolve(options.profileHome ?? workspaceRoot);
+  const artifactHome = path.resolve(
+    options.artifactHome ?? profileHome ?? workspaceRoot,
+  );
   const profileId = options.profileId ?? "default";
 
   fs.mkdirSync(path.join(profileHome, ".agent", "context"), {
@@ -185,7 +230,11 @@ export async function createTerminalAgent(
 
   const sandbox = new PtySandbox({
     workingDirectory: workspaceRoot,
-    initialAllowedRoots: options.allowedFolders,
+    initialAllowedRoots: [
+      ...(options.allowedFolders ?? []),
+      artifactHome,
+    ],
+    artifactHome,
     autoApproveDestructive: options.autoApprove ?? false,
     onOutput: options.onPtyOutput,
   });
@@ -219,9 +268,11 @@ export async function createTerminalAgent(
   });
 
   // Long-Term Memory (cognitive / relevance) — semantic + lexical top-K
+  const memoryScope = createMemoryScopeController();
   const longTerm = createLongTermMemoryMiddleware(memoryStore, {
     limit: 8,
     embedder,
+    getRequiredTags: () => memoryScope.getRequiredTags(),
   });
   const normalize = createNormalizeAiMessageMiddleware();
 
@@ -328,11 +379,13 @@ export async function createTerminalAgent(
     embedder,
     model,
     workspaceRoot,
+    artifactHome,
     profileHome,
     profileId,
     contextPolicy: describeContextPolicy(),
     enableReflection: options.enableReflection ?? true,
     desktopEnabled,
     botScope,
+    memoryScope,
   };
 }

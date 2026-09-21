@@ -74,8 +74,14 @@ export function attachmentKindFor(
   return "file";
 }
 
-export function uploadsDir(workspaceRoot: string): string {
-  return path.join(path.resolve(workspaceRoot), "working", "uploads");
+export function uploadsDir(
+  workspaceRoot: string,
+  uploadsRelDir = "working/global/uploads",
+): string {
+  const parts = String(uploadsRelDir || "working/global/uploads")
+    .split(/[/\\]/)
+    .filter(Boolean);
+  return path.join(path.resolve(workspaceRoot), ...parts);
 }
 
 function safeBasename(fileName: string): string {
@@ -97,14 +103,17 @@ function uniqueTargetPath(dir: string, basename: string): string {
   return candidate;
 }
 
-export function ensureUploadsDir(workspaceRoot: string): string {
-  const dir = uploadsDir(workspaceRoot);
+export function ensureUploadsDir(
+  workspaceRoot: string,
+  uploadsRelDir = "working/global/uploads",
+): string {
+  const dir = uploadsDir(workspaceRoot, uploadsRelDir);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 /**
- * Persist an inbound buffer under working/uploads/ so agent tools can read it.
+ * Persist an inbound buffer under working/<scope>/uploads/ so agent tools can read it.
  */
 export function saveAttachmentBuffer(
   workspaceRoot: string,
@@ -114,6 +123,8 @@ export function saveAttachmentBuffer(
     mime?: string | null;
     source: AttachmentSource;
     maxBytes?: number;
+    /** e.g. working/global/uploads or working/project/foo/uploads */
+    uploadsRelDir?: string;
   },
 ):
   | { ok: true; attachment: InboundAttachment }
@@ -130,7 +141,10 @@ export function saveAttachmentBuffer(
   }
 
   const root = path.resolve(workspaceRoot);
-  const dir = ensureUploadsDir(root);
+  const dir = ensureUploadsDir(
+    root,
+    options.uploadsRelDir ?? "working/global/uploads",
+  );
   const absPath = uniqueTargetPath(dir, options.fileName);
   try {
     fs.writeFileSync(absPath, options.buffer);
@@ -159,12 +173,13 @@ export function saveAttachmentBuffer(
   };
 }
 
-/** Copy an existing local file into working/uploads/ (streams on disk — safe up to 1 GiB). */
+/** Copy an existing local file into working/<scope>/uploads/ (streams on disk — safe up to 1 GiB). */
 export function importLocalAttachment(
   workspaceRoot: string,
   sourcePath: string,
   source: AttachmentSource = "desktop",
   maxBytes = INBOUND_UPLOAD_MAX_BYTES,
+  uploadsRelDir = "working/global/uploads",
 ):
   | { ok: true; attachment: InboundAttachment }
   | { ok: false; error: string } {
@@ -184,7 +199,7 @@ export function importLocalAttachment(
     };
   }
   const root = path.resolve(workspaceRoot);
-  const dir = ensureUploadsDir(root);
+  const dir = ensureUploadsDir(root, uploadsRelDir);
   const absPath = uniqueTargetPath(dir, path.basename(abs));
   try {
     fs.copyFileSync(abs, absPath);
@@ -295,7 +310,7 @@ export async function buildAttachmentPromptBlock(
   const { extractDocumentText } = await import("./document-extract.js");
   const lines = [
     "[ATTACHMENTS]",
-    "The user attached the following file(s). They are saved under working/uploads/.",
+    "The user attached the following file(s). They are saved under working/<scope>/uploads/.",
     "For .docx/.xlsx use read_document (NOT read_file — those formats are binary ZIP).",
     "Extracted text below (when available) is authoritative — base your answer on it, do not invent from older files.",
   ];
@@ -381,8 +396,9 @@ export async function buildMultimodalUserContent(
 }
 
 /**
- * Resolve renderer-supplied attachment refs to files already under working/uploads.
- * Rejects path traversal / arbitrary absolute paths outside the uploads dir.
+ * Resolve renderer-supplied attachment refs to files already under a scoped
+ * working/.../uploads directory (global, bots, or project).
+ * Rejects path traversal / arbitrary absolute paths outside working/.
  */
 export function resolveWorkspaceUploadAttachment(
   workspaceRoot: string,
@@ -391,7 +407,7 @@ export function resolveWorkspaceUploadAttachment(
   | { ok: true; attachment: InboundAttachment }
   | { ok: false; error: string } {
   const root = path.resolve(workspaceRoot);
-  const uploadRoot = uploadsDir(root);
+  const workingRoot = path.join(root, "working");
   const candidate = String(ref.absPath || ref.path || "").trim();
   if (!candidate) return { ok: false, error: "path required" };
 
@@ -402,10 +418,18 @@ export function resolveWorkspaceUploadAttachment(
     abs = path.resolve(root, candidate);
   }
 
-  if (!isInsideRoot(uploadRoot, abs)) {
+  const underWorking = isInsideRoot(workingRoot, abs);
+  const normRel = path.relative(workingRoot, abs).split(path.sep).join("/");
+  const inUploads =
+    underWorking &&
+    (normRel === "uploads" ||
+      normRel.startsWith("uploads/") ||
+      /(^|\/)uploads(\/|$)/.test(normRel));
+  if (!inUploads) {
     return {
       ok: false,
-      error: "Attachment must be under working/uploads (re-attach via picker)",
+      error:
+        "Attachment must be under working/<scope>/uploads (re-attach via picker)",
     };
   }
 

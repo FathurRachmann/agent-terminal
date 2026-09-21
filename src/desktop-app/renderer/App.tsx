@@ -18,7 +18,7 @@ import {
   parseTaskBoardJson,
   extractTodosFromPlanInterrupt,
 } from "./plan-approval.js";
-import { collectDeliverablePaths } from "../file-delivery-shared.js";
+import { buildDeliverableFileChips } from "../deliverable-chips.js";
 import {
   buildChatSegments,
   CollapsibleTraceGroup,
@@ -218,6 +218,15 @@ declare global {
         dirty: boolean;
         error?: string;
       }>;
+      listGitBranches?: () => Promise<{
+        ok: boolean;
+        current?: string | null;
+        branches?: Array<{ name: string; current: boolean; remote: boolean }>;
+        error?: string;
+      }>;
+      checkoutGitBranch?: (
+        branch: string,
+      ) => Promise<{ ok: boolean; branch?: string; error?: string }>;
       listProfiles?: () => Promise<{
         ok: boolean;
         profiles: Array<{
@@ -305,15 +314,23 @@ declare global {
       }) => Promise<{ ok: boolean; error?: string }>;
       deleteProject?: (
         id: string,
-      ) => Promise<{ ok: boolean; error?: string; warning?: string }>;
+      ) => Promise<{
+        ok: boolean;
+        error?: string;
+        warning?: string;
+        activeProjectId?: string | null;
+        workspaceRoot?: string;
+      }>;
       setActiveProject?: (
         id: string | null,
+        opts?: { force?: boolean },
       ) => Promise<{
         ok: boolean;
         activeProjectId?: string | null;
         threadId?: string;
         workspaceRoot?: string;
         error?: string;
+        busyThreadIds?: string[];
       }>;
       pickProjectFolder?: () => Promise<{
         ok: boolean;
@@ -321,6 +338,124 @@ declare global {
         cancelled?: boolean;
         error?: string;
       }>;
+      listWorkspaces?: () => Promise<{
+        ok: boolean;
+        workspaces: Array<{
+          id: string;
+          name: string;
+          description?: string;
+          projectIds: string[];
+          activeProjectId: string | null;
+          memberCount: number;
+          chatCount: number;
+        }>;
+      }>;
+      createWorkspace?: (payload: {
+        name: string;
+        description?: string;
+        seedItRoles?: boolean;
+        division?: string;
+      }) => Promise<{
+        ok: boolean;
+        workspace?: { id: string; name: string; description?: string };
+        error?: string;
+      }>;
+      getWorkspace?: (id: string) => Promise<{
+        ok: boolean;
+        workspace?: Record<string, unknown>;
+        bots?: unknown[];
+        chats?: unknown[];
+        error?: string;
+      }>;
+      assignWorkspaceProject?: (payload: {
+        workspaceId: string;
+        projectId: string;
+      }) => Promise<{
+        ok: boolean;
+        workspace?: unknown;
+        workspaceRoot?: string;
+        activeProjectId?: string | null;
+        error?: string;
+        warning?: string;
+      }>;
+      unassignWorkspaceProject?: (payload: {
+        workspaceId: string;
+        projectId: string;
+      }) => Promise<{ ok: boolean; workspace?: unknown; error?: string }>;
+      setWorkspaceActiveProject?: (payload: {
+        workspaceId: string;
+        projectId: string | null;
+        force?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        workspace?: unknown;
+        workspaces?: unknown[];
+        workspaceRoot?: string;
+        activeProjectId?: string | null;
+        reused?: boolean;
+        error?: string;
+        warning?: string;
+        busyThreadIds?: string[];
+      }>;
+      createWorkspaceBot?: (payload: Record<string, unknown>) => Promise<{
+        ok: boolean;
+        bots?: unknown[];
+        error?: string;
+      }>;
+      updateWorkspaceBot?: (payload: Record<string, unknown>) => Promise<{
+        ok: boolean;
+        bots?: unknown[];
+        error?: string;
+      }>;
+      deleteWorkspaceBot?: (payload: {
+        workspaceId: string;
+        botId: string;
+      }) => Promise<{ ok: boolean; bots?: unknown[]; error?: string }>;
+      updateWorkspaceChat?: (payload: Record<string, unknown>) => Promise<{
+        ok: boolean;
+        error?: string;
+        chat?: {
+          id: string;
+          name: string;
+          replyMode?: "auto" | "mention_only";
+          maxResponders?: number;
+        };
+      }>;
+      deleteWorkspace?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+      openWorkspaceChat?: (payload: {
+        workspaceId: string;
+        chatId: string;
+      }) => Promise<{
+        ok: boolean;
+        threadId?: string;
+        events?: TranscriptRow[];
+        bots?: Array<{ id: string; name: string; role?: string }>;
+        chat?: { id: string; name: string };
+        workspace?: { id: string; name: string };
+        error?: string;
+      }>;
+      sendWorkspaceGroupPrompt?: (payload: {
+        workspaceId: string;
+        chatId: string;
+        prompt: string;
+        attachments?: Array<{ path?: string; absPath?: string }>;
+      }) => Promise<{
+        ok: boolean;
+        threadId?: string;
+        replies?: Array<{ botId: string; botName: string; content: string }>;
+        note?: string;
+        supervisor?: {
+          botId?: string | null;
+          botName?: string | null;
+          status?: string;
+          summary?: string;
+          gaps?: string[];
+          nextActions?: string[];
+          note?: string | null;
+        } | null;
+        error?: string;
+      }>;
+      openWorkspacesWindow?: () => Promise<{ ok: boolean; error?: string }>;
       getGatewayStatus?: () => Promise<GatewayStatusSnapshot>;
       testLocalGateway?: () => Promise<{ ok: boolean; detail: string }>;
       setGatewayMode?: (
@@ -808,7 +943,15 @@ type ChatItem =
       at: string;
       attachments?: UserBubbleAttachment[];
     }
-  | { id: string; kind: "assistant"; text: string; at: string }
+  | {
+      id: string;
+      kind: "assistant";
+      text: string;
+      at: string;
+      botId?: string;
+      botName?: string;
+      botRole?: string;
+    }
   | { id: string; kind: "system"; text: string; at: string }
   | { id: string; kind: "reasoning"; text: string; at: string; label?: string }
   | {
@@ -1108,27 +1251,11 @@ export function App() {
     extraPaths: string[] = [],
     atTs = now(),
   ) => {
-    const paths = collectDeliverablePaths(texts, extraPaths).slice(0, 5);
-    if (!paths.length) return;
-    setItems((prev) => {
-      const existing = new Set(
-        prev.filter((i) => i.kind === "file").map((i) => i.path),
-      );
-      const next = [...prev];
-      for (const p of paths) {
-        if (existing.has(p)) continue;
-        existing.add(p);
-        next.push({
-          id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          kind: "file",
-          path: p,
-          basename: p.split(/[/\\]/).pop() || p,
-          at: atTs,
-          note: "Open in app, or Save as… to download a copy",
-        });
-      }
-      return next;
+    const chips = buildDeliverableFileChips(texts, extraPaths, atTs, {
+      limit: 5,
     });
+    if (!chips.length) return;
+    setItems((prev) => [...prev, ...chips]);
   };
   const appendDeliverableFileChipsRef = useRef(appendDeliverableFileChips);
   appendDeliverableFileChipsRef.current = appendDeliverableFileChips;
@@ -1655,11 +1782,20 @@ export function App() {
             label: "Model notice",
           });
         } else {
+          const botName =
+            typeof ev.meta?.botName === "string" ? ev.meta.botName : undefined;
+          const botId =
+            typeof ev.meta?.botId === "string" ? ev.meta.botId : undefined;
+          const botRole =
+            typeof ev.meta?.botRole === "string" ? ev.meta.botRole : undefined;
           restoredItems.push({
             id: `a-${ev.ts}-${restoredItems.length}`,
             kind: "assistant",
             text: ev.content,
             at,
+            botId,
+            botName,
+            botRole,
           });
         }
         continue;
@@ -1948,6 +2084,32 @@ export function App() {
     await refreshProjects();
   };
 
+  const handleDeleteProject = async (projectId: string, projectName: string) => {
+    if (!window.electronAgent?.deleteProject) return;
+    const ok = window.confirm(
+      `Hapus project “${projectName}”?\n\nFolder di disk tidak dihapus. Session yang terikat project ini tetap ada (jadi session global).`,
+    );
+    if (!ok) return;
+    const res = await window.electronAgent.deleteProject(projectId);
+    if (!res.ok) {
+      window.alert(res.error || "Gagal menghapus project");
+      return;
+    }
+    if (projectsFocusId === projectId) setProjectsFocusId(null);
+    setExpandedProjectIds((prev) => prev.filter((id) => id !== projectId));
+    if (res.activeProjectId !== undefined) {
+      setActiveProjectId(res.activeProjectId ?? null);
+    }
+    if (res.workspaceRoot) {
+      setStatus((s) => ({ ...s, workspaceRoot: res.workspaceRoot! }));
+    }
+    if (res.warning) {
+      window.alert(res.warning);
+    }
+    await refreshProjects();
+    await refreshSessions({ syncBusy: true });
+  };
+
   const handleMoveSessionToProject = async (
     threadId: string,
     projectId: string | null,
@@ -2049,7 +2211,18 @@ export function App() {
 
   const handleActivateProject = async (id: string | null) => {
     if (!window.electronAgent?.setActiveProject) return;
-    const res = await window.electronAgent.setActiveProject(id);
+    let res = await window.electronAgent.setActiveProject(id);
+    if (!res.ok && res.error?.includes("running turns")) {
+      const busy =
+        Array.isArray(res.busyThreadIds) && res.busyThreadIds.length
+          ? `\n\nBusy: ${res.busyThreadIds.join(", ")}`
+          : "";
+      const ok = window.confirm(
+        `Masih ada turn yang jalan, jadi project belum bisa diganti.${busy}\n\nStop turn itu dan pindah sekarang?`,
+      );
+      if (!ok) return;
+      res = await window.electronAgent.setActiveProject(id, { force: true });
+    }
     if (!res.ok) {
       window.alert(res.error || "Could not switch project");
       return;
@@ -2079,7 +2252,16 @@ export function App() {
     setActiveTab("projects");
     if (activeProjectId !== projectId) {
       if (!window.electronAgent?.setActiveProject) return;
-      const res = await window.electronAgent.setActiveProject(projectId);
+      let res = await window.electronAgent.setActiveProject(projectId);
+      if (!res.ok && res.error?.includes("running turns")) {
+        const ok = window.confirm(
+          "Masih ada turn yang jalan. Stop dan pindah project sekarang?",
+        );
+        if (!ok) return;
+        res = await window.electronAgent.setActiveProject(projectId, {
+          force: true,
+        });
+      }
       if (!res.ok) {
         window.alert(res.error || "Could not switch project");
         return;
@@ -2304,6 +2486,14 @@ export function App() {
             },
           ]);
         } else {
+          const evAny = event as {
+            botName?: unknown;
+            botId?: unknown;
+          };
+          const botName =
+            typeof evAny.botName === "string" ? evAny.botName : undefined;
+          const botId =
+            typeof evAny.botId === "string" ? evAny.botId : undefined;
           setItems((prev) => [
             ...prev,
             {
@@ -2311,6 +2501,8 @@ export function App() {
               kind: "assistant",
               text: finalText || "(empty response)",
               at,
+              botId,
+              botName,
             },
           ]);
         }
@@ -3102,6 +3294,40 @@ export function App() {
                 <span>{item.label}</span>
               </button>
             ))}
+            <button
+              type="button"
+              data-tip="Workspaces — divisions & group chat (new window)"
+              data-tip-pos="bottom"
+              onClick={() => {
+                void window.electronAgent?.openWorkspacesWindow?.();
+              }}
+              className="inline-flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[11px] text-fg-dim transition hover:bg-surface-2 hover:text-fg"
+            >
+              <span className="inline-flex shrink-0 opacity-80">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <path
+                    d="M4 7.5h16v11A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-11z"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d="M4 7.5l2.2-3h11.6L20 7.5"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d="M9 11.5h6M9 15h4"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </span>
+              <span>Workspaces</span>
+              <span className="ml-auto text-[9px] text-muted">↗</span>
+            </button>
           </nav>
 
           <div className="flex border-b border-border">
@@ -3143,7 +3369,7 @@ export function App() {
             ))}
           </div>
 
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden pr-0.5">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden -mx-3 px-[2px]">
             {activeTab === "sessions" ? (
               globalSessions.length === 0 ? (
                 <div className="px-1 py-2 text-xs text-muted">No sessions yet</div>
@@ -3314,16 +3540,29 @@ export function App() {
                       <span className="text-muted" aria-hidden>
                         ⌂
                       </span>
-                      <span className="truncate text-[12px] font-medium text-fg">
+                      <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-fg">
                         {focusedProject.name}
                       </span>
                       <button
                         type="button"
                         title="New session in project"
                         onClick={() => void handleNewSession()}
-                        className="ml-auto rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-surface-2 hover:text-fg"
+                        className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-surface-2 hover:text-fg"
                       >
                         +
+                      </button>
+                      <button
+                        type="button"
+                        title="Delete project"
+                        onClick={() =>
+                          void handleDeleteProject(
+                            focusedProject.id,
+                            focusedProject.name,
+                          )
+                        }
+                        className="rounded px-1.5 py-0.5 text-[10px] text-muted hover:bg-red-500/15 hover:text-red-300"
+                      >
+                        Del
                       </button>
                     </div>
                     {(sessionsByProject.get(focusedProject.id) ?? []).length ===
@@ -3420,7 +3659,7 @@ export function App() {
                                 : "border-transparent"
                             }`}
                           >
-                            <div className="flex items-stretch">
+                            <div className="group flex items-stretch">
                               <button
                                 type="button"
                                 title={expanded ? "Collapse" : "Expand"}
@@ -3446,6 +3685,17 @@ export function App() {
                                       }`
                                     : ""}
                                 </div>
+                              </button>
+                              <button
+                                type="button"
+                                title="Delete project"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleDeleteProject(p.id, p.name);
+                                }}
+                                className="shrink-0 self-center rounded px-1.5 py-1 text-[10px] text-muted opacity-0 transition hover:bg-red-500/15 hover:text-red-300 group-hover:opacity-100 focus:opacity-100"
+                              >
+                                Del
                               </button>
                             </div>
                             {expanded ? (
@@ -3798,10 +4048,13 @@ export function App() {
             }
             if (item.kind === "assistant") {
               const isWelcome = item.id === "welcome";
+              const label = item.botName
+                ? `${item.botName}${item.botRole ? ` · ${item.botRole}` : ""}`
+                : "Agent";
               return (
                 <div key={item.id} className="group min-w-0 w-full max-w-[90%] self-start">
                   <div className="mb-1 text-[9.5px] text-muted">
-                    Agent · {item.at}
+                    {label} · {item.at}
                   </div>
                   <div className="min-w-0 overflow-x-auto rounded-2xl rounded-bl-md border border-border bg-surface-3 px-3.5 py-3">
                     <MarkdownBody

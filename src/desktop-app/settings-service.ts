@@ -253,7 +253,7 @@ export function applySettingsUpdate(
       envMirror.PTY_TIMEOUT_MS = String(n);
     }
     if (s.ptyPoolSize !== undefined) {
-      const n = Math.max(1, Math.min(16, Math.floor(s.ptyPoolSize)));
+      const n = Math.max(1, Math.min(10, Math.floor(s.ptyPoolSize)));
       envUpdates.PTY_POOL_SIZE = String(n);
       envMirror.PTY_POOL_SIZE = String(n);
     }

@@ -30,6 +30,8 @@ export type ReflectionInput = {
   errorMessage?: string;
   /** Skip episode when the turn had no usable answer (e.g. leaked CoT). */
   skipEpisode?: boolean;
+  /** Extra tags for workspace/bot isolation (e.g. workspace:it, bot:cto). */
+  scopeTags?: string[];
 };
 
 /**
@@ -60,6 +62,7 @@ export async function reflectAndStore(options: {
         tags: [
           "auto-reflection",
           input.hadError ? "failure" : "success",
+          ...(input.scopeTags ?? []),
           ...extractTags(input.userPrompt),
         ],
         importance: input.hadError ? 0.85 : 0.55,
@@ -83,7 +86,7 @@ export async function reflectAndStore(options: {
         kind: "rule",
         title: "Known Pitfalls",
         content: guideline.text,
-        tags: ["auto-reflection", "guideline", "when-do"],
+        tags: ["auto-reflection", "guideline", "when-do", ...(input.scopeTags ?? [])],
         importance: 0.8,
       },
       embedder,
@@ -108,7 +111,7 @@ export async function reflectAndStore(options: {
           kind: "preference",
           title: "User preferences",
           content: pref.text,
-          tags: ["auto-reflection", "user-style", pref.kind],
+          tags: ["auto-reflection", "user-style", pref.kind, ...(input.scopeTags ?? [])],
           importance: 0.7,
         },
         embedder,
@@ -136,7 +139,7 @@ export async function reflectAndStore(options: {
         kind: "fact",
         title: item.title,
         content: item.text,
-        tags: ["auto-reflection", "chat-context", item.kind],
+        tags: ["auto-reflection", "chat-context", item.kind, ...(input.scopeTags ?? [])],
         importance: item.importance,
       },
       embedder,

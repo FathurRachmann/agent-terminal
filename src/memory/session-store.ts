@@ -24,10 +24,14 @@ export type SessionListItem = {
   preview: string;
   turnCount: number;
   projectId: string | null;
+  workspaceId: string | null;
+  chatId: string | null;
 };
 
 export type SessionMeta = {
   projectId: string | null;
+  workspaceId?: string | null;
+  chatId?: string | null;
 };
 
 export type TranscriptRole =
@@ -88,16 +92,60 @@ export class SessionStore {
     fs.writeFileSync(this.sessionPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
   }
 
+  threadStatePath(threadId: string): string {
+    return path.join(
+      this.transcriptsDir,
+      `${sanitizeThreadId(threadId)}.state.json`,
+    );
+  }
+
+  readThreadSession(threadId: string): SessionState | null {
+    const file = this.threadStatePath(threadId);
+    if (!fs.existsSync(file)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8")) as SessionState;
+    } catch {
+      return null;
+    }
+  }
+
+  writeThreadSession(threadId: string, state: SessionState): void {
+    const next: SessionState = {
+      ...state,
+      threadId,
+      updatedAt: new Date().toISOString(),
+    };
+    fs.mkdirSync(this.transcriptsDir, { recursive: true });
+    fs.writeFileSync(
+      this.threadStatePath(threadId),
+      `${JSON.stringify(next, null, 2)}\n`,
+      "utf8",
+    );
+    // Keep global pointer as last-touched thread for UI compatibility.
+    this.writeSession(next);
+  }
+
   startOrResume(options: {
     threadId: string;
     model: string;
     projectId?: string | null;
+    workspaceId?: string | null;
+    chatId?: string | null;
   }): SessionState {
-    const existing = this.readSession();
+    const existing =
+      this.readThreadSession(options.threadId) ??
+      (() => {
+        const global = this.readSession();
+        return global?.threadId === options.threadId ? global : null;
+      })();
     const now = new Date().toISOString();
     const projectId =
       options.projectId === undefined ? null : options.projectId;
+    const workspaceId =
+      options.workspaceId === undefined ? undefined : options.workspaceId;
+    const chatId = options.chatId === undefined ? undefined : options.chatId;
     if (existing && existing.threadId === options.threadId) {
+      const prevMeta = this.readSessionMeta(options.threadId);
       const resumed: SessionState = {
         ...existing,
         model: options.model,
@@ -110,9 +158,14 @@ export class SessionStore {
             ? projectId
             : (existing.projectId ?? null),
       };
-      this.writeSession(resumed);
+      this.writeThreadSession(options.threadId, resumed);
       this.writeSessionMeta(options.threadId, {
         projectId: resumed.projectId ?? null,
+        workspaceId:
+          workspaceId !== undefined
+            ? workspaceId
+            : (prevMeta.workspaceId ?? null),
+        chatId: chatId !== undefined ? chatId : (prevMeta.chatId ?? null),
       });
       return resumed;
     }
@@ -126,8 +179,12 @@ export class SessionStore {
       lastStatus: "running",
       projectId,
     };
-    this.writeSession(created);
-    this.writeSessionMeta(options.threadId, { projectId });
+    this.writeThreadSession(options.threadId, created);
+    this.writeSessionMeta(options.threadId, {
+      projectId,
+      workspaceId: workspaceId ?? null,
+      chatId: chatId ?? null,
+    });
     return created;
   }
 
@@ -148,6 +205,12 @@ export class SessionStore {
           typeof raw.projectId === "string" && raw.projectId
             ? raw.projectId
             : null,
+        workspaceId:
+          typeof raw.workspaceId === "string" && raw.workspaceId
+            ? raw.workspaceId
+            : null,
+        chatId:
+          typeof raw.chatId === "string" && raw.chatId ? raw.chatId : null,
       };
     } catch {
       return { projectId: null };
@@ -158,13 +221,25 @@ export class SessionStore {
     fs.mkdirSync(this.transcriptsDir, { recursive: true });
     fs.writeFileSync(
       this.metaPath(threadId),
-      `${JSON.stringify({ projectId: meta.projectId ?? null }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          projectId: meta.projectId ?? null,
+          workspaceId: meta.workspaceId ?? null,
+          chatId: meta.chatId ?? null,
+        },
+        null,
+        2,
+      )}\n`,
       "utf8",
     );
   }
 
-  markTurnStart(prompt: string): SessionState {
-    const current = this.readSession();
+  markTurnStart(prompt: string, threadId?: string): SessionState {
+    const tid = threadId ?? this.readSession()?.threadId;
+    if (!tid) throw new Error("Session not initialized");
+    const current =
+      this.readThreadSession(tid) ??
+      (this.readSession()?.threadId === tid ? this.readSession() : null);
     if (!current) {
       throw new Error("Session not initialized");
     }
@@ -175,12 +250,16 @@ export class SessionStore {
       lastError: undefined,
       turnCount: current.turnCount + 1,
     };
-    this.writeSession(next);
+    this.writeThreadSession(tid, next);
     return next;
   }
 
-  markTurnComplete(response: string): SessionState {
-    const current = this.readSession();
+  markTurnComplete(response: string, threadId?: string): SessionState {
+    const tid = threadId ?? this.readSession()?.threadId;
+    if (!tid) throw new Error("Session not initialized");
+    const current =
+      this.readThreadSession(tid) ??
+      (this.readSession()?.threadId === tid ? this.readSession() : null);
     if (!current) {
       throw new Error("Session not initialized");
     }
@@ -190,12 +269,16 @@ export class SessionStore {
       lastResponsePreview: response.slice(0, 500),
       lastError: undefined,
     };
-    this.writeSession(next);
+    this.writeThreadSession(tid, next);
     return next;
   }
 
-  markTurnError(error: string): SessionState {
-    const current = this.readSession();
+  markTurnError(error: string, threadId?: string): SessionState {
+    const tid = threadId ?? this.readSession()?.threadId;
+    if (!tid) throw new Error("Session not initialized");
+    const current =
+      this.readThreadSession(tid) ??
+      (this.readSession()?.threadId === tid ? this.readSession() : null);
     if (!current) {
       throw new Error("Session not initialized");
     }
@@ -204,7 +287,7 @@ export class SessionStore {
       lastStatus: "error",
       lastError: error.slice(0, 1000),
     };
-    this.writeSession(next);
+    this.writeThreadSession(tid, next);
     return next;
   }
 
@@ -284,7 +367,11 @@ export class SessionStore {
 
   /** Assign / unassign a session to a project (`null` = global). */
   setSessionProject(threadId: string, projectId: string | null): void {
-    this.writeSessionMeta(threadId, { projectId: projectId || null });
+    const prev = this.readSessionMeta(threadId);
+    this.writeSessionMeta(threadId, {
+      ...prev,
+      projectId: projectId || null,
+    });
     const current = this.readSession();
     if (current?.threadId === threadId) {
       this.writeSession({
@@ -330,17 +417,23 @@ export class SessionStore {
         preview: (lastUser?.content || lastAny?.content || "(empty)").slice(0, 80),
         turnCount: users.length,
         projectId: meta.projectId ?? null,
+        workspaceId: meta.workspaceId ?? null,
+        chatId: meta.chatId ?? null,
       });
     }
 
     sessions.sort((a, b) => b.mtime - a.mtime);
-    return sessions.map(({ threadId, updatedAt, preview, turnCount, projectId }) => ({
-      threadId,
-      updatedAt,
-      preview,
-      turnCount,
-      projectId,
-    }));
+    return sessions.map(
+      ({ threadId, updatedAt, preview, turnCount, projectId, workspaceId, chatId }) => ({
+        threadId,
+        updatedAt,
+        preview,
+        turnCount,
+        projectId,
+        workspaceId,
+        chatId,
+      }),
+    );
   }
 
   writeConfigSnapshot(config: Record<string, unknown>): void {

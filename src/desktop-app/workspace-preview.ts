@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { restoreAbsolutePathPrefix } from "./path-normalize.js";
+import { resolveExistingWorkspaceFile } from "./file-delivery.js";
 import { mimeForPath } from "./file-delivery-shared.js";
 import {
   encodeAgentPreviewUrl,
@@ -164,7 +166,7 @@ export function listWorkspaceDirMulti(
     return listWorkspaceDir(resolvedRoots[0]!, requestedPath);
   }
 
-  const trimmed = String(requestedPath || "").trim();
+  const trimmed = restoreAbsolutePathPrefix(String(requestedPath || "").trim());
   if (!trimmed || trimmed === "." || trimmed === "/") {
     const used = new Map<string, number>();
     const entries: WorkspaceDirEntry[] = resolvedRoots.map((root) => {
@@ -212,7 +214,7 @@ export function readWorkspacePreviewMulti(
   if (resolvedRoots.length === 0) {
     return Promise.resolve({ ok: false as const, error: "No workspace folders" });
   }
-  const trimmed = String(requestedPath || "").trim();
+  const trimmed = restoreAbsolutePathPrefix(String(requestedPath || "").trim());
   if (!trimmed) {
     return Promise.resolve({ ok: false as const, error: "path required" });
   }
@@ -220,13 +222,19 @@ export function readWorkspacePreviewMulti(
   if (path.isAbsolute(trimmed)) {
     const abs = path.resolve(trimmed);
     const root = resolvedRoots.find((r) => isInsideRoot(r, abs));
-    if (!root) {
-      return Promise.resolve({
-        ok: false as const,
-        error: "Path escapes project folders",
-      });
+    if (root) {
+      return readWorkspacePreview(root, abs);
     }
-    return readWorkspacePreview(root, abs);
+    // Basename / remapped working/ fallback (Agent artifact home may be the only hit).
+    const found = resolveExistingWorkspaceFile(resolvedRoots, trimmed);
+    if (found.ok) {
+      const home = resolvedRoots.find((r) => isInsideRoot(r, found.abs));
+      if (home) return readWorkspacePreview(home, found.abs);
+    }
+    return Promise.resolve({
+      ok: false as const,
+      error: "Path escapes project folders",
+    });
   }
 
   for (const root of resolvedRoots) {
@@ -237,6 +245,13 @@ export function readWorkspacePreviewMulti(
       /* try next */
     }
   }
+
+  const found = resolveExistingWorkspaceFile(resolvedRoots, trimmed);
+  if (found.ok) {
+    const home = resolvedRoots.find((r) => isInsideRoot(r, found.abs));
+    if (home) return readWorkspacePreview(home, found.abs);
+  }
+
   return Promise.resolve({
     ok: false as const,
     error: "Path escapes project folders",
@@ -275,7 +290,9 @@ function languageForExt(ext: string): string {
 }
 
 function kindForExt(ext: string): WorkspacePreviewKind {
-  if (ext === "md" || ext === "mdx" || ext === "markdown") return "markdown";
+  if (ext === "md" || ext === "mdx" || ext === "markdown" || ext === "mmd") {
+    return "markdown";
+  }
   if (ext === "html" || ext === "htm") return "html";
   if (ext === "csv" || ext === "tsv") return "csv";
   if (["xlsx", "xls", "xlsm", "sheet", "ods"].includes(ext)) return "spreadsheet";
@@ -340,6 +357,25 @@ function kindForExt(ext: string): WorkspacePreviewKind {
     return "binary";
   }
   return "unsupported";
+}
+
+/** Wrap raw Mermaid (.mmd) so MarkdownBody/MermaidDiagram can render it. */
+export function wrapMermaidForMarkdownPreview(
+  text: string,
+  ext: string,
+): string {
+  const t = String(text || "").trim();
+  if (!t) return text;
+  if (ext.toLowerCase() !== "mmd") return text;
+  if (/^```\s*mermaid\b/i.test(t) || /^```\s*mmd\b/i.test(t)) return text;
+  if (
+    /^(sequenceDiagram|flowchart(?:\s|$)|graph\s|classDiagram|stateDiagram(?:-v2)?|erDiagram|journey|gantt|pie(?:\s|$)|mindmap|timeline|gitGraph)/i.test(
+      t,
+    )
+  ) {
+    return `\`\`\`mermaid\n${t}\n\`\`\`\n`;
+  }
+  return text;
 }
 
 function fileMeta(
@@ -646,8 +682,8 @@ export async function readWorkspacePreview(
       basename,
       ext,
       kind,
-      language,
-      text,
+      language: ext === "mmd" ? "mermaid" : language,
+      text: wrapMermaidForMarkdownPreview(text, ext),
       truncated,
       mime: mimeForPath(filePath),
       previewUrl: encodeAgentPreviewUrl(filePath),
