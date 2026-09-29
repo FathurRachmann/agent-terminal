@@ -35,6 +35,69 @@ export function contentLooksLikeTextToolCall(content: unknown): boolean {
   return parseTextToolCalls(content).length > 0;
 }
 
+/**
+ * True for complete OR truncated JSON tool dumps (9router quirk).
+ * Incomplete streams often end mid-object (`{"name":`) and fail JSON.parse —
+ * those must still be hidden from the chat bubble.
+ *
+ * Also catches Antigravity / OpenClaw-style bracket dumps:
+ * `[READ DOCUMENT]File Path: … [EDIT FILE]…`
+ */
+export function looksLikeTextToolCallDump(content: unknown): boolean {
+  if (contentLooksLikeTextToolCall(content)) return true;
+  const text = contentToString(content)
+    .replace(/```(?:json)?\s*/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  if (!text || text.length < 12) return false;
+
+  if (looksLikeBracketToolDump(text)) return true;
+
+  if (!/^[\[{]/.test(text)) return false;
+  if (!/"name"\s*:/.test(text)) return false;
+
+  const knownTool =
+    /"(task_plan|task_todos|task_todo_update|task_verify|execute|read_file|write_file|edit_file|str_replace|glob|grep|ls|shell|bash|memory_recall|remember_rule|list_dir|desktop_[a-z_]+)"/.test(
+      text,
+    );
+  const nameHits = (text.match(/"name"\s*:/g) ?? []).length;
+  const argHits = (text.match(/"(?:arguments|args)"\s*:/g) ?? []).length;
+  // Truncated mid-call: …{"name":  or …"name":"
+  const truncatedTail = /"name"\s*:\s*"?[a-zA-Z_][\w.-]*"?\s*,?\s*$/.test(text);
+
+  if (knownTool) return true;
+  if (nameHits >= 1 && argHits >= 1) return true;
+  if (nameHits >= 1 && truncatedTail) return true;
+  return false;
+}
+
+/** Bracket-tagged pseudo tool logs (not user-facing answers). */
+export function looksLikeBracketToolDump(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t || t.length < 20) return false;
+  const tags = t.match(
+    /\[(READ DOCUMENT|EDIT FILE|WRITE FILE|WEB SEARCH|WEB EXTRACT|EXECUTE|RUN COMMAND|LIST DIR|GREP|GLOB|BROWSER|CLICK|TYPE|SCROLL|SCREENSHOT)\]/gi,
+  );
+  if (!tags || tags.length < 1) return false;
+  // One tag + File Path / File Contents / Query = dump
+  if (
+    tags.length >= 2 ||
+    (/File Path\s*:/i.test(t) && /File Contents\s*:/i.test(t)) ||
+    (/File Path\s*:/i.test(t) && tags.length >= 1)
+  ) {
+    // Allow a short prose answer that merely cites one tag in backticks.
+    if (
+      tags.length === 1 &&
+      t.length < 120 &&
+      !/File (Path|Contents)\s*:/i.test(t)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {

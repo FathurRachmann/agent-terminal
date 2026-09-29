@@ -6,7 +6,7 @@ describe("parseUserMessageContent", () => {
   it("extracts image paths and strips attachment wrapper", () => {
     const content = `[ATTACHMENTS]
 The user attached the following file(s).
-- IMAGE: \`working/uploads/shot.png\` (image/png, 12 bytes). Call vision_analyze…
+- IMAGE: \`tmp/uploads/shot.png\` (image/png, 12 bytes). Call vision_analyze…
 [/ATTACHMENTS]
 
 [USER]
@@ -15,7 +15,7 @@ gambar apa ini?`;
     assert.equal(parsed.text, "gambar apa ini?");
     assert.equal(parsed.attachments.length, 1);
     assert.equal(parsed.attachments[0]?.kind, "image");
-    assert.equal(parsed.attachments[0]?.path, "working/uploads/shot.png");
+    assert.equal(parsed.attachments[0]?.path, "tmp/uploads/shot.png");
     assert.equal(parsed.attachments[0]?.basename, "shot.png");
   });
 
@@ -27,7 +27,7 @@ gambar apa ini?`;
 
   it("clears default analyze placeholder when only images", () => {
     const content = `[ATTACHMENTS]
-- IMAGE: \`working/uploads/a.png\` (image/png, 1 bytes).
+- IMAGE: \`tmp/uploads/a.png\` (image/png, 1 bytes).
 [/ATTACHMENTS]
 
 [USER]

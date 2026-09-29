@@ -28,7 +28,7 @@ describe("activity artifacts", () => {
     assert.equal(shouldAutoFocusCanvas("pdf"), true);  });
 
   it("detects clickable workspace paths", () => {
-    assert.equal(looksLikeWorkspacePath("working/uu_pdp_27_2022.md"), true);
+    assert.equal(looksLikeWorkspacePath("tmp/uu_pdp_27_2022.md"), true);
     assert.equal(looksLikeWorkspacePath("README.md"), true);
     assert.equal(looksLikeWorkspacePath("./src/app.ts"), true);
     assert.equal(looksLikeWorkspacePath("not a path"), false);
@@ -40,7 +40,7 @@ describe("activity artifacts", () => {
     const art = resolveArtifactFromTool({
       name: "write_file",
       input: {
-        path: "working/demo.js",
+        path: "tmp/demo.js",
         content: "console.log(1)",
       },
     });
@@ -69,14 +69,14 @@ describe("activity artifacts", () => {
 
   it("extracts result paths from shell output", () => {
     const paths = extractResultPathsFromText(
-      "Saved report to ./working/laporan_bulanan.docx\n",
+      "Saved report to ./tmp/laporan_bulanan.docx\n",
     );
     assert.ok(paths.some((p) => p.endsWith("laporan_bulanan.docx")));
   });
 
   it("extracts backtick paths that contain spaces", () => {
     const paths = extractResultPathsFromText(
-      "File ada di `working/LAPORAN TP ADMINISTRASI SEPTEMBER 2026 - DIANDRA.doc` siap dibuka.",
+      "File ada di `tmp/LAPORAN TP ADMINISTRASI SEPTEMBER 2026 - DIANDRA.doc` siap dibuka.",
     );
     assert.ok(
       paths.some((p) =>
@@ -89,11 +89,11 @@ describe("activity artifacts", () => {
 
   it("keeps leading slash on absolute backtick paths", () => {
     const paths = extractResultPathsFromText(
-      "Dokumen: `/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf`",
+      "Dokumen: `/Users/fathurrachman/Desktop/Agent/tmp/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf`",
     );
     assert.equal(
       paths[0],
-      "/Users/fathurrachman/Desktop/Agent/working/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf",
+      "/Users/fathurrachman/Desktop/Agent/tmp/project/simkopdes/FSD_SIMKOPDES_FINAL.pdf",
     );
   });
 
@@ -105,16 +105,16 @@ describe("activity artifacts", () => {
   });
 
   it("collapses equivalent canvas paths to one key", () => {
-    const a = normalizeCanvasKey("working/rencana_alur_login_secure.md");
+    const a = normalizeCanvasKey("tmp/rencana_alur_login_secure.md");
     const b = normalizeCanvasKey(
-      "/Users/me/Agent/working/rencana_alur_login_secure.md",
+      "/Users/me/Agent/tmp/rencana_alur_login_secure.md",
     );
-    const c = normalizeCanvasKey("./working/rencana_alur_login_secure.md");
+    const c = normalizeCanvasKey("./tmp/rencana_alur_login_secure.md");
     assert.equal(a, b);
     assert.equal(a, c);
     assert.equal(
-      preferCanvasPath("working/a.md", "/abs/working/a.md"),
-      "/abs/working/a.md",
+      preferCanvasPath("tmp/a.md", "/abs/tmp/a.md"),
+      "/abs/tmp/a.md",
     );
   });
 });

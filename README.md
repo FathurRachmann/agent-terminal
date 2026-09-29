@@ -10,7 +10,9 @@ Terminal-first AI coding agent built with **Deep Agents** (LangGraph harness), *
 - 256k context budget with auto-summarize and history offload
 - Dual memory: Persistent (durability) + Long-Term (semantic/cognitive)
 - Always-on guidelines via `.agent/AGENTS.md`
-- **Agent skills** under `.agent/skills/*/SKILL.md` (on-demand via `ls`/`read_file` on `/skills/` — not auto-injected)
+- **Agent skills** under `.agent/skills/*/SKILL.md` — **name/description catalog** injected into the system prompt; full bodies on-demand via `read_file` on `/skills/`
+- Composer **chat modes**: Agent / Ask / Plan / Debug (orthogonal to Settings agentKind posture)
+- **Run Modes** (Cursor-style): Auto-review (classifier) / Allowlist / Run Everything — workspace edits auto-apply except config/secrets; folder grants always HITL
 - Multi-agent orchestration: `explorer` / `coder` / `reviewer`
 - Text CLI + Ink TUI (`npm run agent`, `-t` for plain CLI)
 - **Desktop app** (Electron): chat, canvas, files, terminal deck, kanban, messaging, profiles
@@ -74,7 +76,25 @@ npm run agent -- --cwd ~/Documents/MyApp         # confine sandbox to that folde
 
 (`npm run tui` is an alias of `npm run agent`.)
 
-Workspace confinement: the agent can only read/write/exec inside the current allowlist (starts as `--cwd`). To open another laptop folder mid-session, the agent must call `request_folder_access` and you press **y/n**. Without `-y`, execute / edit / write / folder grants always ask approval.
+Workspace confinement: the agent can only read/write/exec inside the current allowlist (starts as `--cwd`). To open another laptop folder mid-session, the agent must call `request_folder_access` and you press **y/n**.
+
+**HITL / Run Modes** (desktop Settings → Safety):
+
+| Mode | Behavior |
+| --- | --- |
+| **Auto-review** (default) | Allowlisted tools/commands auto-run; else a cheap classifier (`AGENT_CLASSIFIER_MODEL`) decides allow / ask / deny |
+| **Allowlist** | Only listed tools/command prefixes auto-run; everything else asks |
+| **Run Everything** | Shell/MCP/desktop auto (same as CLI `-y`); config/secret path edits still ask unless this mode |
+
+Workspace `edit_file` / `write_file` auto-apply (Cursor-style) except sensitive paths (`.env`, credentials, `mcp.json`, …). Folder grants always require Approve.
+
+Composer modes: **Ask** = read-only; **Plan** = research + `task_todos` until Approve (Build); **Agent** / **Debug** = full tools under Run Modes. Switching mode starts a fresh thread.
+
+**@ mentions** (composer): type `@` for `@file:path`, `@folder:path`, `@Terminals`, `@Commit`, `@Branch`, `@Chats` — attached into the turn context.
+
+**Hooks** — `.agent/hooks.json` (also `~/.agent/hooks.json`). Supports `beforeSubmitPrompt`, `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `sessionStart`, `stop`, `afterAgentResponse`. Commands get JSON on stdin; return `{ "permission": "allow"|"deny"|"ask" }`. See `.agent/hooks.json.example`.
+
+**permissions.json** — Auto-review steering + allowlists (Settings → permissions.json dashboard). Paths: `.agent/permissions.json`, `~/.agent/permissions.json`; optional `.agent/team-permissions.json` overrides local (team dashboard). See `.agent/permissions.json.example`.
 
 ### Environment
 
@@ -83,6 +103,7 @@ Workspace confinement: the agent can only read/write/exec inside the current all
 | `ROUTER_BASE_URL` | `https://api.9router.com/v1` | OpenAI-compatible base URL |
 | `ROUTER_API_KEY` | — | API key for 9router |
 | `AGENT_MODEL` | `gpt-4o` | Model id (prefer ≥256k context) |
+| `AGENT_CLASSIFIER_MODEL` | (falls back to `AGENT_MODEL`) | Cheap model for Auto-review tool classifier |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embeddings via 9router for LTM |
 | `EMBEDDING_TIMEOUT_MS` | `20000` | Abort hung embedding requests |
 | `CONTEXT_WINDOW_TOKENS` | `256000` | Effective context budget |

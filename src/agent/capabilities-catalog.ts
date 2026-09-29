@@ -56,7 +56,7 @@ const BUILTIN_TOOLS: Array<{
     name: "write_file",
     category: "Filesystem",
     description: "Create or overwrite a file.",
-    detail: "Writes within allowlisted roots. Prefer `working/` for generated artifacts.",
+    detail: "Writes within allowlisted roots. Prefer `tmp/` for generated artifacts.",
   },
   {
     id: "tool:edit_file",
@@ -325,6 +325,62 @@ const CUSTOM_TOOLS: Array<{
     detail: "AST-only update into <project>/graphify-out/ (not per session).",
   },
   {
+    id: "tool:git_status",
+    name: "git_status",
+    category: "Git",
+    description: "Branch + short git status.",
+    detail: "Prefer over raw execute('git status').",
+  },
+  {
+    id: "tool:git_diff",
+    name: "git_diff",
+    category: "Git",
+    description: "Show unstaged or staged diff.",
+    detail: "Optional path filter; staged=true for index.",
+  },
+  {
+    id: "tool:git_log",
+    name: "git_log",
+    category: "Git",
+    description: "Recent commits (oneline).",
+    detail: "Default last 10 commits.",
+  },
+  {
+    id: "tool:git_add",
+    name: "git_add",
+    category: "Git",
+    description: "Stage files for commit.",
+    detail: "Requires approval unless auto-approve.",
+  },
+  {
+    id: "tool:git_commit",
+    name: "git_commit",
+    category: "Git",
+    description: "Create a commit (no amend/force).",
+    detail: "Requires approval unless auto-approve.",
+  },
+  {
+    id: "tool:find_symbol",
+    name: "find_symbol",
+    category: "Code navigation",
+    description: "Go-to-definition (TypeScript LS or ripgrep).",
+    detail: "Uses tsconfig language service when available.",
+  },
+  {
+    id: "tool:find_references",
+    name: "find_references",
+    category: "Code navigation",
+    description: "Find all references to a symbol.",
+    detail: "TypeScript language service when available; else ripgrep -w.",
+  },
+  {
+    id: "tool:run_tests",
+    name: "run_tests",
+    category: "Verification",
+    description: "Run project tests or typecheck.",
+    detail: "Auto-detects npm scripts; use after edits.",
+  },
+  {
     id: "tool:desktop_automate",
     name: "desktop_automate",
     category: "Desktop",
@@ -488,7 +544,7 @@ function listSkills(workspaceRoot: string, disabled: Set<string>): CapabilityIte
         "",
         `- **Path**: \`.agent/skills/${rel.replaceAll(path.sep, "/")}/SKILL.md\``,
         `- **Virtual**: \`/skills/${rel.replaceAll(path.sep, "/")}/SKILL.md\``,
-        `- **Mode**: on-demand (agent must ls + read; not auto-injected)`,
+        `- **Mode**: catalog descriptions in system prompt; full body on-demand via read_file`,
         "",
         "## Skill document",
         "",
@@ -580,7 +636,7 @@ function listMcp(workspaceRoot: string, disabled: Set<string>): CapabilityItem[]
               cfg.command ? `- **Command**: \`${cfg.command} ${(cfg.args ?? []).join(" ")}\`` : "",
               cfg.url ? `- **URL**: ${cfg.url}` : "",
               "",
-              "MCP servers are listed from local config. Runtime wiring may be added later.",
+              "MCP tools from this server are loaded into the agent at runtime (names prefixed `mcp_<server>_`). Disable via Capabilities if unused.",
             ]
               .filter(Boolean)
               .join("\n"),
@@ -681,7 +737,7 @@ export function buildDisabledSkillPermissions(
   return rules;
 }
 
-/** Filter MCP server map by disabled prefs (for future MCP wiring). */
+/** Filter MCP server map by disabled prefs. */
 export function filterMcpServers<T>(
   servers: Record<string, T>,
   disabledMcpServers: Set<string>,

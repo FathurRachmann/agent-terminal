@@ -219,43 +219,15 @@ export function readWorkspacePreviewMulti(
     return Promise.resolve({ ok: false as const, error: "path required" });
   }
 
-  if (path.isAbsolute(trimmed)) {
-    const abs = path.resolve(trimmed);
-    const root = resolvedRoots.find((r) => isInsideRoot(r, abs));
-    if (root) {
-      return readWorkspacePreview(root, abs);
-    }
-    // Basename / remapped working/ fallback (Agent artifact home may be the only hit).
-    const found = resolveExistingWorkspaceFile(resolvedRoots, trimmed);
-    if (found.ok) {
-      const home = resolvedRoots.find((r) => isInsideRoot(r, found.abs));
-      if (home) return readWorkspacePreview(home, found.abs);
-    }
-    return Promise.resolve({
-      ok: false as const,
-      error: "Path escapes project folders",
-    });
-  }
-
-  for (const root of resolvedRoots) {
-    try {
-      resolveSafePath(root, trimmed);
-      return readWorkspacePreview(root, trimmed);
-    } catch {
-      /* try next */
-    }
-  }
-
+  // Resolve first (incl. absolute paths outside roots + Downloads basename),
+  // then preview. Never early-return "not found" from the first workspace root
+  // when the file actually lives elsewhere (e.g. ~/Downloads).
   const found = resolveExistingWorkspaceFile(resolvedRoots, trimmed);
-  if (found.ok) {
-    const home = resolvedRoots.find((r) => isInsideRoot(r, found.abs));
-    if (home) return readWorkspacePreview(home, found.abs);
+  if (!found.ok) {
+    return Promise.resolve({ ok: false as const, error: found.error });
   }
-
-  return Promise.resolve({
-    ok: false as const,
-    error: "Path escapes project folders",
-  });
+  // Parent dir as synthetic root so resolveSafePath accepts the absolute file.
+  return readWorkspacePreview(path.dirname(found.abs), found.abs);
 }
 
 function extOf(filePath: string): string {
@@ -499,20 +471,30 @@ export async function readWorkspacePreview(
             note: `Document too large to convert in Canvas (${meta.sizeLabel}). Open with an external app.`,
           };
         }
-        const { html } = await previewDocx(filePath);
-        return {
-          ok: true,
-          path: requestedPath,
-          basename,
-          ext,
-          kind,
-          language: "html",
-          html,
-          mime: mimeForPath(filePath),
-          size,
-          sizeLabel: formatBytes(size),
-          previewUrl: encodeAgentPreviewUrl(filePath),
-        };
+        try {
+          const { html } = await previewDocx(filePath);
+          return {
+            ok: true,
+            path: requestedPath,
+            basename,
+            ext,
+            kind,
+            language: "html",
+            html,
+            mime: mimeForPath(filePath),
+            size,
+            sizeLabel: formatBytes(size),
+            previewUrl: encodeAgentPreviewUrl(filePath),
+          };
+        } catch {
+          const meta = fileMeta(filePath, requestedPath, basename, ext, "document");
+          return {
+            ok: true,
+            ...meta,
+            language: "binary",
+            note: "Could not render .docx inline — use Open externally.",
+          };
+        }
       }
       // .doc / .rtf / .odt — show file card + streaming open, no false "docx only" error
       const meta = fileMeta(filePath, requestedPath, basename, ext, "binary");
@@ -780,8 +762,10 @@ function tryResolveExisting(
 ): string | null {
   const variants = [
     candidate,
+    path.join("tmp", path.basename(candidate)),
     path.join("working", path.basename(candidate)),
     path.basename(candidate),
+    path.join("tmp", candidate),
     path.join("working", candidate),
   ];
   for (const v of variants) {
@@ -801,7 +785,11 @@ function listRecentDeliverables(
   workspaceRoot: string,
   maxAgeMs: number,
 ): Array<{ path: string; mtime: number }> {
-  const roots = [workspaceRoot, path.join(workspaceRoot, "working")];
+  const roots = [
+    workspaceRoot,
+    path.join(workspaceRoot, "tmp"),
+    path.join(workspaceRoot, "working"),
+  ];
   const found: Array<{ path: string; mtime: number }> = [];
   const now = Date.now();
   for (const dir of roots) {

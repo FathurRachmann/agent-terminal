@@ -373,7 +373,40 @@ export function ActivityCanvas({
           <div className="p-3 text-[10.5px] text-muted">Loading preview…</div>
         )}
         {!loading && payload && !payload.ok && (
-          <div className="p-3 text-[10.5px] text-danger">{payload.error}</div>
+          <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+            <div className="text-[10.5px] text-danger">
+              {payload.error || "Preview failed"}
+            </div>
+            {active?.path ? (
+              <>
+                <div className="max-w-sm break-all font-mono text-[9.5px] text-muted">
+                  {active.path}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    className="rounded-md bg-accent px-2.5 py-1.5 text-[10px] font-semibold text-surface-0"
+                    onClick={() =>
+                      void window.electronAgent?.openWorkspaceFile?.(active.path)
+                    }
+                  >
+                    Open externally
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-md border border-border bg-surface-2 px-2.5 py-1.5 text-[10px] text-fg"
+                    onClick={() =>
+                      void window.electronAgent?.revealWorkspaceFile?.(
+                        active.path,
+                      )
+                    }
+                  >
+                    Show in folder
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </div>
         )}
         {!loading && payload?.ok && payload.note && !text && !payload.html && !sheets.length && !payload.previewUrl && !payload.dataUrl && kind !== "binary" && (
           <div className="p-3 text-[10.5px] text-muted">{payload.note}</div>

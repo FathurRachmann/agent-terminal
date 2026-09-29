@@ -4,55 +4,44 @@ type Props = {
   attachments: UserBubbleAttachment[];
 };
 
-/** Image / file previews inside a sent user bubble. */
+function formatSize(bytes?: number): string | null {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return null;
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** Image / file chips inside a sent user bubble — Figma attach tray. */
 export function UserBubbleAttachments({ attachments }: Props) {
   if (!attachments.length) return null;
   return (
-    <div className="mb-2 flex flex-col gap-2">
+    <div className="chat-attach-row">
       {attachments.map((a) => {
         const key = a.path || a.basename;
-        if (a.kind === "image") {
+        const size = formatSize(a.size);
+        if (a.kind === "image" && a.previewUrl) {
           return (
-            <div
-              key={key}
-              className="overflow-hidden rounded-xl border border-accent/20 bg-black/25"
-              title={a.absPath || a.path}
-            >
-              {a.previewUrl ? (
-                <img
-                  src={a.previewUrl}
-                  alt={a.basename}
-                  className="max-h-56 max-w-full object-contain"
-                />
-              ) : (
-                <div className="flex items-center gap-2 px-3 py-2.5 text-[11px] text-fg-dim">
-                  <span className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-surface-2 text-[9px] font-semibold tracking-wide text-accent">
-                    IMG
-                  </span>
-                  <span className="min-w-0 truncate">{a.label || a.basename}</span>
-                </div>
-              )}
+            <div key={key} title={a.absPath || a.path}>
+              <img
+                src={a.previewUrl}
+                alt={a.basename}
+                className="chat-attach-img"
+              />
             </div>
           );
         }
         return (
-          <div
+          <span
             key={key}
-            className="flex items-center gap-2 rounded-xl border border-accent/20 bg-black/20 px-2.5 py-2"
+            className="chat-attach-chip"
             title={a.absPath || a.path}
           >
-            <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-surface-2 text-[9px] font-semibold tracking-wide text-muted">
-              FILE
+            <span className="material-symbols-outlined">
+              {a.kind === "image" ? "image" : "description"}
             </span>
-            <div className="min-w-0">
-              <div className="truncate text-[11px] font-medium text-fg">
-                {a.label || a.basename}
-              </div>
-              <div className="truncate font-mono text-[9.5px] text-muted">
-                {a.path}
-              </div>
-            </div>
-          </div>
+            <span className="chat-attach-name">{a.label || a.basename}</span>
+            {size ? <span className="chat-attach-size">{size}</span> : null}
+          </span>
         );
       })}
     </div>

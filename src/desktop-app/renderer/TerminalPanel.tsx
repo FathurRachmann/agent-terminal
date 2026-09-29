@@ -281,12 +281,20 @@ export function TerminalPanel({
       cursorBlink: true,
       fontSize: 12,
       fontFamily:
-        '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+        '"Space Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
       theme: {
-        background: "#0a0a0b",
-        foreground: "#c8c8d0",
-        cursor: "#c8c8d0",
-        selectionBackground: "#2a3f5f",
+        background: "#0c0e11",
+        foreground: "#e2e2e6",
+        cursor: "#4cd7f6",
+        selectionBackground: "#333538",
+        black: "#0c0e11",
+        red: "#ffb4ab",
+        green: "#4edea3",
+        yellow: "#e3b341",
+        blue: "#4cd7f6",
+        magenta: "#c0c1ff",
+        cyan: "#acedff",
+        white: "#e2e2e6",
       },
       allowProposedApi: true,
     });
@@ -393,7 +401,7 @@ export function TerminalPanel({
 
   return (
     <div
-      className={`relative flex shrink-0 flex-col border-t border-border bg-surface-0 ${
+      className={`relative flex shrink-0 flex-col bg-surface-0 ${
         open ? "" : "hidden"
       }`}
       style={{ height: open ? height : 0 }}
@@ -417,10 +425,16 @@ export function TerminalPanel({
 
       <div className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-border/80 px-3">
+          <div className="flex h-7 shrink-0 items-center justify-between gap-2 bg-surface-2 px-3">
             <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
               {DECK_TABS.map((tab) => {
                 const active = deckTab === tab.id;
+                const label =
+                  tab.id === "terminal"
+                    ? `TERMINAL (${sessions.length || 1})`
+                    : tab.id === "pty"
+                      ? "PTY Sandbox"
+                      : "LOG Stream";
                 return (
                   <button
                     key={tab.id}
@@ -428,13 +442,23 @@ export function TerminalPanel({
                     data-tip={tab.tip}
                     data-tip-pos="bottom"
                     onClick={() => setDeckTab(tab.id)}
-                    className={`shrink-0 rounded px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase ${
+                    className={`flex shrink-0 items-center gap-1.5 px-3 py-0.5 font-mono text-[11px] font-bold transition ${
                       active
-                        ? "bg-surface-2 text-fg"
-                        : "text-muted hover:text-fg"
+                        ? "bg-surface-1 text-accent"
+                        : "bg-surface-2 text-fg-dim hover:text-fg"
                     }`}
                   >
-                    {tab.label}
+                    <span className="material-symbols-outlined text-[13px]">
+                      {tab.id === "terminal"
+                        ? "terminal"
+                        : tab.id === "pty"
+                          ? "developer_board"
+                          : "receipt_long"}
+                    </span>
+                    {label}
+                    {active && tab.id === "terminal" ? (
+                      <span className="h-1.5 w-1.5 bg-tertiary" />
+                    ) : null}
                   </button>
                 );
               })}
@@ -444,7 +468,7 @@ export function TerminalPanel({
                       key={s.id}
                       type="button"
                       onClick={() => setActiveId(s.id)}
-                      className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[9.5px] ${
+                      className={`shrink-0 px-1.5 py-0.5 font-mono text-[9.5px] ${
                         s.id === activeId
                           ? "bg-accent/20 text-accent"
                           : "text-muted hover:text-fg"
@@ -456,14 +480,34 @@ export function TerminalPanel({
                   ))
                 : null}
             </div>
-            <button
-              type="button"
-              onClick={onClose}
-              data-tip="Hide terminal"
-              className="rounded px-2 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg"
-            >
-              ✕
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={clearScreen}
+                className="bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] text-fg-dim hover:text-fg"
+                data-tip="Clear Buffer"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={() => void killActive()}
+                className="bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] text-danger hover:bg-danger hover:text-surface-0"
+                data-tip="Send SIGKILL"
+              >
+                Kill
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                data-tip="Hide terminal"
+                className="p-0.5 text-fg-dim hover:text-fg"
+              >
+                <span className="material-symbols-outlined text-[14px]">
+                  close
+                </span>
+              </button>
+            </div>
           </div>
 
           <div className="relative min-h-0 flex-1">

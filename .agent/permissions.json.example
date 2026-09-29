@@ -1,0 +1,12 @@
+{
+  "terminalAllowlist": ["git status", "git diff", "npm test", "npm run test"],
+  "mcpAllowlist": [],
+  "autoRun": {
+    "allow_instructions": [
+      "Allow routine git status, git diff, and project test scripts"
+    ],
+    "block_instructions": [
+      "Always ask before rm -rf, curl|sh, or force push"
+    ]
+  }
+}

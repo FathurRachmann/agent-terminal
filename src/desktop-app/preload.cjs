@@ -1,12 +1,16 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAgent", {
-  sendPrompt: (prompt, attachments) =>
+  sendPrompt: (prompt, attachments, options) =>
     ipcRenderer.invoke(
       "agent:sendPrompt",
-      attachments?.length
-        ? { prompt, attachments }
-        : prompt,
+      typeof prompt === "object" && prompt !== null && !Array.isArray(prompt)
+        ? prompt
+        : {
+            prompt,
+            attachments: attachments || [],
+            ...(options && typeof options === "object" ? options : {}),
+          },
     ),
   pickAttachments: (options) =>
     ipcRenderer.invoke("agent:pickAttachments", options || {}),
@@ -25,6 +29,8 @@ contextBridge.exposeInMainWorld("electronAgent", {
   selfHeal: (payload) => ipcRenderer.invoke("agent:selfHeal", payload || {}),
   selfHealStatus: () => ipcRenderer.invoke("agent:selfHealStatus"),
   getStatus: () => ipcRenderer.invoke("agent:getStatus"),
+  setPrivacyMode: (enabled) =>
+    ipcRenderer.invoke("agent:setPrivacyMode", { enabled: Boolean(enabled) }),
   getGitSummary: () => ipcRenderer.invoke("agent:getGitSummary"),
   listGitBranches: () => ipcRenderer.invoke("agent:listGitBranches"),
   checkoutGitBranch: (branch) =>
@@ -35,8 +41,13 @@ contextBridge.exposeInMainWorld("electronAgent", {
   getSettings: () => ipcRenderer.invoke("agent:getSettings"),
   updateSettings: (payload) =>
     ipcRenderer.invoke("agent:updateSettings", payload || {}),
+  searchMentionPaths: (query) =>
+    ipcRenderer.invoke("agent:searchMentionPaths", { query: query || "" }),
+  getPermissions: () => ipcRenderer.invoke("agent:getPermissions"),
+  updatePermissions: (payload) =>
+    ipcRenderer.invoke("agent:updatePermissions", payload || {}),
   listSessions: () => ipcRenderer.invoke("agent:listSessions"),
-  newSession: () => ipcRenderer.invoke("agent:newSession"),
+  newSession: (opts) => ipcRenderer.invoke("agent:newSession", opts || {}),
   openSession: (threadId) => ipcRenderer.invoke("agent:openSession", threadId),
   clearSession: (threadId) => ipcRenderer.invoke("agent:clearSession", threadId),
   deleteSession: (threadId) =>

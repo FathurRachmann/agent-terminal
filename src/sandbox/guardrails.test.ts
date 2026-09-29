@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { checkCommand, checkCommandWorkspaceAccess, isPathInsideWorkspace } from "./guardrails.js";
+import {
+  checkCommand,
+  checkCommandWorkspaceAccess,
+  ensureLsLongListing,
+  isPathInsideWorkspace,
+} from "./guardrails.js";
 import { truncateOutput } from "./pty-sandbox.js";
 
 describe("checkCommand", () => {
@@ -28,6 +33,28 @@ describe("checkCommand", () => {
   });
 });
 
+describe("ensureLsLongListing", () => {
+  it("upgrades bare ls to ls -la", () => {
+    assert.equal(ensureLsLongListing("ls"), "ls -la");
+    assert.equal(
+      ensureLsLongListing("ls /Users/me/Downloads"),
+      "ls -la /Users/me/Downloads",
+    );
+  });
+
+  it("leaves ls -la / ls -l alone", () => {
+    assert.equal(ensureLsLongListing("ls -la"), "ls -la");
+    assert.equal(ensureLsLongListing("ls -l /tmp"), "ls -l /tmp");
+    assert.equal(ensureLsLongListing("ls -A"), "ls -A");
+  });
+
+  it("upgrades ls in chained commands", () => {
+    assert.equal(
+      ensureLsLongListing("cd /tmp && ls"),
+      "cd /tmp && ls -la",
+    );
+  });
+});
 describe("isPathInsideWorkspace", () => {
   it("rejects path traversal", () => {
     assert.equal(isPathInsideWorkspace("/tmp/ws", "../etc/passwd"), false);

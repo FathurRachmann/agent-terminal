@@ -168,7 +168,7 @@ export function deterministicGuideline(
   ) {
     return build(
       "the user names a folder outside the current allowlist",
-      "call request_folder_access and wait for y/n approval before reading or writing there",
+      "call request_folder_access immediately (opens Approve/Deny UI) — never rely on chat-only permission",
     );
   }
 

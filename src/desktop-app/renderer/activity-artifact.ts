@@ -154,8 +154,8 @@ export function normalizeCanvasKey(path: string): string {
     .replace(/\\/g, "/")
     .replace(/^\.\//, "");
   if (!cleaned) return cleaned;
-  const working = cleaned.match(/(?:^|\/)(working\/[^?#]+)$/i);
-  if (working?.[1]) return working[1].toLowerCase();
+  const artifact = cleaned.match(/(?:^|\/)((?:tmp|working)\/[^?#]+)$/i);
+  if (artifact?.[1]) return artifact[1].toLowerCase();
   const base = basenamePath(cleaned).toLowerCase();
   const kind = inferPreviewKind(extensionOf(cleaned));
   if (canvasResultRank(kind) >= 60) return `deliverable:${base}`;
@@ -171,7 +171,11 @@ export function preferCanvasPath(current: string, next: string): string {
   const score = (p: string) => {
     let s = 0;
     if (p.startsWith("/") || /^[a-z]:\//i.test(p)) s += 4;
-    if (/\/working\//i.test(p) || /^working\//i.test(p)) s += 2;
+    if (
+      /\/(?:tmp|working)\//i.test(p) ||
+      /^(?:tmp|working)\//i.test(p)
+    )
+      s += 2;
     s += Math.min(p.length, 200) / 200;
     return s;
   };

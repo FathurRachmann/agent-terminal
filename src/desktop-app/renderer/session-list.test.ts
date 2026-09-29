@@ -67,7 +67,7 @@ describe("session-list", () => {
 
   it("builds clean preview labels from attachment prompts", () => {
     const raw = `[ATTACHMENTS]
-- IMAGE: \`working/uploads/shot.png\` (image/png, 1 bytes).
+- IMAGE: \`tmp/uploads/shot.png\` (image/png, 1 bytes).
 [/ATTACHMENTS]
 
 [USER]

@@ -79,8 +79,8 @@ export function sortBotsForBroadcast(bots: WorkspaceBot[]): WorkspaceBot[] {
 }
 
 /**
- * Heuristic router: score bots by keyword overlap with name/role/description.
- * Used when no @mentions and replyMode is auto. Falls back to first bot.
+ * Heuristic router: score bots by keyword overlap with name/role/description/
+ * skills/tools. Used when no @mentions and replyMode is auto. Falls back to first bot.
  */
 export function heuristicRouteBots(
   message: string,
@@ -94,15 +94,33 @@ export function heuristicRouteBots(
   }
 
   const scored = bots.map((bot) => {
-    const hay = tokenize(
-      `${bot.id} ${bot.name} ${bot.role ?? ""} ${bot.description} ${bot.systemPrompt ?? ""}`,
-    );
+    const capabilityBlob = [
+      bot.id,
+      bot.name,
+      bot.role ?? "",
+      bot.description,
+      bot.systemPrompt ?? "",
+      ...(bot.skills ?? []),
+      ...(bot.tools ?? []),
+    ].join(" ");
+    const hay = tokenize(capabilityBlob);
     let score = 0;
     for (const t of hay) {
       if (tokens.has(t)) score += 1;
     }
-    const blob = `${bot.role ?? ""} ${bot.description}`.toLowerCase();
-    if (/front|ui|react|css/.test(message.toLowerCase()) && /front|fe|ui/.test(blob))
+    // Strong boost when message tokens hit declared skills/tools directly.
+    for (const skill of bot.skills ?? []) {
+      for (const t of tokenize(skill)) {
+        if (tokens.has(t)) score += 2;
+      }
+    }
+    for (const tool of bot.tools ?? []) {
+      for (const t of tokenize(tool)) {
+        if (tokens.has(t)) score += 2;
+      }
+    }
+    const blob = `${bot.role ?? ""} ${bot.description} ${(bot.skills ?? []).join(" ")}`.toLowerCase();
+    if (/front|ui|react|css/.test(message.toLowerCase()) && /front|fe|ui|react/.test(blob))
       score += 3;
     if (/back|api|database|server/.test(message.toLowerCase()) && /back|be|api/.test(blob))
       score += 3;
@@ -231,14 +249,15 @@ export async function llmRouteBots(options: {
   const { message, bots, maxResponders, invoke, semanticCache } = options;
   if (bots.length === 0) return [];
   const catalog = bots
-    .map(
-      (b) =>
-        `- id=${b.id} name=${b.name} role=${b.role ?? ""} desc=${b.description}`,
-    )
+    .map((b) => {
+      const skills = (b.skills ?? []).join(",") || "-";
+      const tools = (b.tools ?? []).join(",") || "-";
+      return `- id=${b.id} name=${b.name} role=${b.role ?? ""} desc=${b.description} skills=${skills} tools=${tools}`;
+    })
     .join("\n");
-  const system = `You route messages in a company division group chat to the best teammate bots.
+  const system = `You route messages in a company division group chat to the best teammate bots by role, skills, and tools.
 Return ONLY a JSON array of bot ids (max ${maxResponders}), e.g. ["fe","qa"].
-Valid ids: ${bots.map((b) => b.id).join(", ")}`;
+Prefer the fewest bots that cover the request. Valid ids: ${bots.map((b) => b.id).join(", ")}`;
   const user = `Bots:\n${catalog}\n\nMessage:\n${message}`;
 
   const compute = async (): Promise<string[]> => {
@@ -287,7 +306,30 @@ export async function buildReplyQueueWithOptionalLlm(options: {
   semanticCache?: LlmRouteSemanticCache;
 }): Promise<ReplyQueueResult> {
   const base = buildReplyQueue(options);
-  if (base.source !== "router" || !options.llmInvoke) return base;
+  if (base.source !== "router") return base;
+
+  // Prefer decision engine (Laya / heuristic) before burning an LLM call.
+  try {
+    const { routeBotsWithDecisionEngine } = await import(
+      "../../decision/route-bots.js"
+    );
+    const decided = await routeBotsWithDecisionEngine({
+      message: options.message,
+      bots: options.bots,
+      maxResponders: options.maxResponders,
+    });
+    if (decided?.botIds.length) {
+      return {
+        botIds: decided.botIds,
+        source: "router",
+        reason: decided.reason,
+      };
+    }
+  } catch {
+    /* fail open to LLM / heuristic */
+  }
+
+  if (!options.llmInvoke) return base;
   const botIds = await llmRouteBots({
     message: options.message,
     bots: options.bots,
@@ -297,7 +339,9 @@ export async function buildReplyQueueWithOptionalLlm(options: {
   });
   return {
     botIds,
-    source: "router",
-    reason: `LLM/heuristic router: ${botIds.join(", ") || "(none)"}`,
+    source: botIds.length ? "router" : "none",
+    reason: botIds.length
+      ? `LLM router selected: ${botIds.join(", ")}`
+      : "No bots available",
   };
 }

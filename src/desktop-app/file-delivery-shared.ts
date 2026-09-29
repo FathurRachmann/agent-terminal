@@ -139,7 +139,7 @@ export function isProseFalsePositivePath(filePath: string): boolean {
 
 /**
  * Paths safe to show as in-chat file chips (not every `.js` mention in prose).
- * Always prefer `working/` / absolute artifact paths / document-like extensions.
+ * Always prefer `tmp/` (legacy `working/`) / absolute artifact paths / document-like extensions.
  */
 export function isChatFileChipPath(filePath: string): boolean {
   const p = String(filePath || "")
@@ -153,7 +153,13 @@ export function isChatFileChipPath(filePath: string): boolean {
   const ext = dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
   if (!CHAT_CHIP_EXTS.has(ext)) return false;
 
-  if (/^working\//i.test(p) || p.includes("/working/")) return true;
+  if (
+    /^tmp\//i.test(p) ||
+    p.includes("/tmp/") ||
+    /^working\//i.test(p) ||
+    p.includes("/working/")
+  )
+    return true;
   if (p.startsWith("/")) return true;
   if (p.includes("/")) return true;
   // Bare `report.pdf` / `diagram.mmd` OK; bare `middleware.js` already rejected.
@@ -234,7 +240,35 @@ export function collectDeliverablePaths(
     seen.add(norm);
     out.push(norm);
   }
-  return out;
+  return dropTruncatedBasenames(out);
+}
+
+/**
+ * Drop bare basenames that are suffixes of a longer collected path
+ * (e.g. "Digital.pdf" when "Kata Kami- … Pemerintah Digital.pdf" is present).
+ */
+export function dropTruncatedBasenames(paths: string[]): string[] {
+  return paths.filter((p) => {
+    const base = p.split("/").pop() || p;
+    if (base.includes("/") || !base.includes(".")) return true;
+    // Keep paths with directories.
+    if (p.includes("/")) return true;
+    return !paths.some((other) => {
+      if (other === p) return false;
+      const otherBase = other.split("/").pop() || other;
+      if (otherBase === base) return false;
+      return (
+        otherBase.endsWith(`/${base}`) ||
+        otherBase.endsWith(` ${base}`) ||
+        otherBase.endsWith(`-${base}`) ||
+        otherBase.endsWith(` - ${base}`) ||
+        other.endsWith(`/${base}`) ||
+        other.endsWith(` ${base}`) ||
+        other.endsWith(`-${base}`) ||
+        other.endsWith(` - ${base}`)
+      );
+    });
+  });
 }
 
 /** Paths for in-chat file cards — stricter than WhatsApp path scrape. */

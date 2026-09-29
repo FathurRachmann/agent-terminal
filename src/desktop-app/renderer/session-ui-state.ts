@@ -3,7 +3,10 @@ import {
   resolveFinalAssistantText,
   shouldRenderAsReasoning,
 } from "../../agent/sanitize-output.js";
-import { isPlanApprovalInterrupt } from "../../agent/interrupt-utils.js";
+import {
+  formatToolApprovalDetail,
+  isPlanApprovalInterrupt,
+} from "../../agent/interrupt-utils.js";
 import type { CanvasTab } from "./ActivityCanvas.js";
 import {
   formatPlanApprovalMarkdown,
@@ -45,7 +48,13 @@ export type ChatItem =
       at: string;
       note?: string;
     }
-  | { id: string; kind: "trace"; event: AgentUiEvent; at: string };
+  | {
+      id: string;
+      kind: "trace";
+      event: AgentUiEvent;
+      at: string;
+      toolInput?: unknown;
+    };
 
 export type ActivityRow = { id: string; event: AgentUiEvent; at: string };
 
@@ -57,6 +66,9 @@ export type SessionUiSnap = {
   planApprovalPending: boolean;
   /** Markdown shown in chat PlanApprovalCard while waiting for Approve. */
   pendingPlanMarkdown: string | null;
+  /** Non-plan HITL (folder access, execute, etc.). */
+  toolApprovalPending: boolean;
+  toolApprovalDetail: string | null;
   canvasTabs: CanvasTab[];
   activeCanvasId: string | null;
   railLayer: "canvas" | "files";
@@ -84,6 +96,8 @@ export function emptySessionSnap(
     phase: "boot",
     planApprovalPending: false,
     pendingPlanMarkdown: null,
+    toolApprovalPending: false,
+    toolApprovalDetail: null,
     canvasTabs: [],
     activeCanvasId: null,
     railLayer: "canvas",
@@ -118,7 +132,16 @@ export function reduceSessionEvent(
       next = {
         ...next,
         planApprovalPending: true,
+        toolApprovalPending: false,
+        toolApprovalDetail: null,
         railLayer: "canvas",
+      };
+    } else if (event.phase === "waiting_approval") {
+      next = {
+        ...next,
+        toolApprovalPending: true,
+        toolApprovalDetail:
+          String(event.detail || "").trim() || "Tool approval required",
       };
     }
     if (event.phase === "done" || event.phase === "error") {
@@ -129,6 +152,8 @@ export function reduceSessionEvent(
           ...next,
           planApprovalPending: false,
           pendingPlanMarkdown: null,
+          toolApprovalPending: false,
+          toolApprovalDetail: null,
           loading: false,
         };
       } else {
@@ -143,12 +168,22 @@ export function reduceSessionEvent(
     }
   }
 
-  if (event.type === "interrupt" && isPlanApprovalInterrupt(event.payload)) {
-    next = {
-      ...next,
-      planApprovalPending: true,
-      railLayer: "canvas",
-    };
+  if (event.type === "interrupt") {
+    if (isPlanApprovalInterrupt(event.payload)) {
+      next = {
+        ...next,
+        planApprovalPending: true,
+        toolApprovalPending: false,
+        toolApprovalDetail: null,
+        railLayer: "canvas",
+      };
+    } else {
+      next = {
+        ...next,
+        toolApprovalPending: true,
+        toolApprovalDetail: formatToolApprovalDetail(event.payload),
+      };
+    }
   }
 
   if (event.type === "token") {
@@ -169,11 +204,11 @@ export function reduceSessionEvent(
         at,
         label: "Model notice",
       });
-    } else {
+    } else if (finalText) {
       items.push({
         id,
         kind: "assistant",
-        text: finalText || "(empty response)",
+        text: finalText,
         at,
       });
     }
@@ -218,6 +253,19 @@ export function reduceSessionEvent(
 
   if (event.type === "tool_start") {
     next.pendingTools.push({ name: event.name, input: event.input });
+    next = {
+      ...next,
+      items: [
+        ...next.items,
+        {
+          id: `t-${id}`,
+          kind: "trace",
+          event,
+          at,
+          toolInput: event.input,
+        },
+      ],
+    };
   }
 
   if (event.type === "tool_end") {
@@ -230,18 +278,42 @@ export function reduceSessionEvent(
         break;
       }
     }
-    const synthetic: AgentUiEvent = {
-      type: "tool_start",
+    const endEvent: AgentUiEvent = {
+      type: "tool_end",
       name: event.name,
-      input,
+      output: event.output,
     };
+    const items = [...next.items];
+    let upgraded = false;
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const row = items[i];
+      if (
+        row?.kind === "trace" &&
+        row.event.type === "tool_start" &&
+        row.event.name === event.name
+      ) {
+        items[i] = {
+          ...row,
+          event: endEvent,
+          toolInput: row.toolInput ?? input,
+        };
+        upgraded = true;
+        break;
+      }
+    }
+    if (!upgraded) {
+      items.push({
+        id: `t-${id}`,
+        kind: "trace",
+        event: endEvent,
+        at,
+        toolInput: input,
+      });
+    }
     next = {
       ...next,
       pendingTools: pending,
-      items: [
-        ...next.items,
-        { id: `t-${id}`, kind: "trace", event: synthetic, at },
-      ],
+      items,
     };
 
     const artifacts = resolveArtifactsFromTool({

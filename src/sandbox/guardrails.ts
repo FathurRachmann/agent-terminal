@@ -63,6 +63,27 @@ export function checkCommand(command: string): GuardrailDecision {
   return { ok: true, requiresApproval: false };
 }
 
+/**
+ * Default bare `ls` to `ls -la` so listings always include hidden files
+ * and long metadata (mode, nlink, owner, size, mtime).
+ * Leaves commands alone when `-l` / `-A` / `-a` is already present on that `ls`.
+ */
+export function ensureLsLongListing(command: string): string {
+  if (!command || !/\bls\b/.test(command)) return command;
+
+  // Split on common shell statement separators while keeping delimiters.
+  const parts = command.split(/(\s*(?:&&|\|\||;|\n)\s*)/);
+  return parts
+    .map((part) => {
+      const m = part.match(/^(\s*)ls(\s+|$)/);
+      if (!m) return part;
+      // Already a long / almost-all listing.
+      if (/(?:^|\s)-[a-zA-Z]*[lAa]/.test(part)) return part;
+      return `${m[1]}ls -la${m[2] ?? ""}` + part.slice(m[0].length);
+    })
+    .join("");
+}
+
 export function resolveWorkspacePath(
   workspaceRoot: string,
   candidate: string,

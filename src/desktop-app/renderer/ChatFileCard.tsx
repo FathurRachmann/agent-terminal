@@ -2,68 +2,93 @@ type Props = {
   path: string;
   basename?: string;
   note?: string;
+  sizeLabel?: string;
+  hashLabel?: string;
   onOpen: () => void;
   onSaveAs: () => void;
   onReveal?: () => void;
 };
 
-/** In-chat file delivery card (agent → user). */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function extIcon(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  if (ext === "pdf") return "picture_as_pdf";
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "image";
+  if (["md", "txt", "doc", "docx"].includes(ext)) return "description";
+  if (["ts", "tsx", "js", "jsx", "py", "go", "rs"].includes(ext)) return "code";
+  return "draft";
+}
+
+/** In-chat file delivery card (agent → user) — Figma deliverable. */
 export function ChatFileCard({
   path: filePath,
   basename,
   note,
+  sizeLabel,
+  hashLabel,
   onOpen,
   onSaveAs,
   onReveal,
 }: Props) {
   const name = basename || filePath.split(/[/\\]/).pop() || filePath;
+  const metaParts = [
+    sizeLabel,
+    hashLabel,
+    !sizeLabel && !hashLabel ? note || filePath : null,
+  ].filter(Boolean);
+
   return (
-    <div className="min-w-0 w-full max-w-[90%] self-start">
-      <div className="mb-1 text-[9.5px] text-muted">File from agent</div>
-      <div className="overflow-hidden rounded-2xl rounded-bl-md border border-accent/35 bg-surface-3">
-        <div className="flex items-start gap-3 px-3.5 py-3">
-          <div
-            className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-surface-2 text-[10px] font-semibold tracking-wide text-accent"
-            aria-hidden
-          >
-            FILE
+    <div className="chat-file">
+      <div className="chat-file-main">
+        <div className="chat-file-icon" aria-hidden>
+          <span className="material-symbols-outlined">{extIcon(name)}</span>
+        </div>
+        <div className="min-w-0">
+          <div className="chat-file-name-row">
+            <span className="chat-file-name">{name}</span>
+            <span className="chat-file-badge">GEN COMPLETED</span>
           </div>
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-[12px] font-medium text-fg">{name}</div>
-            <div className="mt-0.5 truncate font-mono text-[10px] text-muted">
-              {filePath}
-            </div>
-            {note ? (
-              <div className="mt-1 text-[10px] text-muted">{note}</div>
-            ) : null}
+          <div className="chat-file-meta" title={filePath}>
+            {metaParts.join(" • ")}
           </div>
         </div>
-        <div className="flex flex-wrap gap-2 border-t border-border bg-surface-2 px-3 py-2">
+      </div>
+      <div className="chat-file-actions">
+        <button type="button" onClick={onOpen} className="chat-file-open">
+          <span className="material-symbols-outlined text-[12px]">
+            dashboard
+          </span>
+          Open in Canvas
+        </button>
+        <button
+          type="button"
+          onClick={onSaveAs}
+          className="chat-file-icon-btn"
+          title="Save as…"
+          aria-label="Save as"
+        >
+          <span className="material-symbols-outlined text-[14px]">download</span>
+        </button>
+        {onReveal ? (
           <button
             type="button"
-            onClick={onOpen}
-            className="rounded-md bg-accent px-2.5 py-1.5 text-[10px] font-semibold text-surface-0"
+            onClick={onReveal}
+            className="chat-file-icon-btn"
+            title="Show in folder"
+            aria-label="Show in folder"
           >
-            Open
+            <span className="material-symbols-outlined text-[14px]">folder</span>
           </button>
-          <button
-            type="button"
-            onClick={onSaveAs}
-            className="rounded-md border border-border px-2.5 py-1.5 text-[10px] text-fg hover:bg-surface-1"
-          >
-            Save as…
-          </button>
-          {onReveal ? (
-            <button
-              type="button"
-              onClick={onReveal}
-              className="rounded-md border border-border px-2.5 py-1.5 text-[10px] text-muted hover:text-fg"
-            >
-              Show in folder
-            </button>
-          ) : null}
-        </div>
+        ) : null}
       </div>
     </div>
   );
 }
+
+export { formatBytes };

@@ -8,8 +8,13 @@ import {
   truncateMiddle,
   truncatePath,
 } from "./composer-attachments.js";
+import {
+  ContextMentionSuggest,
+  contextMentionQueryFromValue,
+} from "./ContextMentionSuggest.js";
+import type { MentionSuggestItem } from "./mention-suggest-static.js";
 
-export type ComposerMode = "Rotating" | "Auto" | "Fixed" | "Chat" | "Coding";
+export type ComposerMode = "agent" | "ask" | "plan" | "debug";
 export type ComposerEffort =
   | "Minimal"
   | "Low"
@@ -55,7 +60,12 @@ type Props = {
   loading?: boolean;
   placeholder?: string;
   modelLabel?: string;
-  contextLabel?: string;
+  /** Repo / workspace short name for the bottom chrome strip. */
+  repoLabel?: string;
+  /** e.g. "128k / 200k tokens" */
+  tokenLabel?: string;
+  /** e.g. "$0.042 est" */
+  costLabel?: string;
   git?: GitChrome | null;
   mode: ComposerMode;
   effort: ComposerEffort;
@@ -78,7 +88,13 @@ type Props = {
   onDropActiveChange?: (active: boolean) => void;
 };
 
-const MODES: ComposerMode[] = ["Rotating", "Chat", "Coding", "Auto", "Fixed"];
+const MODES: ComposerMode[] = ["agent", "ask", "plan", "debug"];
+const MODE_LABELS: Record<ComposerMode, string> = {
+  agent: "Agent",
+  ask: "Ask",
+  plan: "Plan",
+  debug: "Debug",
+};
 const EFFORTS: Array<{ id: ComposerEffort; label: string; short: string }> = [
   { id: "Minimal", label: "Minimal", short: "Min" },
   { id: "Low", label: "Low", short: "Low" },
@@ -102,13 +118,13 @@ const PROMPT_SNIPPETS = [
   },
   {
     id: "explain",
-    label: "Explain this area",
-    text: "Explain how this part of the codebase works, with key files and flow.",
+    label: "Explain race condition",
+    text: "Explain the race condition risk in this area and how to fix it safely.",
   },
 ];
 
-function effortShort(effort: ComposerEffort): string {
-  return EFFORTS.find((e) => e.id === effort)?.short ?? "Med";
+function effortLabel(effort: ComposerEffort): string {
+  return EFFORTS.find((e) => e.id === effort)?.label ?? "Medium";
 }
 
 function toComposerAttachment(f: ImportedFile): ComposerAttachment {
@@ -233,8 +249,12 @@ export function ChatComposer({
   value,
   disabled,
   loading,
-  placeholder = "What should we tackle?",
+  placeholder = "Direct terminal agent or ask architecture refactoring instructions...",
   modelLabel,
+  repoLabel,
+  tokenLabel,
+  costLabel,
+  git = null,
   mode,
   effort,
   voiceMuted,
@@ -256,11 +276,15 @@ export function ChatComposer({
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const mentionKeyRef = useRef<((e: React.KeyboardEvent) => boolean) | null>(
+    null,
+  );
   const dragDepthRef = useRef(0);
   const [menu, setMenu] = useState<"attach" | "mode" | "effort" | null>(null);
   const [modelQuery, setModelQuery] = useState("");
   const [localDrop, setLocalDrop] = useState(false);
   const [busyAttach, setBusyAttach] = useState(false);
+  const [fileHits, setFileHits] = useState<MentionSuggestItem[]>([]);
 
   const clearDropUi = () => {
     dragDepthRef.current = 0;
@@ -269,10 +293,48 @@ export function ChatComposer({
   };
 
   useEffect(() => {
+    const q = contextMentionQueryFromValue(value);
+    if (q === null) {
+      setFileHits([]);
+      return;
+    }
+    let cancelled = false;
+    const handle = window.setTimeout(() => {
+      void (async () => {
+        const api = (
+          window as unknown as {
+            electronAgent?: {
+              searchMentionPaths?: (query: string) => Promise<{
+                ok: boolean;
+                items?: MentionSuggestItem[];
+              }>;
+            };
+          }
+        ).electronAgent;
+        if (!api?.searchMentionPaths) return;
+        const res = await api.searchMentionPaths(q);
+        if (!cancelled && res?.ok && Array.isArray(res.items)) {
+          setFileHits(res.items);
+        }
+      })();
+    }, 120);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [value]);
+
+  const pickMention = (insert: string) => {
+    const replaced = value.replace(/(^|\s)@[^\s]*$/, `$1${insert}`);
+    onChange(replaced);
+    taRef.current?.focus();
+  };
+
+  useEffect(() => {
     const el = taRef.current;
     if (!el) return;
     el.style.height = "0px";
-    el.style.height = `${Math.min(140, Math.max(22, el.scrollHeight))}px`;
+    el.style.height = `${Math.min(140, Math.max(48, el.scrollHeight))}px`;
   }, [value]);
 
   useEffect(() => {
@@ -313,7 +375,11 @@ export function ChatComposer({
   const filteredModes = useMemo(() => {
     const q = modelQuery.trim().toLowerCase();
     if (!q) return MODES;
-    return MODES.filter((m) => m.toLowerCase().includes(q));
+    return MODES.filter(
+      (m) =>
+        m.toLowerCase().includes(q) ||
+        (MODE_LABELS[m] ?? "").toLowerCase().includes(q),
+    );
   }, [modelQuery]);
 
   // Overlay text only while THIS composer is the drop target — not parent column state
@@ -538,9 +604,7 @@ export function ChatComposer({
   return (
     <div
       ref={rootRef}
-      className={`composer-shell relative rounded-xl border border-border-strong bg-surface-1 shadow-[0_10px_40px_rgba(0,0,0,0.45)] ${
-        showDropChrome ? "composer-shell-drop" : ""
-      }`}
+      className={`composer-shell${showDropChrome ? " composer-shell-drop" : ""}`}
       onDragEnter={onDragEnter}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -552,159 +616,29 @@ export function ChatComposer({
         </div>
       ) : null}
 
-      {attachments.length > 0 ? (
-        <div className="flex flex-wrap gap-2 px-3 pt-3">
-          {attachments.map((a) => (
-            <AttachmentChip
-              key={a.path}
-              attachment={a}
-              onRemove={
-                onRemoveAttachment
-                  ? () => onRemoveAttachment(a.path)
-                  : undefined
-              }
-            />
-          ))}
-        </div>
-      ) : null}
-
-      <div className="flex items-end gap-2 px-2.5 py-2">
-        <div className="relative mb-0.5 shrink-0">
-          <button
-            type="button"
-            title="Add context"
-            data-tip="Add context"
-            aria-label="Add context"
-            aria-expanded={menu === "attach"}
-            disabled={disabled || loading || busyAttach}
-            onClick={() =>
-              setMenu((m) => (m === "attach" ? null : "attach"))
-            }
-            className="inline-flex h-7 w-7 items-center justify-center rounded-md text-fg-dim transition hover:bg-surface-3 hover:text-fg disabled:opacity-40"
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-
-          {menu === "attach" ? (
-            <div className="composer-popover composer-popover-attach" role="menu">
-              <div className="composer-popover-section-label">Attach</div>
-              <MenuItem
-                label="Files..."
-                onClick={() => void pickAttachments()}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                    <path d="M14 2v6h6" />
-                  </svg>
-                }
-              />
-              <MenuItem
-                label="Folder..."
-                onClick={() => void pickAttachments({ directories: true })}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-                  </svg>
-                }
-              />
-              <MenuItem
-                label="Images..."
-                onClick={() => void pickAttachments({ imagesOnly: true })}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <rect x="3" y="5" width="18" height="14" rx="2" />
-                    <circle cx="8.5" cy="10" r="1.5" />
-                    <path d="m21 15-4.5-4.5L7 20" />
-                  </svg>
-                }
-              />
-              <MenuItem
-                label="Paste image"
-                onClick={() => void pasteImageFromClipboard()}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M8 5h8M9 3h6a1 1 0 0 1 1 1v2H8V4a1 1 0 0 1 1-1z" />
-                    <path d="M8 7h8v12a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z" />
-                  </svg>
-                }
-              />
-              <MenuItem
-                label="URL..."
-                onClick={attachUrl}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <path d="M10 13a5 5 0 0 0 7.07 0l2.12-2.12a5 5 0 0 0-7.07-7.07L11 5" />
-                    <path d="M14 11a5 5 0 0 0-7.07 0L4.8 13.12a5 5 0 0 0 7.07 7.07L13 19" />
-                  </svg>
-                }
-              />
-              <div className="composer-popover-divider" />
-              <div className="composer-popover-section-label">Snippets</div>
-              {PROMPT_SNIPPETS.map((s) => (
-                <MenuItem
-                  key={s.id}
-                  label={s.label}
-                  onClick={() => insertSnippet(s.text)}
-                  icon={
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                      <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
-                    </svg>
-                  }
-                />
-              ))}
-              <div className="composer-popover-divider" />
-              <div className="composer-popover-tip">
-                Tip: type <kbd>@</kbd> to reference files inline.
-              </div>
-            </div>
-          ) : null}
-        </div>
-
-        <textarea
-          ref={taRef}
-          value={value}
-          disabled={disabled}
-          rows={1}
-          placeholder={
-            attachments.length
-              ? "Add a message about the attachment(s)…"
-              : placeholder
-          }
-          onChange={(e) => onChange(e.target.value)}
-          onPaste={(e) => {
-            void handlePaste(e);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if (canSend) onSend();
-            }
-          }}
-          className="max-h-[140px] min-h-[22px] flex-1 resize-none border-0 bg-transparent py-1 text-[13px] leading-snug text-fg outline-none placeholder:text-muted disabled:opacity-60"
-        />
-
-        <div className="mb-0.5 flex shrink-0 items-center gap-0.5">
-          <div className="relative">
+      {/* Top tool belt — MODE / EFFORT / toggles, then snippet chips */}
+      <div className="composer-toolbelt">
+        <div className="composer-controls">
+          <div className="composer-pill-mode relative">
+            <span className="composer-label">MODE:</span>
             <button
               type="button"
-              className="composer-pill"
-              title="Model"
+              className="composer-value"
               aria-expanded={menu === "mode"}
+              aria-haspopup="menu"
               onClick={() => setMenu((m) => (m === "mode" ? null : "mode"))}
             >
-              <span>{mode}</span>
-              <Chevron />
+              {MODE_LABELS[mode] ?? mode}
             </button>
             {menu === "mode" ? (
-              <div className="composer-popover composer-popover-mode" role="listbox">
+              <div className="composer-popover composer-popover-mode" role="menu">
                 <div className="composer-popover-search">
                   <input
                     autoFocus
                     value={modelQuery}
                     onChange={(e) => setModelQuery(e.target.value)}
-                    placeholder="Search models"
+                    placeholder="Search modes"
+                    aria-label="Search modes"
                   />
                 </div>
                 <div className="composer-popover-section-label">{gatewayLabel}</div>
@@ -715,6 +649,8 @@ export function ChatComposer({
                       <button
                         key={m}
                         type="button"
+                        role="menuitemradio"
+                        aria-checked={selected}
                         className={`composer-menu-item composer-menu-item-row ${
                           selected ? "is-selected" : ""
                         }`}
@@ -724,69 +660,30 @@ export function ChatComposer({
                           setModelQuery("");
                         }}
                       >
-                        <span>
-                          {m}{" "}
-                          <span className="text-muted">{effortShort(effort)}</span>
-                        </span>
+                        <span>{MODE_LABELS[m] ?? m}</span>
                         {selected ? <span className="composer-check">✓</span> : null}
                       </button>
                     );
                   })}
                 </div>
-                <div className="composer-popover-divider" />
-                <button
-                  type="button"
-                  className="composer-menu-item"
-                  onClick={() => {
-                    setMenu(null);
-                    setModelQuery("");
-                  }}
-                >
-                  <span className="composer-menu-icon">↻</span>
-                  <span>Refresh models</span>
-                </button>
-                <button
-                  type="button"
-                  className="composer-menu-item"
-                  onClick={() => setMenu(null)}
-                >
-                  <span className="composer-menu-icon">⚙</span>
-                  <span>Edit models...</span>
-                </button>
               </div>
             ) : null}
           </div>
 
-          <div className="relative">
+          <div className="composer-pill-effort relative">
+            <span className="composer-label">EFFORT:</span>
             <button
               type="button"
-              className="composer-pill"
-              data-tip={`Effort: ${effortShort(effort)}`}
-              title={`Effort: ${effortShort(effort)}`}
+              className="composer-value composer-value-accent"
               aria-expanded={menu === "effort"}
-              onClick={() =>
-                setMenu((m) => (m === "effort" ? null : "effort"))
-              }
+              aria-haspopup="menu"
+              onClick={() => setMenu((m) => (m === "effort" ? null : "effort"))}
             >
-              <span>{effortShort(effort)}</span>
-              <Chevron />
+              {effortLabel(effort)}
             </button>
+            <span className="composer-effort-tag">(O1)</span>
             {menu === "effort" ? (
               <div className="composer-popover composer-popover-effort" role="menu">
-                <div className="composer-popover-section-label">Options</div>
-                <div className="composer-menu-item composer-menu-item-row">
-                  <span>Thinking</span>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={thinking}
-                    className={`composer-toggle ${thinking ? "is-on" : ""}`}
-                    onClick={() => onThinkingChange?.(!thinking)}
-                  >
-                    <span className="composer-toggle-knob" />
-                  </button>
-                </div>
-                <div className="composer-popover-divider" />
                 <div className="composer-popover-section-label">Effort</div>
                 {EFFORTS.map((opt) => {
                   const selected = opt.id === effort;
@@ -794,6 +691,8 @@ export function ChatComposer({
                     <button
                       key={opt.id}
                       type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
                       className={`composer-menu-item composer-menu-item-row ${
                         selected ? "is-selected" : ""
                       }`}
@@ -811,92 +710,255 @@ export function ChatComposer({
             ) : null}
           </div>
 
-          <button
-            type="button"
-            title="Voice input (coming soon)"
-            aria-label="Voice input"
-            className="composer-icon-btn text-muted/70"
-            onClick={() => {
-              /* not wired */
-            }}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <rect x="9" y="2" width="6" height="11" rx="3" />
-              <path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" />
-            </svg>
-          </button>
+          <div className="composer-feature-toggles">
+            <button
+              type="button"
+              onClick={() => onThinkingChange?.(!thinking)}
+              className={`composer-toggle-btn${thinking ? " is-on" : ""}`}
+            >
+              {thinking ? <span className="composer-toggle-dot" /> : null}
+              Thinking {thinking ? "ON" : "OFF"}
+            </button>
+            <button
+              type="button"
+              onClick={onTogglePrivacy}
+              title={
+                privacyMode
+                  ? "Privacy ON: project folders only — outside paths need your Approve"
+                  : "Privacy OFF: agent can access the whole machine"
+              }
+              className={`composer-toggle-btn${privacyMode ? " is-on" : " is-muted"}`}
+            >
+              Privacy {privacyMode ? "ON" : "OFF"}
+            </button>
+            <button
+              type="button"
+              onClick={onToggleVoiceMute}
+              className="composer-toggle-btn composer-mute-btn"
+            >
+              <span className="material-symbols-outlined text-[11px]">
+                {voiceMuted ? "mic_off" : "mic"}
+              </span>
+              {voiceMuted ? "Mute" : "Live"}
+            </button>
+          </div>
+        </div>
 
+        <div className="composer-snippets">
+          {PROMPT_SNIPPETS.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => insertSnippet(s.text)}
+              className="composer-snippet"
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Attached context tray */}
+      {attachments.length > 0 ? (
+        <div className="composer-attached">
+          <span className="composer-attached-label">ATTACHED CONTEXT:</span>
+          <div className="composer-attached-chips">
+            {attachments.map((a) => (
+              <span key={a.path} className="composer-file-chip">
+                <span className="material-symbols-outlined composer-file-chip-icon">
+                  {a.kind === "image" ? "image" : "description"}
+                </span>
+                <span className="composer-file-chip-name">{a.basename}</span>
+                {onRemoveAttachment ? (
+                  <button
+                    type="button"
+                    className="composer-file-chip-x"
+                    aria-label={`Remove ${a.basename}`}
+                    onClick={() => onRemoveAttachment(a.path)}
+                  >
+                    <span className="material-symbols-outlined">close</span>
+                  </button>
+                ) : null}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {/* Input row — agent:~$ | textarea | attach / mic / Send */}
+      <div className="composer-input-box relative">
+        <ContextMentionSuggest
+          value={value}
+          fileHits={fileHits}
+          onPick={pickMention}
+          keySinkRef={mentionKeyRef}
+        />
+        <div className="composer-prompt" aria-hidden="true">
+          agent:~$
+        </div>
+        <textarea
+          ref={taRef}
+          value={value}
+          disabled={disabled}
+          rows={1}
+          aria-label="Message"
+          placeholder={
+            attachments.length
+              ? "Add a message about the attachment(s)…"
+              : "Type @ for files, Terminals, Commit, Branch, Chats…"
+          }
+          onChange={(e) => onChange(e.target.value)}
+          onPaste={(e) => {
+            void handlePaste(e);
+          }}
+          onKeyDown={(e) => {
+            if (mentionKeyRef.current?.(e)) return;
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              if (canSend) onSend();
+            }
+          }}
+          className="composer-textarea"
+        />
+        <div className="composer-input-actions relative">
           <button
             type="button"
-            title={voiceMuted ? "Unmute agent audio" : "Mute agent audio"}
-            aria-label={voiceMuted ? "Unmute" : "Mute"}
-            className={`composer-icon-btn ${voiceMuted ? "is-active" : ""}`}
+            title="Attach file"
+            data-tip="Attach file or code chunk"
+            aria-label="Attach file"
+            aria-expanded={menu === "attach"}
+            aria-haspopup="menu"
+            disabled={disabled || loading || busyAttach}
+            onClick={() => setMenu((m) => (m === "attach" ? null : "attach"))}
+            className="composer-icon-action"
+          >
+            <span className="material-symbols-outlined">attach_file</span>
+          </button>
+          {menu === "attach" ? (
+            <div className="composer-popover composer-popover-attach" role="menu">
+              <div className="composer-popover-section-label">Attach</div>
+              <MenuItem
+                label="Files..."
+                onClick={() => void pickAttachments()}
+                icon={
+                  <span className="material-symbols-outlined text-[14px]">
+                    description
+                  </span>
+                }
+              />
+              <MenuItem
+                label="Folder..."
+                onClick={() => void pickAttachments({ directories: true })}
+                icon={
+                  <span className="material-symbols-outlined text-[14px]">
+                    folder
+                  </span>
+                }
+              />
+              <MenuItem
+                label="Images..."
+                onClick={() => void pickAttachments({ imagesOnly: true })}
+                icon={
+                  <span className="material-symbols-outlined text-[14px]">
+                    image
+                  </span>
+                }
+              />
+              <MenuItem
+                label="Paste image"
+                onClick={() => void pasteImageFromClipboard()}
+                icon={
+                  <span className="material-symbols-outlined text-[14px]">
+                    content_paste
+                  </span>
+                }
+              />
+              <MenuItem
+                label="URL..."
+                onClick={attachUrl}
+                icon={
+                  <span className="material-symbols-outlined text-[14px]">
+                    link
+                  </span>
+                }
+              />
+              <div className="composer-popover-divider" />
+              <div className="composer-popover-tip">
+                Tip: type <kbd>@</kbd> to reference files inline.
+              </div>
+            </div>
+          ) : null}
+          <button
+            type="button"
+            title="Voice dictation"
+            aria-label={voiceMuted ? "Unmute voice dictation" : "Mute voice dictation"}
+            className="composer-icon-action"
             onClick={onToggleVoiceMute}
           >
-            {voiceMuted ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M11 5 6 9H2v6h4l5 4V5z" />
-                <path d="m23 9-6 6M17 9l6 6" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M11 5 6 9H2v6h4l5 4V5z" />
-                <path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14" />
-              </svg>
-            )}
+            <span className="material-symbols-outlined">mic</span>
           </button>
-
-          <button
-            type="button"
-            title={privacyMode ? "Privacy mode on" : "Privacy mode"}
-            aria-label="Privacy mode"
-            className={`composer-icon-btn ${privacyMode ? "is-active" : ""}`}
-            onClick={onTogglePrivacy}
-          >
-            {privacyMode ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M17.9 17.9A10 10 0 0 1 3.6 6.6M9.9 4.2A10 10 0 0 1 20.5 15" />
-                <path d="M1 1l22 22" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            )}
-          </button>
-
-          <button
-            type="button"
-            title="Context"
-            aria-label="Context"
-            className="composer-icon-btn"
-            onClick={() => setMenu((m) => (m === "attach" ? null : "attach"))}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <rect x="3" y="3" width="7" height="7" rx="1.2" />
-              <rect x="14" y="3" width="7" height="7" rx="1.2" />
-              <rect x="3" y="14" width="7" height="7" rx="1.2" />
-              <rect x="14" y="14" width="7" height="7" rx="1.2" />
-            </svg>
-          </button>
-
           <button
             type="button"
             disabled={!canSend && !loading}
             onClick={onSend}
             title={loading ? "Running…" : "Send"}
-            aria-label={loading ? "Running" : "Send message"}
-            className="ml-0.5 inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#d7dde8] text-[#0b0d11] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"
+            className="composer-send"
           >
             {loading ? (
-              <span className="h-3 w-3 animate-pulse rounded-full bg-[#0b0d11]/70" />
+              <span className="composer-send-pulse" />
             ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M12 19V5M5 12l7-7 7 7" />
-              </svg>
+              <>
+                <span>Send</span>
+                <span className="material-symbols-outlined composer-send-return">
+                  keyboard_return
+                </span>
+              </>
             )}
           </button>
+        </div>
+      </div>
+
+      {/* Git chrome & model metadata strip */}
+      <div className="composer-chrome">
+        <div className="composer-chrome-left">
+          <div className="composer-chrome-branch">
+            <span className="material-symbols-outlined composer-chrome-git-icon">
+              fork_right
+            </span>
+            <span className="composer-chrome-key">branch:</span>
+            <span className="composer-chrome-branch-name">
+              {git?.branch || "—"}
+            </span>
+          </div>
+          {git ? (
+            <div className="composer-chrome-status">
+              <span className="composer-chrome-muted">STATUS:</span>
+              <span
+                className={`composer-status-dot${git.dirty ? " is-dirty" : ""}`}
+              />
+              <span className="composer-chrome-muted">
+                {git.dirty
+                  ? `DIRTY (+${git.additions} / -${git.deletions})`
+                  : "CLEAN"}
+              </span>
+            </div>
+          ) : null}
+          {repoLabel ? (
+            <div className="composer-chrome-repo">
+              <span className="composer-chrome-muted">REPO: {repoLabel}</span>
+            </div>
+          ) : null}
+        </div>
+        <div className="composer-chrome-right">
+          {modelLabel ? (
+            <span className="composer-chrome-model">{modelLabel}</span>
+          ) : null}
+          {tokenLabel ? (
+            <span className="composer-chrome-tokens">{tokenLabel}</span>
+          ) : null}
+          {costLabel ? (
+            <span className="composer-chrome-cost">{costLabel}</span>
+          ) : null}
         </div>
       </div>
     </div>

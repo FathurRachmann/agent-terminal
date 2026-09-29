@@ -30,7 +30,7 @@ export function createDocumentTools(workspaceRoot: string) {
         file_path: z
           .string()
           .describe(
-            "Workspace-relative or absolute path to the document (e.g. working/uploads/laporan.docx)",
+            "Workspace-relative or absolute path to the document (e.g. tmp/uploads/laporan.docx)",
           ),
       }),
     },

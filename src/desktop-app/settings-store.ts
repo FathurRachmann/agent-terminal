@@ -1,8 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 
+export type RunModeSetting = "auto-review" | "allowlist" | "run-everything";
+
 export type AgentBehaviorSettings = {
+  /**
+   * @deprecated Prefer `runMode`. Kept as alias: true ⇔ run-everything.
+   */
   autoApproveDestructive: boolean;
+  /** Cursor-style Run Mode (default auto-review). */
+  runMode: RunModeSetting;
+  /** Tool names / shell command prefixes auto-allowed under allowlist & auto-review. */
+  toolAllowlist: string[];
   requirePlanApproval: boolean;
   enableReflection: boolean;
   enableCheckpointer: boolean;
@@ -10,6 +19,8 @@ export type AgentBehaviorSettings = {
   autoSelfHeal: boolean;
   /** Identical eligible errors required before auto self-heal. */
   selfHealErrorThreshold: number;
+  /** Top-level agent preset: general | research | ops. */
+  agentKind: "general" | "research" | "ops";
 };
 
 export type UiSettings = {
@@ -96,13 +107,49 @@ export type SettingsSnapshot = {
 };
 
 const DEFAULT_AGENT: AgentBehaviorSettings = {
-  autoApproveDestructive: true,
+  autoApproveDestructive: false,
+  runMode: "auto-review",
+  toolAllowlist: [],
   requirePlanApproval: true,
   enableReflection: true,
   enableCheckpointer: true,
   autoSelfHeal: true,
   selfHealErrorThreshold: 2,
+  agentKind: "general",
 };
+
+function normalizeRunMode(raw: Partial<AgentBehaviorSettings>): RunModeSetting {
+  const mode = (raw as { runMode?: string }).runMode;
+  if (
+    mode === "auto-review" ||
+    mode === "allowlist" ||
+    mode === "run-everything"
+  ) {
+    return mode;
+  }
+  // Migrate legacy flag when runMode missing
+  if (raw.autoApproveDestructive === true) return "run-everything";
+  return "auto-review";
+}
+
+function normalizeAgentSettings(
+  raw: Partial<AgentBehaviorSettings> | undefined,
+): AgentBehaviorSettings {
+  const merged = { ...DEFAULT_AGENT, ...(raw ?? {}) };
+  merged.runMode = normalizeRunMode(merged);
+  merged.autoApproveDestructive = merged.runMode === "run-everything";
+  merged.toolAllowlist = Array.isArray(merged.toolAllowlist)
+    ? merged.toolAllowlist.map(String).map((s) => s.trim()).filter(Boolean)
+    : [];
+  if (
+    merged.agentKind !== "general" &&
+    merged.agentKind !== "research" &&
+    merged.agentKind !== "ops"
+  ) {
+    merged.agentKind = "general";
+  }
+  return merged;
+}
 
 const DEFAULT_UI: UiSettings = {
   defaultRailOpen: true,
@@ -145,7 +192,7 @@ export function loadStoredSettings(workspaceRoot: string): StoredSettings {
   const raw = readJsonFile<Partial<StoredSettings>>(settingsPath(workspaceRoot));
   return {
     version: 1,
-    agent: { ...DEFAULT_AGENT, ...(raw?.agent ?? {}) },
+    agent: normalizeAgentSettings(raw?.agent),
     ui: normalizeUiSettings(raw?.ui),
     env: raw?.env ?? {},
   };
@@ -159,7 +206,7 @@ export function saveStoredSettings(
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const payload: StoredSettings = {
     version: 1,
-    agent: { ...DEFAULT_AGENT, ...settings.agent },
+    agent: normalizeAgentSettings(settings.agent),
     ui: normalizeUiSettings(settings.ui),
     env: settings.env ?? {},
   };

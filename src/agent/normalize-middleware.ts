@@ -8,6 +8,7 @@ import {
 } from "@langchain/core/messages";
 import { isCommand } from "@langchain/langgraph";
 import { parseTextToolCalls } from "./parse-text-tool-calls.js";
+import { promotePdfPythonDumpToExecute } from "./promote-pdf-python-dump.js";
 
 /**
  * Convert proxy/router quirks (ChatMessage / ChatMessageChunk / plain objects)
@@ -180,7 +181,7 @@ export function promoteTextToolCalls(
 
   const parsed = parseTextToolCalls(message.content);
   if (parsed.length === 0) {
-    return message;
+    return promotePdfPythonDumpToExecute(message);
   }
 
   if (AIMessageChunk.isInstance(message)) {

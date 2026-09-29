@@ -17,9 +17,14 @@ import {
   looksLikeToolPlanNarration,
   resolveFinalAssistantText,
   sanitizeAssistantText,
+  extractSuggestedModel,
 } from "../agent/sanitize-output.js";
 import { isMalformedProviderSdkError } from "../agent/normalize-middleware.js";
 import { contentLooksLikeTextToolCall } from "../agent/parse-text-tool-calls.js";
+import {
+  greetingFastReply,
+  isTrivialGreeting,
+} from "../agent/greeting-fast-path.js";
 import {
   parseDesktopIntent,
   enrichDesktopIntent,
@@ -54,8 +59,22 @@ export type MemoryRuntime = {
 
 import {
   extractInterruptActionNames,
+  formatToolApprovalDetail,
+  isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
+  requiresExplicitApproval,
 } from "../agent/interrupt-utils.js";
+import {
+  chatModeSystemOverlay,
+  chatModeToolAllowlist,
+  intersectAllowlists,
+  parseAgentChatMode,
+} from "../agent/chat-mode.js";
+import { tryAutoResolveRunModeInterrupt } from "../agent/run-mode-approval.js";
+import { resolveRunMode } from "../agent/run-modes.js";
+import { buildMentionContextNudge } from "../agent/context-mentions.js";
+import { runHooks } from "../agent/hooks/run-hooks.js";
+import { loadMergedPermissions } from "../agent/permissions-store.js";
 
 export type ApprovalDecision = {
   decisions: Array<{ type: "approve" | "reject" }>;
@@ -63,7 +82,10 @@ export type ApprovalDecision = {
 
 export {
   extractInterruptActionNames,
+  formatToolApprovalDetail,
+  isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
+  requiresExplicitApproval,
 } from "../agent/interrupt-utils.js";
 
 export type MultimodalUserPart =
@@ -110,7 +132,7 @@ export type RunAgentOptions = {
    */
   botInstruction?: string;
   /**
-   * Injected each turn — tells the model which working/<scope>/ folder to use.
+   * Injected each turn — tells the model which tmp/<scope>/ folder to use.
    * Combined with botInstruction when both are set.
    */
   workingScopeNudge?: string;
@@ -120,6 +142,37 @@ export type RunAgentOptions = {
   memoryScopeTags?: string[];
   /** When true, do not append the user prompt to the transcript (multi-bot follow-ups). */
   skipUserTranscript?: boolean;
+  /**
+   * Optional botScope bridge so this turn can apply a decision-engine tool allowlist
+   * (main session, workspace bots, WhatsApp — same path).
+   */
+  toolScope?: {
+    get: () => string[] | null;
+    set: (tools: string[] | null) => void;
+  };
+  /** Skip tools/agent turn-scope (e.g. self-heal). */
+  skipTurnScope?: boolean;
+  /** Cursor-style chat mode (orthogonal to agentKind). */
+  chatMode?: import("../agent/chat-mode.js").AgentChatMode;
+  /** Live Run Mode + allowlist (from agent bundle). */
+  runMode?: {
+    getRunMode: () => import("../agent/run-modes.js").RunMode;
+    getAllowlist: () => string[];
+  };
+  /**
+   * Live Privacy toggle. When false, `request_folder_access` auto-approves
+   * (whole-machine sandbox). When true, folder grants need explicit HITL.
+   */
+  isPrivacyStrict?: () => boolean;
+  /** Plan mode Build gate — unlock after task_todos Approve. */
+  planGate?: {
+    isUnlocked: () => boolean;
+    unlock: () => void;
+  };
+  /** Recent PTY/terminal log for @Terminals mentions. */
+  terminalLog?: string;
+  /** Optional prior chat transcript for @Chats. */
+  chatTranscript?: string;
 };
 
 export type AgentPhase =
@@ -145,7 +198,16 @@ export type AgentUiEvent =
   | { type: "error"; message: string }
   | { type: "reflection"; memoryIds: string[] }
   | { type: "warning"; message: string }
-  | { type: "pty"; text: string };
+  | { type: "pty"; text: string }
+  | {
+      type: "continue_available";
+      reason: "model_unavailable" | "self_heal";
+      /** Last user prompt to resume. */
+      prompt: string;
+      /** Suggested replacement model from the provider notice, if any. */
+      suggestedModel?: string | null;
+      notice?: string;
+    };
 
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -220,6 +282,47 @@ function emit(
   onEvent?.(event);
 }
 
+function hasNonTextUserContent(
+  content: string | MultimodalUserPart[] | undefined,
+): boolean {
+  if (!content || typeof content === "string") return false;
+  return content.some(
+    (part) => part && typeof part === "object" && part.type !== "text",
+  );
+}
+
+function finishGreetingFastPath(
+  options: RunAgentOptions,
+  threadId: string,
+  mem: MemoryRuntime | undefined,
+  onEvent: RunAgentOptions["onEvent"],
+): string {
+  const answer = greetingFastReply(options.prompt);
+  emit(onEvent, {
+    type: "status",
+    phase: "thinking",
+    detail: "greeting fast-path (no LLM)",
+  });
+  emit(onEvent, { type: "token", text: answer });
+  if (mem) {
+    mem.sessionStore.markTurnComplete(answer, threadId);
+    mem.sessionStore.appendTranscript({
+      threadId,
+      role: "assistant",
+      content: answer,
+      meta: { ...(options.assistantMeta ?? {}), greetingFastPath: true },
+    });
+  }
+  emit(onEvent, {
+    type: "status",
+    phase: "done",
+    detail: "greeting fast-path",
+  });
+  emit(onEvent, { type: "done", text: answer });
+  // No reflectAndStore — greetings must not burn another model call or memory write.
+  return answer;
+}
+
 /** Activity events worth keeping in session.jsonl (skip token/reasoning spam). */
 function shouldPersistActivity(event: AgentUiEvent): boolean {
   switch (event.type) {
@@ -267,6 +370,33 @@ function sanitizeEventForPersist(event: AgentUiEvent): AgentUiEvent {
   }
   return event;
 }
+
+/**
+ * Chat-only "ya saya izinkan" does not expand the sandbox. Nudge the model to
+ * call request_folder_access so the Approve/Deny interrupt UI appears.
+ */
+export function looksLikeVerbalFolderPermission(text: string): boolean {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t || t.length > 160) return false;
+  if (/\b(izin(kan)?|silakan|silahkan)\b/.test(t)) return true;
+  if (
+    /\b(grant|allow|approve)\b[\s\S]{0,40}\b(access|folder|permission)\b/.test(
+      t,
+    ) ||
+    /\b(access|folder|permission)\b[\s\S]{0,40}\b(grant|allow|approve)\b/.test(t)
+  ) {
+    return true;
+  }
+  // Short pure affirmatives only (avoid matching "yes, make the PDF…").
+  return /^(ya|yes|y|ok|okay|oke|boleh)([\s,.!]*(saya\s*)?(izinkan?|boleh|lanjut(kan)?)?)?[\s!.]*$/.test(
+    t,
+  );
+}
+
+const VERBAL_FOLDER_PERMISSION_NUDGE =
+  "[SYSTEM] User granted folder permission in chat. Chat text does not expand the sandbox. " +
+  "Call request_folder_access NOW with the folder path they named (e.g. Desktop). " +
+  "That tool opens the Approve/Deny UI — wait for Approve, then continue the file/shell work.";
 
 function activitySummary(event: AgentUiEvent): string {
   switch (event.type) {
@@ -515,13 +645,135 @@ export async function runAgentTurn(
     }
   }
 
+  // Pure greetings → local reply (0 model tokens). No tools, no Laya, no reflection.
+  if (
+    isTrivialGreeting(options.prompt) &&
+    !hasNonTextUserContent(options.userContent)
+  ) {
+    return finishGreetingFastPath(options, threadId, mem, onEvent);
+  }
+
+  // Cursor hooks: beforeSubmitPrompt can block or inject additional_context.
+  let hookContextNudge = "";
+  if (mem?.workspaceRoot) {
+    try {
+      const hookResult = await runHooks({
+        name: "beforeSubmitPrompt",
+        workspaceRoot: mem.workspaceRoot,
+        profileHome: mem.profileHome,
+        payload: {
+          prompt: options.prompt,
+          thread_id: threadId,
+          chat_mode: options.chatMode ?? "agent",
+        },
+        matcherHaystack: options.prompt,
+      });
+      if (hookResult.continue === false || hookResult.denied) {
+        const msg =
+          hookResult.user_message ||
+          hookResult.agent_message ||
+          "Blocked by beforeSubmitPrompt hook.";
+        emit(onEvent, { type: "error", message: msg });
+        emit(onEvent, { type: "done", text: msg });
+        return msg;
+      }
+      if (hookResult.additional_context?.trim()) {
+        hookContextNudge = hookResult.additional_context.trim();
+      }
+    } catch {
+      /* fail open */
+    }
+  }
+
+  const mentionPack = mem?.workspaceRoot
+    ? buildMentionContextNudge(options.prompt, {
+        workspaceRoot: mem.workspaceRoot,
+        terminalLog: options.terminalLog,
+        chatTranscript: options.chatTranscript,
+      })
+    : { nudge: "", mentions: [] };
+
   // Deterministic Chrome/desktop path — open URL first; continue LLM for leftovers.
   const desktopPrep = await tryDesktopFastPath(options, threadId);
   if (desktopPrep?.type === "complete") {
     return desktopPrep.answer;
   }
 
-  const turnPrefix = [options.workingScopeNudge, options.botInstruction]
+  let turnScopeNudge = "";
+  let previousToolAllowlist: string[] | null | undefined;
+  const chatMode = parseAgentChatMode(options.chatMode, "agent");
+  const modeOverlay = chatModeSystemOverlay(chatMode);
+  const modeAllowlist = chatModeToolAllowlist(chatMode, {
+    planUnlocked: options.planGate?.isUnlocked() ?? false,
+  });
+
+  if (!options.skipTurnScope) {
+    try {
+      emit(onEvent, {
+        type: "status",
+        phase: "thinking",
+        detail: "scoping tools…",
+      });
+      const { resolveTurnScope } = await import("../decision/turn-scope.js");
+      const base = options.toolScope?.get() ?? null;
+      const scopeStarted = Date.now();
+      const scope = await resolveTurnScope({
+        prompt: options.prompt,
+        baseAllowlist: base,
+      });
+      turnScopeNudge = scope.nudge;
+      const layaList = scope.allowlist ?? null;
+      const combined = intersectAllowlists(modeAllowlist, layaList);
+      if (combined && options.toolScope) {
+        previousToolAllowlist = base;
+        options.toolScope.set(combined);
+        emit(onEvent, {
+          type: "status",
+          phase: "thinking",
+          detail: `turn scope (${scope.source}+${chatMode}, ${Date.now() - scopeStarted}ms): ${scope.reason}`,
+        });
+      } else if (modeAllowlist && options.toolScope) {
+        previousToolAllowlist = base;
+        options.toolScope.set(modeAllowlist);
+        emit(onEvent, {
+          type: "status",
+          phase: "thinking",
+          detail: `chat mode ${chatMode} tool allowlist`,
+        });
+      } else if (scope.allowlist && options.toolScope) {
+        previousToolAllowlist = base;
+        options.toolScope.set(scope.allowlist);
+        emit(onEvent, {
+          type: "status",
+          phase: "thinking",
+          detail: `turn scope (${scope.source}, ${Date.now() - scopeStarted}ms): ${scope.reason}`,
+        });
+      }
+    } catch {
+      /* fail open — apply mode allowlist only */
+      if (modeAllowlist && options.toolScope) {
+        previousToolAllowlist = options.toolScope.get();
+        options.toolScope.set(modeAllowlist);
+      }
+    }
+  } else if (modeAllowlist && options.toolScope) {
+    previousToolAllowlist = options.toolScope.get();
+    options.toolScope.set(modeAllowlist);
+  }
+
+  // Persona/handoff last so it wins over generic turn-scope nudge (recency).
+  const verbalFolderNudge = looksLikeVerbalFolderPermission(options.prompt)
+    ? VERBAL_FOLDER_PERMISSION_NUDGE
+    : "";
+  const turnPrefix = [
+    modeOverlay,
+    mentionPack.nudge,
+    hookContextNudge,
+    options.workingScopeNudge,
+    turnScopeNudge,
+    verbalFolderNudge,
+    options.botInstruction,
+  ]
     .map((s) => String(s || "").trim())
     .filter(Boolean)
     .join("\n\n");
@@ -602,27 +854,106 @@ export async function runAgentTurn(
       const interrupt = getInterruptPayload(result);
       if (interrupt) {
         const planGate = isPlanApprovalInterrupt(interrupt);
-        emit(options.onEvent, {
-          type: "status",
-          phase: "waiting_approval",
-          detail: planGate
-            ? "plan approval required"
-            : "human approval required",
+        const folderGate = isFolderAccessInterrupt(interrupt);
+        // Omit bridge → assume Privacy ON so folder HITL is not silently skipped.
+        const privacyOn =
+          typeof options.isPrivacyStrict === "function"
+            ? options.isPrivacyStrict() === true
+            : true;
+        const explicitGate = requiresExplicitApproval(interrupt, {
+          privacyOn,
         });
-        emit(options.onEvent, { type: "interrupt", payload: interrupt });
-        mem?.sessionStore.appendTranscript({
-          threadId,
-          role: "interrupt",
-          content: JSON.stringify(interrupt).slice(0, 4000),
-          meta: planGate ? { kind: "plan_approval" } : undefined,
-        });
-        // Plan gate always needs an explicit UI/stdin decision — never silent autoApprove.
-        const resumeValue =
-          options.autoApprove && !planGate
-            ? { decisions: [{ type: "approve" as const }] }
-            : options.requestApproval
-              ? await options.requestApproval(interrupt)
-              : await promptApproval(interrupt);
+        let resumeValue: ApprovalDecision | undefined;
+
+        // Privacy OFF: folder grants expand an already-open allowlist — no HITL UI.
+        if (folderGate && !privacyOn && !planGate) {
+          resumeValue = { decisions: [{ type: "approve" as const }] };
+          emit(options.onEvent, {
+            type: "status",
+            phase: "thinking",
+            detail: "privacy off — folder access auto-approved",
+          });
+        } else {
+          emit(options.onEvent, {
+            type: "status",
+            phase: "waiting_approval",
+            detail: planGate
+              ? "plan approval required"
+              : folderGate
+                ? formatToolApprovalDetail(interrupt)
+                : "human approval required",
+          });
+          emit(options.onEvent, { type: "interrupt", payload: interrupt });
+          mem?.sessionStore.appendTranscript({
+            threadId,
+            role: "interrupt",
+            content: JSON.stringify(interrupt).slice(0, 4000),
+            meta: planGate
+              ? { kind: "plan_approval" }
+              : folderGate
+                ? { kind: "folder_access" }
+                : undefined,
+          });
+
+          if (!explicitGate) {
+            const runMode =
+              options.runMode?.getRunMode() ??
+              resolveRunMode({
+                autoApproveDestructive: options.autoApprove,
+              });
+            const perms = mem?.workspaceRoot
+              ? loadMergedPermissions({
+                  workspaceRoot: mem.workspaceRoot,
+                  profileHome: mem.profileHome,
+                })
+              : null;
+            const allowlist = [
+              ...(options.runMode?.getAllowlist() ?? []),
+              ...(perms?.terminalAllowlist ?? []),
+            ];
+            const auto = await tryAutoResolveRunModeInterrupt({
+              payload: interrupt,
+              runMode,
+              allowlist,
+              chatMode,
+              autoApprove: options.autoApprove,
+              allowInstructions: perms?.allowInstructions,
+              blockInstructions: perms?.blockInstructions,
+              mcpAllowlist: perms?.mcpAllowlist,
+              privacyOn,
+            });
+            if (auto) {
+              resumeValue = { decisions: auto.decisions };
+              emit(options.onEvent, {
+                type: "status",
+                phase: "thinking",
+                detail: `run mode ${auto.source}${auto.verdict ? ` (${auto.verdict})` : ""}`,
+              });
+            }
+          }
+
+          // Plan + (Privacy ON) folder grants need an explicit UI/stdin decision.
+          if (!resumeValue) {
+            resumeValue =
+              options.autoApprove && !explicitGate
+                ? { decisions: [{ type: "approve" as const }] }
+                : options.requestApproval
+                  ? await options.requestApproval(interrupt)
+                  : await promptApproval(interrupt);
+          }
+        }
+
+        if (
+          planGate &&
+          resumeValue.decisions.some((d) => d.type === "approve")
+        ) {
+          options.planGate?.unlock();
+          // After Build, expand tools for remainder of this turn if Plan mode.
+          if (chatMode === "plan" && options.toolScope) {
+            options.toolScope.set(null);
+          }
+        }
+
         inputPayload = new Command({ resume: resumeValue });
         continue;
       }
@@ -700,7 +1031,14 @@ export async function runAgentTurn(
           finalText = "";
           continue;
         }
-        // Exhausted retries — fall through and return the error as-is
+        // Exhausted retries — offer Continue so the user can switch model and resume.
+        emit(options.onEvent, {
+          type: "continue_available",
+          reason: "model_unavailable",
+          prompt: options.prompt,
+          suggestedModel: extractSuggestedModel(finalText),
+          notice: finalText.slice(0, 500),
+        });
       }
       break;
     }
@@ -723,6 +1061,21 @@ export async function runAgentTurn(
       detail: "turn complete",
     });
     emit(options.onEvent, { type: "done", text: answer });
+
+    if (mem?.workspaceRoot) {
+      void runHooks({
+        name: "afterAgentResponse",
+        workspaceRoot: mem.workspaceRoot,
+        profileHome: mem.profileHome,
+        payload: { text: answer, thread_id: threadId },
+      }).catch(() => undefined);
+      void runHooks({
+        name: "stop",
+        workspaceRoot: mem.workspaceRoot,
+        profileHome: mem.profileHome,
+        payload: { status: "completed", thread_id: threadId },
+      }).catch(() => undefined);
+    }
 
     if (mem && mem.enableReflection !== false) {
       void reflectAndStore({
@@ -797,6 +1150,10 @@ export async function runAgentTurn(
       }
     }
     throw err;
+  } finally {
+    if (previousToolAllowlist !== undefined && options.toolScope) {
+      options.toolScope.set(previousToolAllowlist);
+    }
   }
 }
 
@@ -818,6 +1175,25 @@ async function tryDesktopFastPath(
   if (!rawIntent) return null;
   const intent = enrichDesktopIntent(rawIntent, options.prompt);
   const followUp = extractDesktopFollowUp(options.prompt, rawIntent);
+
+  try {
+    const { gateDesktopFastPath } = await import("../decision/desktop-gate.js");
+    const gate = await gateDesktopFastPath({
+      prompt: options.prompt,
+      hasParsedIntent: true,
+      hasFollowUp: Boolean(followUp),
+    });
+    if (!gate.allowFastPath) {
+      emit(options.onEvent, {
+        type: "status",
+        phase: "boot",
+        detail: `desktop fast-path skipped (${gate.reason})`,
+      });
+      return null;
+    }
+  } catch {
+    /* fail open — keep legacy fast-path */
+  }
 
   const workspaceRoot =
     options.memory?.workspaceRoot ?? process.env.AGENT_WORKSPACE ?? process.cwd();

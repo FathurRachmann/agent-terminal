@@ -4,6 +4,7 @@
  */
 
 import { isJunkGuideline as isJunkStandardGuideline } from "../memory/guideline.js";
+import { looksLikeTextToolCallDump } from "./parse-text-tool-calls.js";
 
 const COT_OPENERS =
   /^(okay[,.]?\s+)?let'?s\s+(break\s+down|think|analyze|reason|start)|^(first|now)[,.]?\s+i\s+(need\s+to|should|can|will|am\s+going\s+to)\b|^the\s+user\s+(provided|asked|wants|greeted|said|wrote|sent|messaged)\b|^(first|okay|so)[,.]?\s+the\s+user\b|^i\s+(should|can|will|need\s+to)\s+(start\s+by\s+)?(explore|exploring|check|checking|list|listing|look|looking|use|using|run|running)\b/i;
@@ -164,19 +165,47 @@ export function looksLikeToolPlanNarration(text: string): boolean {
 export function looksLikeProviderNotice(text: string): boolean {
   const t = stripThinkBlocks(text).trim();
   if (!t || t.length > 1200) return false;
-  return /\b(no longer available|model.*deactivated|model.*not found|switch to.*model|please switch|upgraded version|sunset|retired|antigravity)\b/i.test(
+  return /\b(no longer available|model.*deactivated|model.*not found|switch to.*model|please switch|upgraded version|sunset|retired|antigravity|upstream error|service temporarily overloaded|overloaded)\b/i.test(
     t,
   );
 }
 
+/**
+ * Best-effort extract of a suggested replacement model id from a provider notice.
+ * e.g. "switch to Gemini 3.7 Flash" → "Gemini 3.7 Flash"
+ */
+export function extractSuggestedModel(text: string): string | null {
+  const t = stripThinkBlocks(text).trim();
+  if (!t) return null;
+  // Do not treat "." as a terminator — model ids often include versions (3.7).
+  const patterns = [
+    /switch to\s+([A-Za-z0-9][A-Za-z0-9 ._+/-]{2,64}?)(?:\s+in\b|\s+on\b|\s+instead\b|[!,;]|$)/i,
+    /use\s+([A-Za-z0-9][A-Za-z0-9 ._+/-]{2,64}?)\s+instead\b/i,
+    /upgrade(?:d)?\s+to\s+([A-Za-z0-9][A-Za-z0-9 ._+/-]{2,64}?)(?:\s+in\b|\s+on\b|[!,;]|$)/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m?.[1]) {
+      const name = m[1]
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/[.,;:]+$/, "");
+      if (name.length >= 3 && name.length <= 80) return name;
+    }
+  }
+  return null;
+}
+
 /** Prefer reasoning-panel styling over a chat bubble. */
 export function shouldRenderAsReasoning(text: string): boolean {
+  if (looksLikeTextToolCallDump(text)) return false;
   if (salvageUserFacingAnswer(text)) return false;
   return looksLikeProviderNotice(text) || looksLikeIncompleteReasoning(text);
 }
 
 export function sanitizeAssistantText(text: string): string {
   const stripped = stripThinkBlocks(text);
+  if (looksLikeTextToolCallDump(stripped)) return "";
   const salvaged = salvageUserFacingAnswer(stripped);
   return salvaged ?? stripped;
 }
@@ -185,13 +214,19 @@ export function sanitizeAssistantText(text: string): string {
  * Merge streamed draft vs done payload.
  * Prefer a complete answer over incomplete CoT; otherwise keep the longer text
  * (helps when the done payload was truncated).
+ * Drops JSON tool-call dumps (complete or truncated) so they never become the bubble.
  */
 export function resolveFinalAssistantText(
   eventText: string | undefined,
   draft: string,
 ): string {
-  const rawEvent = stripThinkBlocks(String(eventText ?? "")).trim();
-  const rawDraft = stripThinkBlocks(draft).trim();
+  const scrub = (raw: string): string => {
+    const t = stripThinkBlocks(raw).trim();
+    if (!t || looksLikeTextToolCallDump(t)) return "";
+    return t;
+  };
+  const rawEvent = scrub(String(eventText ?? ""));
+  const rawDraft = scrub(draft);
   const salvaged =
     salvageUserFacingAnswer(rawEvent) || salvageUserFacingAnswer(rawDraft);
   if (salvaged) return salvaged;

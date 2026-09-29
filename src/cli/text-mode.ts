@@ -58,6 +58,7 @@ export async function runTextMode(opts: TextModeOptions): Promise<void> {
   const bundle = await createTerminalAgent({
     workspaceRoot,
     autoApprove: opts.yes,
+    runMode: opts.yes ? "run-everything" : "auto-review",
     enableCheckpointer: true,
     onPtyOutput: opts.verbose
       ? (chunk) => {
@@ -176,6 +177,8 @@ export async function runTextMode(opts: TextModeOptions): Promise<void> {
             botInstruction: SELF_HEAL_BOT_INSTRUCTION,
             threadId: opts.thread ?? "repl",
             autoApprove: opts.yes,
+            runMode: bundle.runMode,
+            planGate: bundle.planGate,
             onEvent,
             desktopEnabled: false,
             memory,
@@ -189,6 +192,8 @@ export async function runTextMode(opts: TextModeOptions): Promise<void> {
           prompt: line,
           threadId: opts.thread ?? "repl",
           autoApprove: opts.yes,
+          runMode: bundle.runMode,
+          planGate: bundle.planGate,
           onEvent,
           desktopEnabled,
           memory,
@@ -202,6 +207,8 @@ export async function runTextMode(opts: TextModeOptions): Promise<void> {
         prompt: opts.promptParts.join(" "),
         threadId: opts.thread,
         autoApprove: opts.yes,
+        runMode: bundle.runMode,
+        planGate: bundle.planGate,
         onEvent,
         desktopEnabled,
         memory,

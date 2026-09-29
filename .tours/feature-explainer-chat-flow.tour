@@ -1,0 +1,68 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "Alur chat: kirim pesan → selesai",
+  "description": "End-to-end path of one desktop Agent turn — from ChatComposer Send through IPC, runAgentTurn, live events, and done/error.",
+  "tags": ["feature-explainer", "chat", "desktop"],
+  "steps": [
+    {
+      "file": "src/desktop-app/renderer/ChatComposer.tsx",
+      "line": 752,
+      "title": "1. User kirim pesan",
+      "description": "**Situation:** Composer di chat column.\n**Mechanism:** Enter (tanpa Shift) atau tombol Send memanggil `onSend()` kalau `canSend`.\n**Implication:** Ini satu-satunya pintu UI untuk turn baru dari keyboard/klik.\n**Gotcha:** Shift+Enter = baris baru, bukan send."
+    },
+    {
+      "file": "src/desktop-app/renderer/App.tsx",
+      "line": 3074,
+      "title": "2. handleSend menyiapkan UI turn",
+      "description": "**Situation:** Smart container `App` menerima `onSend`.\n**Mechanism:** `handleSend` trim prompt + attachment, cek `agentReady` / thread busy, clear input, set `loading` + phase `thinking`, append bubble user ke `items`, lalu panggil `electronAgent.sendPrompt`.\n**Implication:** UI sudah optimistic sebelum main process selesai.\n**Gotcha:** Kalau engine belum ready, turn dibatalkan dengan system bubble error — tidak ada IPC."
+    },
+    {
+      "file": "src/desktop-app/preload.cjs",
+      "line": 4,
+      "title": "3. Bridge preload → IPC",
+      "description": "**Situation:** Renderer tidak punya Node; preload mengekspos API aman.\n**Mechanism:** `sendPrompt(prompt, attachments)` → `ipcRenderer.invoke(\"agent:sendPrompt\", …)`.\n**Implication:** Semua turn desktop lewat channel IPC ini.\n**Gotcha:** Event live (token/tool) **bukan** return value invoke — mereka datang lewat `onEvent` / `agent:event`."
+    },
+    {
+      "file": "src/desktop-app/main.ts",
+      "line": 2556,
+      "title": "4. Main: agent:sendPrompt",
+      "description": "**Situation:** Electron main process handler.\n**Mechanism:** Resolve attachment → compose prompt multimodal → cek self-heal command → `turnWorkingScope` + busy lock → `runAgentTurn({…, onEvent: emitToRenderer})`.\n**Implication:** Di sini session diikat ke `activeThreadId` / bot / project folder.\n**Gotcha:** Kalau thread sudah di `busyThreadIds`, return error tanpa jalanin agent lagi."
+    },
+    {
+      "file": "src/cli/run-agent.ts",
+      "line": 565,
+      "title": "5. runAgentTurn — otak turn",
+      "description": "**Situation:** Shared runner CLI + desktop.\n**Mechanism:** Persist transcript start → fast-path greeting/desktop automation bila cocok → stream LangGraph/DeepAgents → emit `status` / `token` / `reasoning` / tool events → interrupt untuk approval bila perlu.\n**Implication:** Semua logika agent (tools, recursion, sanitize) hidup di sini, bukan di React.\n**Gotcha:** `onEvent` di-wrap supaya tiap event juga di-persist ke session store tanpa merusak stream UI."
+    },
+    {
+      "file": "src/desktop-app/main.ts",
+      "line": 365,
+      "title": "6. emitToRenderer → agent:event",
+      "description": "**Situation:** Bridge balik ke UI.\n**Mechanism:** `emitToRenderer` kirim `AgentUiEvent` ke semua BrowserWindow via `webContents.send(\"agent:event\", …)`.\n**Implication:** Streaming token/tool muncul live sebelum `sendPrompt` resolve.\n**Gotcha:** Event selalu membawa `threadId` turn — penting untuk background session cache."
+    },
+    {
+      "file": "src/desktop-app/preload.cjs",
+      "line": 90,
+      "title": "7. Renderer subscribe onEvent",
+      "description": "**Situation:** Preload menghubungkan channel ke callback React.\n**Mechanism:** `ipcRenderer.on(\"agent:event\", listener)`; `App` mendaftar di `useEffect` dan route event ke live UI atau `sessionCacheRef`.\n**Implication:** Ganti session di tengah turn tidak merusak stream — event non-live masuk cache.\n**Gotcha:** Busy badge hanya update dengan `threadId` eksplisit (lihat komentar di App.tsx ~2627)."
+    },
+    {
+      "file": "src/desktop-app/renderer/session-ui-state.ts",
+      "line": 111,
+      "title": "8. reduceSessionEvent — state per session",
+      "description": "**Situation:** Reducer murni untuk snapshot UI session.\n**Mechanism:** `status` update phase (thinking / waiting_approval / done); `token`/`reasoning` isi draft; tool events → activity chips + canvas artifacts; `done`/`error` akhiri loading.\n**Implication:** Live path dan background cache memakai reducer yang sama.\n**Gotcha:** `waiting_approval` + detail \"plan approval\" membuka plan HITL di canvas, beda dari tool approval biasa."
+    },
+    {
+      "file": "src/cli/run-agent.ts",
+      "line": 865,
+      "title": "9. Selesai: done + reflection",
+      "description": "**Situation:** Jawaban final sudah di-sanitize.\n**Mechanism:** Emit `status: done` lalu `done` dengan teks final; UI unlock. Reflection (`reflectAndStore`) jalan di background — tidak menahan bubble.\n**Implication:** User melihat jawaban lengkap sebelum memory learn selesai.\n**Gotcha:** Interrupt/approval: turn pause di `waiting_approval` sampai `resolveApproval` — baru lanjut graph."
+    },
+    {
+      "file": "src/desktop-app/renderer/App.tsx",
+      "line": 3248,
+      "title": "10. finally — bersihkan busy",
+      "description": "**Situation:** Setelah `sendPrompt` resolve (sukses atau gagal).\n**Mechanism:** `finally` di `handleSend` clear `loading`, `removeBusyThread`, refresh sessions/bots.\n**Implication:** Sidebar & footer balik idle hampir bersamaan dengan event `done`.\n**Gotcha:** Error dari invoke dan event `error` bisa dobel — handler dedupe system bubble dengan teks sama."
+    }
+  ]
+}

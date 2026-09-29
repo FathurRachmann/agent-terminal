@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "npx",
+      "args": ["-y", "tradingview-mcp-server@0.7.1"],
+      "description": "Unofficial TradingView screener API — stocks, forex, crypto, ETFs"
+    }
+  }
+}

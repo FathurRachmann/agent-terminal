@@ -1,5 +1,67 @@
 import { MarkdownBody } from "./MarkdownBody.js";
 
+export type PlanStep = {
+  index: number;
+  text: string;
+  status: "done" | "active" | "pending";
+};
+
+/** Parse checklist / numbered steps from plan markdown. */
+export function parsePlanSteps(markdown: string): PlanStep[] {
+  const lines = String(markdown || "").split(/\r?\n/);
+  const steps: PlanStep[] = [];
+  for (const line of lines) {
+    const check = line.match(/^\s*[-*]\s*\[([ xX])\]\s+(.+)$/);
+    if (check) {
+      const done = check[1]!.toLowerCase() === "x";
+      const text = check[2]!.trim();
+      const statusHint = /\(completed|done|finished\)/i.test(text);
+      steps.push({
+        index: steps.length + 1,
+        text: text.replace(/\s*\((completed|done|finished|pending|in[_ ]progress)\)\s*$/i, ""),
+        status: done || statusHint ? "done" : "pending",
+      });
+      continue;
+    }
+    const num = line.match(/^\s*(\d+)\.\s+(.+)$/);
+    if (num) {
+      const text = num[2]!.trim();
+      const struck = /^~~.+~~$/.test(text) || /<del>/i.test(text);
+      steps.push({
+        index: Number(num[1]) || steps.length + 1,
+        text: text.replace(/^~~|~~$/g, ""),
+        status: struck ? "done" : "pending",
+      });
+    }
+  }
+  if (!steps.length) return [];
+  // First pending becomes active
+  let activated = false;
+  return steps.map((s) => {
+    if (s.status === "done") return s;
+    if (!activated) {
+      activated = true;
+      return { ...s, status: "active" };
+    }
+    return { ...s, status: "pending" };
+  });
+}
+
+/** Subtitle like "Step 4 of 6: …" from goal / first heading. */
+export function planSubtitle(markdown: string, steps: PlanStep[]): string {
+  const goal =
+    markdown.match(/\*\*Goal:\*\*\s*(.+)/i)?.[1]?.trim() ||
+    markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() ||
+    "";
+  if (steps.length) {
+    const active = steps.find((s) => s.status === "active");
+    const n = active?.index ?? steps.filter((s) => s.status === "done").length + 1;
+    const label = goal || active?.text || "Implementation plan";
+    return `Step ${n} of ${steps.length}: ${label}`;
+  }
+  return goal || "Review the plan, then approve to continue with todos & coding.";
+}
+
 type Props = {
   markdown: string;
   busy?: boolean;
@@ -8,7 +70,7 @@ type Props = {
   onOpenCanvas?: () => void;
 };
 
-/** In-chat plan gate so Approve is visible without hunting the Canvas rail. */
+/** In-chat plan gate — Figma interrupt card. */
 export function PlanApprovalCard({
   markdown,
   busy,
@@ -16,44 +78,80 @@ export function PlanApprovalCard({
   onReject,
   onOpenCanvas,
 }: Props) {
+  const steps = parsePlanSteps(markdown);
+  const subtitle = planSubtitle(markdown, steps);
+
   return (
-    <div className="min-w-0 w-full max-w-[90%] self-start">
-      <div className="mb-1 text-[9.5px] text-muted">Plan approval</div>
-      <div className="min-w-0 overflow-hidden rounded-2xl rounded-bl-md border border-accent/45 bg-surface-3">
-        <div className="border-b border-border/80 bg-surface-2 px-3.5 py-2 text-[11px] font-medium text-fg">
-          Review the plan, then approve to continue with todos &amp; coding.
+    <div className="chat-plan">
+      <div className="chat-plan-top">
+        <div className="chat-plan-title-row">
+          <span className="chat-plan-icon" aria-hidden>
+            <span className="material-symbols-outlined">fact_check</span>
+          </span>
+          <div>
+            <h4 className="chat-plan-title">Plan Approval Required</h4>
+            <p className="chat-plan-sub">{subtitle}</p>
+          </div>
         </div>
-        <div className="max-h-[42vh] min-w-0 overflow-y-auto px-3.5 py-3">
+        <span className="chat-plan-halt">HALTED FOR SIGN-OFF</span>
+      </div>
+      <div className="chat-plan-body">
+        {steps.length > 0 ? (
+          <ul className="chat-plan-steps">
+            {steps.map((step) => (
+              <li
+                key={step.index}
+                className={`chat-plan-step is-${step.status}`}
+              >
+                <span className="chat-plan-check" aria-hidden>
+                  {step.status === "done" ? (
+                    <span className="material-symbols-outlined">check_box</span>
+                  ) : (
+                    <span className="material-symbols-outlined">
+                      check_box_outline_blank
+                    </span>
+                  )}
+                </span>
+                <span className="chat-plan-step-text">
+                  {step.index}. {step.text}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
           <MarkdownBody text={markdown || "_Plan saved. Approve to continue._"} />
-        </div>
-        <div className="flex flex-wrap items-center gap-2 border-t border-border bg-surface-2 px-3 py-2.5">
+        )}
+      </div>
+      <div className="chat-plan-actions">
+        {onOpenCanvas ? (
           <button
             type="button"
             disabled={busy}
-            onClick={onApprove}
-            className="rounded-md bg-accent px-3 py-1.5 text-[11px] font-semibold text-surface-0 disabled:opacity-50"
+            onClick={onOpenCanvas}
+            className="chat-btn-ghost"
           >
-            {busy ? "Working…" : "Approve plan"}
+            Open in Canvas
           </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onReject}
-            className="rounded-md border border-danger/40 bg-[#2a1518] px-3 py-1.5 text-[11px] text-danger disabled:opacity-50"
-          >
-            Reject
-          </button>
-          {onOpenCanvas ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={onOpenCanvas}
-              className="ml-auto rounded-md border border-border px-2.5 py-1.5 text-[10px] text-muted hover:text-fg disabled:opacity-50"
-            >
-              Open in Canvas
-            </button>
-          ) : null}
-        </div>
+        ) : null}
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onReject}
+          className="chat-btn-ghost"
+        >
+          Deny / Edit Plan
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onApprove}
+          className="chat-btn-primary"
+        >
+          <span className="material-symbols-outlined text-[14px]">
+            play_arrow
+          </span>
+          {busy ? "Working…" : "Approve & Execute (⌘↵)"}
+        </button>
       </div>
     </div>
   );

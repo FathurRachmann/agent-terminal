@@ -68,6 +68,15 @@ import {
   isWorkspaceThreadId,
   registerWorkspaceIpc,
 } from "./workspace-service.js";
+import { softAllowProjectFolders } from "./soft-allow-project.js";
+import {
+  buildDeliverySearchRoots,
+  sessionWorkspaceFields,
+} from "./session-workspace.js";
+import {
+  resolveNewSessionProjectId,
+  resolveSessionTurnProjectId,
+} from "./session-project-binding.js";
 import {
   loadMessagingConfig,
   resolveWhatsAppAccessRole,
@@ -84,7 +93,20 @@ import {
   type WhatsAppBridgeEvent,
   type WhatsAppInboundMessage,
 } from "./whatsapp-bridge.js";
+import { collectDeliverablePaths } from "./file-delivery.js";
+import {
+  isWhatsAppAttachablePath,
+  sanitizeWhatsAppOutboundText,
+  WA_OUTBOUND_HYGIENE_INSTRUCTION,
+} from "./whatsapp-outbound.js";
 import { extractInterruptActionNames, isPlanApprovalInterrupt } from "../agent/interrupt-utils.js";
+import { loadFolderAllowlist } from "../agent/folder-allowlist.js";
+import { userHomeRoot, usersScopeRoot } from "../agent/default-sandbox-roots.js";
+import {
+  loadPrivacyMode,
+  privacyModeInstruction,
+  savePrivacyMode,
+} from "../agent/privacy-mode.js";
 import {
   buildSelfHealPrompt,
   parseSelfHealCommand,
@@ -123,6 +145,8 @@ let mainWindow: BrowserWindow | null = null;
 let workspacesWindow: BrowserWindow | null = null;
 let agentBundle: AgentBundle | null = null;
 let agentBootError: string | null = null;
+/** True while createTerminalAgent is in flight (window may already be open). */
+let agentBooting = false;
 /** Threads currently executing a turn (supports parallel sessions). */
 const busyThreadIds = new Set<string>();
 let activeBotId = "general";
@@ -142,6 +166,26 @@ const pendingApprovals = new Map<
 >();
 let whatsappBridge: WhatsAppBridge | null = null;
 const selfHeal = new SelfHealController();
+
+/** Ring buffer of recent PTY output for @Terminals mentions. */
+const recentPtyChunks: string[] = [];
+const RECENT_PTY_MAX = 24;
+function appendRecentPty(chunk: string): void {
+  if (!chunk) return;
+  recentPtyChunks.push(chunk);
+  while (recentPtyChunks.length > RECENT_PTY_MAX) recentPtyChunks.shift();
+}
+function recentTerminalLog(): string {
+  return recentPtyChunks.join("").slice(-12_000);
+}
+
+function agentNotReadyMessage(): string {
+  if (agentBootError) return agentBootError;
+  if (agentBooting) {
+    return "Agent engine is still starting (tools/MCP)… wait a moment and retry.";
+  }
+  return "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
+}
 
 function settingsCtx(): SettingsContext {
   return { agentHome: profileHome || workspaceRoot, workspaceRoot, profileId };
@@ -165,21 +209,31 @@ function effectiveWorkspaceRoot(): string {
 
 function effectiveAllowedFolders(): string[] | undefined {
   const project = getActiveProject(agentStateRoot());
-  if (!project?.folders.length) return undefined;
-  return [...project.folders];
+  const persisted = loadFolderAllowlist(agentStateRoot());
+  const projectFolders = project?.folders?.length ? [...project.folders] : [];
+  const home = userHomeRoot();
+  const users = usersScopeRoot();
+  const merged = [
+    ...new Set([
+      ...(users ? [users] : []),
+      ...(home ? [home] : []),
+      ...projectFolders,
+      ...persisted,
+    ]),
+  ];
+  return merged.length ? merged : undefined;
 }
 
 /**
  * Roots for Open / Save as / reveal of agent deliverables.
- * Always includes Agent artifact home so working/global|bots|project resolve.
+ * Always includes Agent artifact home so tmp/global|bots|project resolve.
  */
 function deliverySearchRoots(): string[] {
-  const roots = [
-    ...(effectiveAllowedFolders() ?? []),
-    effectiveWorkspaceRoot(),
-    artifactHomeRoot(),
-  ].filter(Boolean);
-  return [...new Set(roots.map((r) => path.resolve(r)))];
+  return buildDeliverySearchRoots({
+    projectFolders: effectiveAllowedFolders() ?? null,
+    toolWorkspaceRoot: effectiveWorkspaceRoot(),
+    artifactHome: artifactHomeRoot(),
+  });
 }
 
 /** Artifact root is always the Agent application repo. */
@@ -196,19 +250,30 @@ function turnWorkingScope(opts?: {
 }): WorkingScope {
   const threadId = opts?.threadId ?? activeThreadId;
   const botSession = isBotThreadId(threadId);
-  const project = getActiveProject(agentStateRoot());
+  // Session meta is source of truth — not the global activeProjectId sticky flag.
+  // Otherwise general sessions keep writing into the last project's tmp/ folder.
+  const metaProjectId =
+    !botSession && agentBundle?.sessionStore
+      ? (agentBundle.sessionStore.readSessionMeta(threadId).projectId ?? null)
+      : null;
+  const resolvedProjectId = resolveSessionTurnProjectId({
+    isBotThread: botSession,
+    sessionMetaProjectId: metaProjectId,
+    overrideProjectId: opts?.projectId,
+  });
+  const project =
+    resolvedProjectId
+      ? loadProjectRegistry(agentStateRoot()).projects.find(
+          (p) => p.id === resolvedProjectId,
+        ) ?? null
+      : null;
   return resolveWorkingScope({
     threadId,
     botId:
       opts?.botId ??
       (botSession ? activeBotId || parseBotIdFromThread(threadId) : null),
     workspaceId: opts?.workspaceId ?? null,
-    projectId:
-      opts?.projectId !== undefined
-        ? opts.projectId
-        : botSession
-          ? null
-          : activeProjectId,
+    projectId: resolvedProjectId,
     projectName:
       opts?.projectName !== undefined
         ? opts.projectName
@@ -431,9 +496,7 @@ async function runSelfHealTurn(opts: {
 }): Promise<{ ok: boolean; content?: string; error?: string; threadId: string }> {
   const turnThreadId = opts.threadId ?? activeThreadId;
   if (!agentBundle) {
-    const error =
-      agentBootError ??
-      "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
+    const error = agentNotReadyMessage();
     emitToRenderer({ type: "error", message: error });
     return { ok: false, error, threadId: turnThreadId };
   }
@@ -488,7 +551,12 @@ async function runSelfHealTurn(opts: {
       botInstruction: SELF_HEAL_BOT_INSTRUCTION,
       threadId: turnThreadId,
       autoApprove: loadStoredSettings(agentStateRoot()).agent.autoApproveDestructive,
+      runMode: agentBundle.runMode,
+      planGate: agentBundle.planGate,
+      isPrivacyStrict: () =>
+        agentBundle?.sandbox.isPrivacyStrict() ?? true,
       desktopEnabled: false,
+      skipTurnScope: true,
       requestApproval: () =>
         new Promise((resolve) => {
           pendingApprovals.set(turnThreadId, resolve);
@@ -508,9 +576,37 @@ async function runSelfHealTurn(opts: {
     selfHeal.end("done");
     emitToRenderer({
       type: "warning",
-      message: "Self-heal finished. Review the repair summary above, then retry the original task.",
+      message: "Self-heal finished. Review the repair summary above, then Continue to resume the original task.",
       threadId: turnThreadId,
     } as never);
+    // Offer Continue with the last real user prompt (not the self-heal prompt).
+    const lastUser = (() => {
+      try {
+        const rows = agentBundle.sessionStore.readTranscript(turnThreadId, 40);
+        for (let i = rows.length - 1; i >= 0; i -= 1) {
+          const r = rows[i]!;
+          if (r.role !== "user") continue;
+          const text = String(r.content || "").trim();
+          if (!text) continue;
+          if (/self-heal|SELF_HEAL|diagnosing recent errors/i.test(text)) {
+            continue;
+          }
+          return text;
+        }
+      } catch {
+        /* ignore */
+      }
+      return opts.note?.trim() || "";
+    })();
+    if (lastUser) {
+      emitToRenderer({
+        type: "continue_available",
+        reason: "self_heal",
+        prompt: lastUser,
+        notice: "Self-heal finished — continue the original task.",
+        threadId: turnThreadId,
+      } as never);
+    }
     return {
       ok: true,
       content: answer,
@@ -597,15 +693,19 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
   }
 
   if (!agentBundle) {
-    const error =
-      agentBootError ?? "Agent engine not ready; cannot reply on WhatsApp.";
+    const error = agentBooting
+      ? "Agent engine is still starting… try again in a moment."
+      : agentBootError ?? "Agent engine not ready; cannot reply on WhatsApp.";
     emitMessagingToRenderer({ type: "error", payload: { message: error } });
     await bridge.sendText(
       msg.jid,
-      "Agent belum siap. Coba lagi sebentar ya.",
+      agentBooting
+        ? "Agent masih starting, kirim ulang sebentar lagi ya."
+        : "Agent belum siap. Coba lagi sebentar ya.",
     );
     return;
   }
+  const waBundle = agentBundle;
 
   if (busyThreadIds.has(turnThreadId)) {
     await bridge.sendText(
@@ -639,23 +739,29 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
       const tools = hasImages
         ? [...WA_FRIEND_ALLOWED_TOOLS, "vision_analyze"]
         : [...WA_FRIEND_ALLOWED_TOOLS];
-      agentBundle.botScope.setAllowedTools(tools);
+      waBundle.botScope.setAllowedTools(tools);
     } else {
-      agentBundle.botScope.setAllowedTools(null);
+      waBundle.botScope.setAllowedTools(null);
     }
 
-    const botInstruction = buildWhatsAppRoleInstruction(
-      role,
-      config.whatsapp.conciseReplies,
-    );
+    const botInstruction = [
+      buildWhatsAppRoleInstruction(
+        role,
+        config.whatsapp.conciseReplies,
+      ),
+      WA_OUTBOUND_HYGIENE_INSTRUCTION,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
 
     const attachments = msg.attachments ?? [];
     const prompt = await composePromptWithAttachments(msg.text, attachments);
     const userContent = await buildMultimodalUserContent(prompt, attachments);
 
     const writtenDuringTurn: string[] = [];
+    const harvestedFromTools: string[] = [];
     const answer = await runAgentTurn({
-      agent: agentBundle.agent,
+      agent: waBundle.agent,
       prompt,
       userContent,
       botInstruction,
@@ -663,16 +769,21 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
       // Owner can proceed through tool interrupts; friends use selective approve.
       autoApprove: false,
       desktopEnabled: false,
+      isPrivacyStrict: () => waBundle.sandbox.isPrivacyStrict(),
+      toolScope: {
+        get: () => waBundle.botScope.getAllowedTools(),
+        set: (tools) => waBundle.botScope.setAllowedTools(tools),
+      },
       requestApproval: async (interrupt) =>
         decideWhatsAppApproval(role, interrupt),
       memory: {
-        sessionStore: agentBundle.sessionStore,
-        memoryStore: agentBundle.memoryStore,
-        embedder: agentBundle.embedder,
-        model: agentBundle.model,
-        workspaceRoot: agentBundle.workspaceRoot,
-        profileHome: agentBundle.profileHome,
-        enableReflection: agentBundle.enableReflection,
+        sessionStore: waBundle.sessionStore,
+        memoryStore: waBundle.memoryStore,
+        embedder: waBundle.embedder,
+        model: waBundle.model,
+        workspaceRoot: waBundle.workspaceRoot,
+        profileHome: waBundle.profileHome,
+        enableReflection: waBundle.enableReflection,
       },
       onEvent: (ev) => {
         if (
@@ -685,35 +796,51 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
           ).trim();
           if (p) writtenDuringTurn.push(p);
         }
+        if (ev.type === "tool_end" && ev.output) {
+          for (const p of collectDeliverablePaths([String(ev.output)])) {
+            harvestedFromTools.push(p);
+          }
+        }
         emitToRenderer({ ...ev, threadId: turnThreadId } as never);
       },
     });
 
     const text = (answer || "").trim() || "(empty response)";
+    const forChat = sanitizeWhatsAppOutboundText(text) || "(empty response)";
     const clipped =
-      text.length > 3500 ? `${text.slice(0, 3490)}\n…(truncated)` : text;
+      forChat.length > 3500
+        ? `${forChat.slice(0, 3490)}\n…(truncated)`
+        : forChat;
     const pauseMs = Math.min(1_800, Math.max(400, Math.floor(clipped.length * 12)));
     await new Promise((r) => setTimeout(r, pauseMs));
     await bridge.sendText(msg.jid, clipped);
 
     // Attach deliverable files mentioned in the answer (agent → user upload).
     try {
-      const {
-        collectDeliverablePaths,
-        prepareFileForDelivery,
-      } = await import("./file-delivery.js");
+      const { prepareFileForDelivery } = await import("./file-delivery.js");
+      const explicitWrites = new Set(
+        writtenDuringTurn
+          .map((p) => path.basename(p.trim()))
+          .filter((b) => b && isWhatsAppAttachablePath(b)),
+      );
       const paths = collectDeliverablePaths(
         [text],
-        writtenDuringTurn,
-      ).slice(0, 3);
+        [...writtenDuringTurn, ...harvestedFromTools],
+      )
+        .filter((p) => isWhatsAppAttachablePath(p))
+        .slice(0, 3);
       const roots = deliverySearchRoots();
       for (const rel of paths) {
         const file = prepareFileForDelivery(roots, rel);
         if (!file.ok) {
-          await bridge.sendText(
-            msg.jid,
-            `File tidak bisa dikirim (${rel}): ${file.error}`,
-          );
+          // Text-scraped false positives — stay quiet.
+          // Only tell the user when an explicit write/edit deliverable failed.
+          if (explicitWrites.has(path.basename(rel))) {
+            await bridge.sendText(
+              msg.jid,
+              `File tidak bisa dikirim (${path.basename(rel)}): ${file.error}`,
+            );
+          }
           continue;
         }
         const sent = await bridge.sendDocument(msg.jid, {
@@ -765,7 +892,10 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
   const toolRoot = effectiveWorkspaceRoot();
   const artifactHome = workspaceRoot;
   const projectFolders = effectiveAllowedFolders() ?? [];
+  // Home + projects + persisted grants — createTerminalAgent also merges home.
   const allowedFolders = [...new Set([...projectFolders, artifactHome])];
+  agentBooting = true;
+  agentBootError = null;
   localGateway.markStarting({
     profileId,
     profileHome: agentStateRoot(),
@@ -781,12 +911,17 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
       artifactHome,
       profileHome: agentStateRoot(),
       profileId,
+      agentKind: prefs.agent.agentKind,
       autoApprove: prefs.agent.autoApproveDestructive,
+      runMode: prefs.agent.runMode,
+      toolAllowlist: prefs.agent.toolAllowlist,
       requirePlanApproval: prefs.agent.requirePlanApproval,
       enableCheckpointer: prefs.agent.enableCheckpointer,
       enableReflection: prefs.agent.enableReflection,
+      privacyMode: loadPrivacyMode(agentStateRoot()),
       onPtyOutput: (chunk: string) => {
         if (!chunk) return;
+        appendRecentPty(chunk);
         const owners = listBusyThreadIds();
         const threadId =
           owners.length === 1
@@ -801,10 +936,21 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
     });
     agentBundle = next;
     agentBootError = null;
+    agentBooting = false;
     localGateway.markReady();
+    emitToRenderer({
+      type: "status",
+      phase: "idle",
+      detail: "agent ready",
+    } as never);
     if (options?.disposePrevious && previous) {
       try {
         previous.sandbox.dispose();
+      } catch {
+        /* ignore */
+      }
+      try {
+        await previous.closeMcp();
       } catch {
         /* ignore */
       }
@@ -813,7 +959,12 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     agentBootError = message;
+    agentBooting = false;
     localGateway.markError(message);
+    emitToRenderer({
+      type: "error",
+      message: `Failed to boot agent engine: ${message}`,
+    } as never);
     throw err;
   }
 }
@@ -966,7 +1117,10 @@ app.whenReady().then(async () => {
   ensureSettingsFile(profileHome);
   applySettingsEnvToProcess(profileHome);
   initializeBots(profileHome);
-  syncActiveProjectFromDisk();
+  // Every app launch starts detached: sticky project must not leak into
+  // Files / terminal / general sessions across restarts.
+  setActiveProject(agentStateRoot(), null);
+  activeProjectId = null;
 
   ipcMain.handle("agent:getSettings", async () => {
     const folders = agentBundle?.sandbox.getAllowedRoots() ?? [workspaceRoot];
@@ -994,6 +1148,18 @@ app.whenReady().then(async () => {
           settingsCtx(),
           payload ?? {},
         );
+        // Live-update Run Mode without full agent reboot.
+        if (agentBundle && snapshot.agent) {
+          const mode = snapshot.agent.runMode;
+          if (
+            mode === "auto-review" ||
+            mode === "allowlist" ||
+            mode === "run-everything"
+          ) {
+            agentBundle.runMode.setRunMode(mode);
+          }
+          agentBundle.runMode.setAllowlist(snapshot.agent.toolAllowlist ?? []);
+        }
         let reloaded = false;
         let reloadReason: string | undefined;
         if (needsReload) {
@@ -1070,7 +1236,7 @@ app.whenReady().then(async () => {
           id: "rule-system-1",
           kind: "rule",
           title: "Working Directory Isolation",
-          content: "WHEN generating files/scripts -> DO place all output inside working/ folder",
+          content: "WHEN generating files/scripts -> DO place all output inside tmp/ folder",
           updatedAt: new Date().toISOString(),
           tags: ["learned", "auto-reflection"],
         },
@@ -1136,6 +1302,7 @@ app.whenReady().then(async () => {
   ipcMain.handle("agent:getStatus", async () => ({
     bridge: true,
     agentReady: Boolean(agentBundle),
+    agentBooting,
     error: agentBootError,
     model: process.env.AGENT_MODEL ?? "unknown",
     workspaceRoot: effectiveWorkspaceRoot(),
@@ -1144,6 +1311,10 @@ app.whenReady().then(async () => {
     profileHome: agentStateRoot(),
     activeProjectId,
     projectFolders: effectiveAllowedFolders() ?? null,
+    privacyMode: agentBundle?.sandbox.isPrivacyStrict()
+      ? true
+      : loadPrivacyMode(agentStateRoot()),
+    allowedRoots: agentBundle?.sandbox.getAllowedRoots() ?? null,
     gateway: localGateway.getStatus(),
     busy: busyThreadIds.size > 0,
     busyThreadIds: listBusyThreadIds(),
@@ -1152,10 +1323,195 @@ app.whenReady().then(async () => {
     activeBotId,
   }));
 
+  ipcMain.handle(
+    "agent:setPrivacyMode",
+    async (_event, payload?: { enabled?: boolean } | boolean) => {
+      const enabled =
+        typeof payload === "boolean"
+          ? payload
+          : Boolean(payload && typeof payload === "object" && payload.enabled);
+      try {
+        savePrivacyMode(agentStateRoot(), enabled);
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (!agentBundle?.sandbox) {
+        return {
+          ok: true,
+          privacyMode: enabled,
+          deferred: true,
+          detail: "Saved; applies when agent engine is ready.",
+        };
+      }
+      const result = agentBundle.sandbox.setPrivacyMode(enabled);
+      emitToRenderer({
+        type: "status",
+        phase: "idle",
+        detail: enabled
+          ? "Privacy ON — project confinement"
+          : "Privacy OFF — full machine access",
+      } as never);
+      return {
+        ok: true,
+        privacyMode: result.privacyStrict,
+        allowedRoots: result.allowedRoots,
+      };
+    },
+  );
+
   ipcMain.handle("agent:getGitSummary", async () => {
     const { getWorkspaceGitSummary } = await import("./workspace-git.js");
     return getWorkspaceGitSummary(effectiveWorkspaceRoot());
   });
+
+  ipcMain.handle(
+    "agent:searchMentionPaths",
+    async (_event, payload?: { query?: string }) => {
+      const q = String(payload?.query ?? "").trim().toLowerCase();
+      const root = effectiveWorkspaceRoot();
+      const items: Array<{
+        id: string;
+        label: string;
+        insert: string;
+        kind: "file" | "folder";
+        detail?: string;
+      }> = [];
+      try {
+        const { execFileSync } = await import("node:child_process");
+        // Prefer git ls-files for speed; fall back to shallow readdir.
+        let files: string[] = [];
+        try {
+          const out = execFileSync(
+            "git",
+            ["ls-files", "--cached", "--others", "--exclude-standard"],
+            {
+              cwd: root,
+              encoding: "utf8",
+              maxBuffer: 4_000_000,
+              timeout: 4_000,
+            },
+          );
+          files = out.split("\n").map((s) => s.trim()).filter(Boolean);
+        } catch {
+          files = fs
+            .readdirSync(root)
+            .filter((n) => !n.startsWith("."))
+            .slice(0, 200);
+        }
+        for (const rel of files) {
+          if (q && !rel.toLowerCase().includes(q)) continue;
+          const abs = path.join(root, rel);
+          let isDir = rel.endsWith("/");
+          try {
+            isDir = fs.existsSync(abs) && fs.statSync(abs).isDirectory();
+          } catch {
+            /* ignore */
+          }
+          items.push({
+            id: `path:${rel}`,
+            label: isDir ? `@folder:${rel}` : `@file:${rel}`,
+            insert: isDir ? `@folder:${rel}` : `@file:${rel}`,
+            kind: isDir ? "folder" : "file",
+            detail: rel,
+          });
+          if (items.length >= 8) break;
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+          items: [],
+        };
+      }
+      return { ok: true, items };
+    },
+  );
+
+  ipcMain.handle("agent:getPermissions", async () => {
+    const {
+      loadMergedPermissions,
+      permissionsPaths,
+    } = await import("../agent/permissions-store.js");
+    const root = effectiveWorkspaceRoot();
+    const profile = agentStateRoot();
+    const merged = loadMergedPermissions({
+      workspaceRoot: root,
+      profileHome: profile,
+    });
+    const paths = permissionsPaths({
+      workspaceRoot: root,
+      profileHome: profile,
+    });
+    let projectRaw = null;
+    try {
+      if (fs.existsSync(paths.project)) {
+        projectRaw = JSON.parse(fs.readFileSync(paths.project, "utf8"));
+      }
+    } catch {
+      projectRaw = null;
+    }
+    let teamRaw = null;
+    try {
+      if (fs.existsSync(paths.team)) {
+        teamRaw = JSON.parse(fs.readFileSync(paths.team, "utf8"));
+      }
+    } catch {
+      teamRaw = null;
+    }
+    return {
+      ok: true,
+      merged,
+      paths,
+      project: projectRaw,
+      team: teamRaw,
+    };
+  });
+
+  ipcMain.handle(
+    "agent:updatePermissions",
+    async (
+      _event,
+      payload?: {
+        scope?: "project" | "team";
+        data?: Record<string, unknown> | null;
+      },
+    ) => {
+      const {
+        writeProjectPermissions,
+        writeTeamPermissions,
+        loadMergedPermissions,
+      } = await import("../agent/permissions-store.js");
+      const root = effectiveWorkspaceRoot();
+      const scope = payload?.scope === "team" ? "team" : "project";
+      if (scope === "team") {
+        writeTeamPermissions(
+          root,
+          payload?.data === null
+            ? null
+            : ((payload?.data as never) ?? null),
+        );
+      } else if (payload?.data && typeof payload.data === "object") {
+        writeProjectPermissions(root, payload.data as never);
+      }
+      // Refresh allowlist on live agent
+      if (agentBundle) {
+        const merged = loadMergedPermissions({
+          workspaceRoot: root,
+          profileHome: agentStateRoot(),
+        });
+        const settingsAllow =
+          loadStoredSettings(agentStateRoot()).agent.toolAllowlist ?? [];
+        agentBundle.runMode.setAllowlist([
+          ...settingsAllow,
+          ...merged.terminalAllowlist,
+        ]);
+      }
+      return { ok: true };
+    },
+  );
 
   ipcMain.handle("agent:listGitBranches", async () => {
     const { listWorkspaceBranches } = await import("./workspace-git.js");
@@ -1431,27 +1787,56 @@ app.whenReady().then(async () => {
     };
   });
 
-  ipcMain.handle("agent:newSession", async () => {
+  ipcMain.handle(
+    "agent:newSession",
+    async (
+      _event,
+      payload?: { projectId?: string | null },
+    ) => {
     // Allow creating/viewing another session while a turn runs in the background.
     if (busyThreadIds.size > 0) {
       selectBotWithoutScopeMutation("general");
     } else {
       applyBotScope("general");
     }
+
+    const wantProject = resolveNewSessionProjectId(
+      payload && "projectId" in payload ? payload.projectId : null,
+    );
+
+    if (wantProject === null && activeProjectId) {
+      // Soft-clear sticky project so "New session" is not "in appgw".
+      await activateProjectAndReboot(null, { preserveThreadId: null });
+    } else if (wantProject && wantProject !== activeProjectId) {
+      const switched = await activateProjectAndReboot(wantProject, {
+        preserveThreadId: null,
+      });
+      if (!switched.ok) {
+        // Soft-allow folders if busy; still tag the new session to the project.
+        softAllowProjectFolders(agentBundle, agentStateRoot(), wantProject);
+      }
+    }
+
     activeThreadId = `desktop-${Date.now()}`;
     lastGeneralThreadId = activeThreadId;
     agentBundle?.sessionStore.writeSessionMeta(activeThreadId, {
-      projectId: activeProjectId,
+      projectId: wantProject,
     });
     return {
       ok: true,
       threadId: activeThreadId,
       activeBotId,
-      activeProjectId,
+      ...sessionWorkspaceFields({
+        workspaceRoot: effectiveWorkspaceRoot(),
+        projectFolders: effectiveAllowedFolders() ?? null,
+        activeProjectId: wantProject,
+        projectId: wantProject,
+      }),
       busyThreadIds: listBusyThreadIds(),
       busyThreadId: primaryBusyThreadId(),
     };
-  });
+  },
+  );
 
   ipcMain.handle("agent:openSession", async (_event, threadId: string) => {
     // Do not block navigation — background turns keep running on their thread ids.
@@ -1475,12 +1860,47 @@ app.whenReady().then(async () => {
       }
     }
 
+    const meta = agentBundle?.sessionStore.readSessionMeta(id) ?? {
+      projectId: null,
+    };
+    const sessionProjectId = meta.projectId ?? null;
+
+    // Opening a general session must clear sticky project UI/sandbox flag.
+    if (!isBotThreadId(id) && !sessionProjectId && activeProjectId) {
+      await activateProjectAndReboot(null, { preserveThreadId: id });
+    } else if (
+      !isBotThreadId(id) &&
+      sessionProjectId &&
+      sessionProjectId !== activeProjectId
+    ) {
+      const switched = await activateProjectAndReboot(sessionProjectId, {
+        preserveThreadId: id,
+      });
+      if (!switched.ok) {
+        softAllowProjectFolders(
+          agentBundle,
+          agentStateRoot(),
+          sessionProjectId,
+        );
+      }
+    }
+    // Ensure prompts still target the opened session (reboot must not steal focus).
+    activeThreadId = id;
+    if (!isBotThreadId(id)) lastGeneralThreadId = id;
+
     const events = agentBundle?.sessionStore.readTranscript(id, 800) ?? [];
     return {
       ok: true,
       threadId: id,
       activeBotId,
       events,
+      ...sessionWorkspaceFields({
+        workspaceRoot: effectiveWorkspaceRoot(),
+        projectFolders: effectiveAllowedFolders() ?? null,
+        // Session meta is the UI source of truth (not sticky registry while soft-aligned).
+        activeProjectId: sessionProjectId,
+        projectId: sessionProjectId,
+      }),
       busyThreadIds: listBusyThreadIds(),
       busyThreadId: primaryBusyThreadId(),
       busy: busyThreadIds.has(id),
@@ -1657,7 +2077,7 @@ app.whenReady().then(async () => {
 
   async function activateProjectAndReboot(
     projectId: string | null,
-    opts?: { force?: boolean },
+    opts?: { force?: boolean; preserveThreadId?: string | null },
   ) {
     const target =
       projectId === null || projectId === undefined || projectId === ""
@@ -1682,6 +2102,26 @@ app.whenReady().then(async () => {
 
     if (busyThreadIds.size > 0) {
       if (!opts?.force) {
+        // Leaving a project for general sessions must not wait on background turns.
+        // Soft-detach: clear active project; dispose user terminals so cwd resets.
+        // Keep agent sandbox alive for in-flight turns.
+        if (target === null) {
+          const result = setActiveProject(agentStateRoot(), null);
+          if (!result.ok) return result;
+          activeProjectId = null;
+          terminalService.disposeAll();
+          return {
+            ok: true as const,
+            registry: result.registry,
+            project: null,
+            activeProjectId: null,
+            threadId: activeThreadId,
+            workspaceRoot: effectiveWorkspaceRoot(),
+            projectFolders: effectiveAllowedFolders() ?? null,
+            projects: listProjectSummaries(agentStateRoot()),
+            softDetached: true as const,
+          };
+        }
         const busy = listBusyThreadIds();
         return {
           ok: false as const,
@@ -1710,11 +2150,19 @@ app.whenReady().then(async () => {
     activeProjectId = result.registry.activeProjectId;
     terminalService.disposeAll();
     await bootAgentEngine({ disposePrevious: true });
-    activeThreadId = `desktop-${Date.now()}`;
-    lastGeneralThreadId = activeThreadId;
-    agentBundle?.sessionStore.writeSessionMeta(activeThreadId, {
-      projectId: activeProjectId,
-    });
+    // preserveThreadId: keep opened session (openSession) or defer mint (newSession).
+    if (typeof opts?.preserveThreadId === "string" && opts.preserveThreadId) {
+      activeThreadId = opts.preserveThreadId;
+      lastGeneralThreadId = activeThreadId;
+    } else if (opts?.preserveThreadId === null) {
+      // Caller will mint / set the thread — do not orphan an empty session here.
+    } else {
+      activeThreadId = `desktop-${Date.now()}`;
+      lastGeneralThreadId = activeThreadId;
+      agentBundle?.sessionStore.writeSessionMeta(activeThreadId, {
+        projectId: activeProjectId,
+      });
+    }
     applyBotScope("general");
     return {
       ok: true as const,
@@ -1740,6 +2188,8 @@ app.whenReady().then(async () => {
       busyThreadIds.delete(id);
     },
     activateProjectAndReboot,
+    softAllowProjectFolders: (projectId) =>
+      softAllowProjectFolders(agentBundle, agentStateRoot(), projectId),
     getActiveThreadId: () => activeThreadId,
     setActiveThreadId: (id) => {
       activeThreadId = id;
@@ -2345,24 +2795,30 @@ app.whenReady().then(async () => {
         | {
             prompt?: string;
             attachments?: Array<{ path?: string; absPath?: string }>;
+            chatMode?: string;
           },
     ) => {
     const payload =
       typeof promptOrPayload === "string"
-        ? { prompt: promptOrPayload, attachments: [] as Array<{ path?: string; absPath?: string }> }
+        ? {
+            prompt: promptOrPayload,
+            attachments: [] as Array<{ path?: string; absPath?: string }>,
+            chatMode: undefined as string | undefined,
+          }
         : promptOrPayload || {};
     const prompt = String(payload.prompt ?? "").trim();
     const attachmentRefs = Array.isArray(payload.attachments)
       ? payload.attachments
       : [];
+    const { parseAgentChatMode } = await import("../agent/chat-mode.js");
+    const chatMode = parseAgentChatMode(payload.chatMode, "agent");
 
     if (!agentBundle) {
-      const error =
-        agentBootError ??
-        "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
+      const error = agentNotReadyMessage();
       emitToRenderer({ type: "error", message: error });
       return { ok: false, error };
     }
+    const bundle = agentBundle;
 
     const {
       buildMultimodalUserContent,
@@ -2405,7 +2861,16 @@ app.whenReady().then(async () => {
     const turnThreadId = activeThreadId;
     const turnBotId = activeBotId;
     const scope = turnWorkingScope({ threadId: turnThreadId, botId: turnBotId });
-    const { nudge: workingScopeNudge } = ensureTurnWorkingDirs(scope);
+    const { nudge: workingScopeNudgeBase } = ensureTurnWorkingDirs(scope);
+    const privacyOn = agentBundle?.sandbox.isPrivacyStrict()
+      ? true
+      : loadPrivacyMode(agentStateRoot());
+    const workingScopeNudge = [
+      workingScopeNudgeBase,
+      privacyModeInstruction(privacyOn),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     if (busyThreadIds.has(turnThreadId)) {
       return {
         ok: false,
@@ -2443,7 +2908,7 @@ app.whenReady().then(async () => {
         const wanted = isSpecializedBot(currentBot)
           ? (currentBot.tools ?? null)
           : null;
-        const current = agentBundle.botScope.getAllowedTools();
+        const current = bundle.botScope.getAllowedTools();
         const same =
           wanted === null
             ? current === null
@@ -2452,7 +2917,7 @@ app.whenReady().then(async () => {
               wanted.every((t) => current.includes(t));
         if (!same && wanted === null) {
           // Prefer unlocking tools when a general turn joins specialized ones.
-          agentBundle.botScope.setAllowedTools(null);
+          bundle.botScope.setAllowedTools(null);
         }
       }
       const specialized = isSpecializedBot(currentBot);
@@ -2460,29 +2925,68 @@ app.whenReady().then(async () => {
         ? buildBotScopeInstruction(currentBot)
         : undefined;
 
+      const toolScope = {
+        get: () => bundle.botScope.getAllowedTools(),
+        set: (tools: string[] | null) =>
+          bundle.botScope.setAllowedTools(tools),
+      };
+
+      const prefs = loadStoredSettings(agentStateRoot()).agent;
+      // Keep live Run Mode in sync with settings (no full agent reboot).
+      if (prefs.runMode) {
+        bundle.runMode.setRunMode(prefs.runMode);
+      }
+      bundle.runMode.setAllowlist(prefs.toolAllowlist ?? []);
+
+      // Plan mode starts locked until Build (task_todos Approve).
+      if (chatMode === "plan") {
+        bundle.planGate.lock();
+      }
+
       const answer = await runAgentTurn({
-        agent: agentBundle.agent,
+        agent: bundle.agent,
         prompt: composedPrompt,
         userContent,
         botInstruction,
         workingScopeNudge,
         threadId: turnThreadId,
-        projectId: isBotThreadId(turnThreadId) ? null : activeProjectId,
-        autoApprove: loadStoredSettings(agentStateRoot()).agent.autoApproveDestructive,
+        projectId: isBotThreadId(turnThreadId)
+          ? null
+          : (bundle.sessionStore.readSessionMeta(turnThreadId).projectId ??
+            null),
+        autoApprove: prefs.autoApproveDestructive,
+        chatMode,
+        runMode: bundle.runMode,
+        planGate: bundle.planGate,
+        isPrivacyStrict: () => bundle.sandbox.isPrivacyStrict(),
+        terminalLog: recentTerminalLog(),
+        chatTranscript: (() => {
+          try {
+            const rows = bundle.sessionStore
+              .readTranscript(turnThreadId, 16)
+              .slice(-12);
+            return rows
+              .map((r) => `${r.role}: ${String(r.content ?? "").slice(0, 800)}`)
+              .join("\n");
+          } catch {
+            return undefined;
+          }
+        })(),
         // Desktop fast-path is general-mode only — specialized bots stay scoped.
-        desktopEnabled: agentBundle.desktopEnabled && !specialized,
+        desktopEnabled: bundle.desktopEnabled && !specialized,
+        toolScope,
         requestApproval: () =>
           new Promise((resolve) => {
             pendingApprovals.set(turnThreadId, resolve);
           }),
         memory: {
-          sessionStore: agentBundle.sessionStore,
-          memoryStore: agentBundle.memoryStore,
-          embedder: agentBundle.embedder,
-          model: agentBundle.model,
-          workspaceRoot: agentBundle.workspaceRoot,
-          profileHome: agentBundle.profileHome,
-          enableReflection: agentBundle.enableReflection,
+          sessionStore: bundle.sessionStore,
+          memoryStore: bundle.memoryStore,
+          embedder: bundle.embedder,
+          model: bundle.model,
+          workspaceRoot: bundle.workspaceRoot,
+          profileHome: bundle.profileHome,
+          enableReflection: bundle.enableReflection,
         },
         onEvent: (ev) =>
           emitToRenderer({ ...ev, threadId: turnThreadId } as never),
@@ -2555,18 +3059,31 @@ app.whenReady().then(async () => {
     return;
   }
 
+  agentBooting = true;
+  emitToRenderer({
+    type: "status",
+    phase: "boot",
+    detail: "starting agent engine",
+  } as never);
+
   try {
     await bootAgentEngine();
-    // Prefer last real general transcript over a fresh empty desktop-* id.
-    const newestGeneral = listGeneralSessions()[0];
-    if (newestGeneral) {
-      lastGeneralThreadId = newestGeneral.threadId;
-      if (!isBotThreadId(activeThreadId)) {
-        activeThreadId = newestGeneral.threadId;
-      }
-    }
-    applyBotScope(activeBotId);
+    terminalService.disposeAll();
+    // Fresh general session on every launch (old sessions stay in the sidebar).
+    activeThreadId = `desktop-${Date.now()}`;
+    lastGeneralThreadId = activeThreadId;
+    agentBundle?.sessionStore.writeSessionMeta(activeThreadId, {
+      projectId: null,
+    });
+    applyBotScope("general");
     console.log("Agent engine ready");
+    // Prefetch Laya so the first chat turn does not pay cold HF/torch load.
+    try {
+      const { warmLayaInBackground } = await import("../decision/warm.js");
+      warmLayaInBackground();
+    } catch {
+      /* optional */
+    }
     // Resume WhatsApp if previously enabled + has auth.
     try {
       const cfg = loadMessagingConfig(agentStateRoot());
@@ -2579,7 +3096,12 @@ app.whenReady().then(async () => {
     }
   } catch (err) {
     agentBootError = err instanceof Error ? err.message : String(err);
+    agentBooting = false;
     console.error("Failed to boot agent engine:", err);
+    emitToRenderer({
+      type: "error",
+      message: `Failed to boot agent engine: ${agentBootError}`,
+    } as never);
   }
 
   app.on("activate", () => {

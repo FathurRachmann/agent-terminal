@@ -234,6 +234,7 @@ function scanWorkingFiles(
   fallbackSession: { threadId: string; sessionPreview: string },
 ): ArtifactRecord[] {
   const dirs = [
+    path.join(workspaceRoot, "tmp"),
     path.join(workspaceRoot, "working"),
     path.join(workspaceRoot, ".agent", "task"),
   ];
@@ -264,7 +265,7 @@ function scanWorkingFiles(
         location: rel,
         category,
         threadId: fallbackSession.threadId,
-        sessionPreview: fallbackSession.sessionPreview || "working/",
+        sessionPreview: fallbackSession.sessionPreview || "tmp/",
         at: new Date(mtime).toISOString(),
         kind: inferPreviewKind(extensionOf(rel)),
         path: rel,
@@ -302,7 +303,7 @@ export function listAllArtifacts(options: {
     const latest = sessions[0];
     for (const row of scanWorkingFiles(options.workspaceRoot, {
       threadId: latest?.threadId ?? "workspace",
-      sessionPreview: latest?.preview ?? "working/",
+      sessionPreview: latest?.preview ?? "tmp/",
     })) {
       // Prefer transcript-backed rows when same location exists
       const key = [...map.values()].find(

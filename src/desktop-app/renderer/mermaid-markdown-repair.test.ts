@@ -15,7 +15,7 @@ describe("repairMermaidMarkdown", () => {
 
   it("wraps bare mermaidsequenceDiagram prose", () => {
     const raw =
-      "mermaidsequenceDiagram\n    actor User\n    User->>API: login\n\nFile tersimpan di working/bots/x.mmd";
+      "mermaidsequenceDiagram\n    actor User\n    User->>API: login\n\nFile tersimpan di tmp/bots/x.mmd";
     const out = repairMermaidMarkdown(raw);
     assert.match(out, /```mermaid\nsequenceDiagram/);
     assert.match(out, /```\nFile tersimpan/);

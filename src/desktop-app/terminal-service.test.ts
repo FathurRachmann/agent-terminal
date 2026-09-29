@@ -89,6 +89,23 @@ describe("TerminalService", () => {
     assert.equal(svc.list().length, 0);
   });
 
+  it("after disposeAll, create uses the new cwd (soft-detach reset)", () => {
+    if (process.platform === "win32") return;
+
+    const todo = fs.mkdtempSync(path.join(os.tmpdir(), "ui-term-todo-"));
+    const agent = fs.mkdtempSync(path.join(os.tmpdir(), "ui-term-agent-"));
+    dirs.push(todo, agent);
+    const svc = new TerminalService();
+    services.push(svc);
+
+    const stuck = svc.create({ cwd: todo, cols: 40, rows: 12 });
+    assert.equal(stuck.cwd, todo);
+    svc.disposeAll();
+    const fresh = svc.create({ cwd: agent, cols: 40, rows: 12 });
+    assert.equal(fresh.cwd, agent);
+    assert.equal(svc.list().length, 1);
+  });
+
   it("write/resize/kill return errors for unknown ids", () => {
     const svc = new TerminalService();
     services.push(svc);

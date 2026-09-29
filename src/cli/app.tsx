@@ -90,6 +90,7 @@ function App({ workspaceRoot, autoApprove, initialPrompt }: Props) {
       const bundle = await createTerminalAgent({
         workspaceRoot,
         autoApprove,
+        runMode: autoApprove ? "run-everything" : "auto-review",
         enableCheckpointer: true,
       });
       if (disposed) {
@@ -238,9 +239,15 @@ function App({ workspaceRoot, autoApprove, initialPrompt }: Props) {
         prompt,
         threadId: "agent-cli",
         autoApprove,
+        runMode: bundle.runMode,
+        planGate: bundle.planGate,
         onEvent,
         requestApproval: autoApprove ? undefined : requestApproval,
         desktopEnabled: bundle.desktopEnabled,
+        toolScope: {
+          get: () => bundle.botScope.getAllowedTools(),
+          set: (tools) => bundle.botScope.setAllowedTools(tools),
+        },
         memory: {
           sessionStore: bundle.sessionStore,
           memoryStore: bundle.memoryStore,

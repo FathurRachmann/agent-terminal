@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [],
+    "preToolUse": [],
+    "beforeShellExecution": [],
+    "beforeMCPExecution": [],
+    "sessionStart": [],
+    "stop": [],
+    "afterAgentResponse": []
+  }
+}

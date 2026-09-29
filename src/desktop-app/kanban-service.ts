@@ -13,6 +13,7 @@ import {
 } from "../agent/kanban/boards.js";
 import { isValidBoardSlug, normalizeBoardSlug } from "../agent/kanban/paths.js";
 import { fallbackDecomposer } from "../agent/kanban/decompose.js";
+import { layaAwareDecomposer } from "../decision/kanban-triage.js";
 import { dispatchOnce, type SpawnRequest } from "../agent/kanban/dispatch.js";
 import { runKanbanGoalLoop, heuristicGoalJudge } from "../agent/kanban/goal.js";
 import {
@@ -42,7 +43,7 @@ export type KanbanServiceDeps = {
   isAgentReady: () => boolean;
   /** Active profile home (for project registry). */
   getProfileHome: () => string;
-  /** Agent application root (for working/project/<name>). */
+  /** Agent application root (for tmp/project/<name>). */
   getArtifactHome: () => string;
   runWorkerTurn: (opts: {
     boardSlug: string;
@@ -618,7 +619,7 @@ async function runDispatchTick(
     return await dispatchOnce({
       maxPerTick: max,
       profiles,
-      decomposer: fallbackDecomposer(),
+      decomposer: layaAwareDecomposer(fallbackDecomposer()),
       spawn: (req) => spawnWorker(deps, req),
     });
   } finally {

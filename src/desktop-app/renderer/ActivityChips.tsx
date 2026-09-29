@@ -5,6 +5,11 @@ import {
   shouldAutoFocusCanvas,
   type ActivityArtifact,
 } from "./activity-artifact.js";
+import {
+  detectTestPassSummary,
+  extractDiffFromToolOutput,
+  summarizePatchStats,
+} from "./tool-diff.js";
 
 export type AgentPhase =
   | "boot"
@@ -29,7 +34,14 @@ export type AgentUiEvent =
   | { type: "error"; message: string }
   | { type: "reflection"; memoryIds: string[] }
   | { type: "warning"; message: string }
-  | { type: "pty"; text: string };
+  | { type: "pty"; text: string }
+  | {
+      type: "continue_available";
+      reason: "model_unavailable" | "self_heal";
+      prompt: string;
+      suggestedModel?: string | null;
+      notice?: string;
+    };
 
 function shortJson(value: unknown, max = 280): string {
   try {
@@ -43,22 +55,22 @@ function shortJson(value: unknown, max = 280): string {
 export function phaseColor(phase: AgentPhase): string {
   switch (phase) {
     case "thinking":
-      return "#7eb6ff";
+      return "#7d98ff";
     case "reasoning":
-      return "#c3a6ff";
+      return "#7d98ff";
     case "tool":
     case "pty":
-      return "#5dcaa5";
+      return "#7d98ff";
     case "waiting_approval":
-      return "#e3b341";
+      return "#ee7d77";
     case "reflecting":
-      return "#79b8ff";
+      return "#7d98ff";
     case "error":
-      return "#ff7b72";
+      return "#ee7d77";
     case "done":
-      return "#3fb950";
+      return "#7d98ff";
     default:
-      return "#8b98a8";
+      return "#747676";
   }
 }
 
@@ -86,6 +98,8 @@ function eventTitle(ev: AgentUiEvent): string {
       return "done";
     case "pty":
       return "pty";
+    case "continue_available":
+      return "continue available";
     default:
       return "event";
   }
@@ -115,6 +129,14 @@ export function eventBody(ev: AgentUiEvent): string {
       return truncate(safeStr(ev.text), 400);
     case "pty":
       return truncate(safeStr(ev.text), 400);
+    case "continue_available":
+      return truncate(
+        safeStr(ev.notice) ||
+          (ev.reason === "self_heal"
+            ? "Self-heal finished — continue available"
+            : "Model unavailable — continue available"),
+        400,
+      );
     default:
       return "";
   }
@@ -302,29 +324,132 @@ export function shouldMirrorInChat(ev: AgentUiEvent): boolean {
 }
 
 /** One-liner in chat — click to expand input/output detail. */
-export function CompactActivityChip({ event }: { event: AgentUiEvent }) {
+export function CompactActivityChip({
+  event,
+  input,
+  output,
+}: {
+  event: AgentUiEvent;
+  /** Tool args captured at start (for tool_end rows). */
+  input?: unknown;
+  output?: string;
+}) {
   const [open, setOpen] = useState(false);
-  const { icon, text, color } = compactActivityLabel(event);
-  const detail = formatEventDetail(event);
-  const expandable = detail.trim().length > 0;
+  const args = asRecord(
+    input ?? (event.type === "tool_start" ? event.input : {}),
+  );
+  const out =
+    output ?? (event.type === "tool_end" ? safeStr(event.output) : "");
+  const name =
+    event.type === "tool_start" || event.type === "tool_end" ? event.name : "";
+
+  const running = event.type === "tool_start";
+  const done =
+    event.type === "tool_end" ||
+    event.type === "reflection" ||
+    event.type === "context_compacted" ||
+    event.type === "done";
+  const err = event.type === "error" || event.type === "warning";
+  const isMemory =
+    event.type === "reflection" || event.type === "context_compacted";
+
+  let action = "";
+  let result = "";
+  if (isMemory) {
+    action = compactActivityLabel(event).text;
+    result = event.type === "reflection" ? "stored" : "ok";
+  } else if (name === "execute" || name === "shell" || name === "bash") {
+    const cmd = String(args.command ?? args.cmd ?? "").trim();
+    action = cmd ? `execute: \`${truncate(cmd, 56)}\`` : "execute";
+    result = detectTestPassSummary(out) || (done ? "done" : "");
+  } else if (
+    name === "edit_file" ||
+    name === "edit" ||
+    name === "str_replace" ||
+    name === "write_file" ||
+    name === "write"
+  ) {
+    const path = String(
+      args.file_path ?? args.path ?? args.filename ?? args.file ?? "",
+    );
+    const file = path ? basenamePath(path) : path || "file";
+    const toolLabel =
+      name === "write_file" || name === "write" ? "write_file" : "edit_file";
+    action = `${toolLabel}: \`${truncate(file || path, 48)}\``;
+    result = summarizePatchStats(out) || (done ? "patched" : "");
+  } else if (name) {
+    const label = compactActivityLabel({
+      type: "tool_start",
+      name,
+      input: args,
+    });
+    action = `${name}: ${label.text.replace(/^(Read|Wrote|Edited|Ran|Used|Finished)\s+/i, "")}`;
+    result = done ? "done" : "";
+  } else {
+    action = compactActivityLabel(event).text;
+  }
+
+  const richDetail = formatEventDetail(
+    event.type === "tool_start"
+      ? event
+      : name
+        ? ({ type: "tool_start", name, input: args } as AgentUiEvent)
+        : event,
+    done
+      ? ({ type: "tool_end", name, output: out } as Extract<
+          AgentUiEvent,
+          { type: "tool_end" }
+        >)
+      : undefined,
+  );
+  const expandable = richDetail.trim().length > 0;
+  const diff = done ? extractDiffFromToolOutput(out) : null;
+  const badge = err ? "ERR" : done ? "OK" : running ? "RUNNING" : "•";
+  const badgeClass = err
+    ? "is-err"
+    : done
+      ? "is-ok"
+      : running
+        ? "is-run"
+        : "is-ok";
+  const resultMuted =
+    running || (!!result && !/^Passed|^Failed/i.test(result));
 
   return (
-    <div className="max-w-full">
-      <button
-        type="button"
-        onClick={() => expandable && setOpen((v) => !v)}
-        aria-expanded={expandable ? open : undefined}
-        className={`inline-flex max-w-full items-center gap-2 border-0 bg-transparent py-0.5 text-left text-[11px] leading-snug ${expandable ? "cursor-pointer" : "cursor-default"}`}
-        style={{ color }}
-        title={expandable ? (open ? "Collapse" : "Expand details") : undefined}
-      >
-        <span className="w-4 shrink-0 text-center opacity-95">{icon}</span>
-        <span className="truncate text-fg-dim">{text}</span>
-        {expandable && (
-          <span className="shrink-0 text-[9px] text-muted">{open ? "▾" : "▸"}</span>
-        )}
-      </button>
-      {open && expandable && <DetailBlock text={detail} />}
+    <div className="chat-tool-block">
+      <div className="chat-tool-row">
+        <button
+          type="button"
+          onClick={() => expandable && setOpen((v) => !v)}
+          aria-expanded={expandable ? open : undefined}
+          className={`chat-tool-left border-0 bg-transparent p-0 text-left ${expandable ? "cursor-pointer" : "cursor-default"}`}
+          title={expandable ? (open ? "Collapse" : "Expand details") : undefined}
+        >
+          <span className={`chat-tool-badge ${badgeClass}`}>{badge}</span>
+          <span className="chat-tool-action">{action}</span>
+        </button>
+        {result ? (
+          <span className={`chat-tool-right${resultMuted ? " is-muted" : ""}`}>
+            {result}
+          </span>
+        ) : null}
+      </div>
+      {diff ? (
+        <div className="chat-diff">
+          <div className="chat-diff-head">
+            <span className="chat-diff-meta">DIFF CHUNK: {diff.header}</span>
+            <span className="chat-diff-lang">SYNTAX: {diff.language}</span>
+          </div>
+          <pre className="chat-diff-body">
+            {diff.lines.map((line, i) => (
+              <div key={i} className={`chat-diff-line is-${line.kind}`}>
+                {line.text}
+              </div>
+            ))}
+          </pre>
+        </div>
+      ) : null}
+      {open && expandable ? <DetailBlock text={richDetail} /> : null}
     </div>
   );
 }
@@ -366,49 +491,69 @@ export function CollapsibleTraceGroup({
   entries,
   live = false,
 }: {
-  entries: Array<{ id: string; event: AgentUiEvent }>;
+  entries: Array<{
+    id: string;
+    event: AgentUiEvent;
+    input?: unknown;
+    output?: string;
+  }>;
   live?: boolean;
 }) {
-  const [open, setOpen] = useState(live);
+  const [open, setOpen] = useState(true);
 
   useEffect(() => {
-    setOpen(live);
+    if (live) setOpen(true);
   }, [live]);
 
   if (entries.length === 0) return null;
 
-  if (live) {
-    return (
-      <div className="flex max-w-[92%] flex-col gap-0.5 self-start pl-1">
-        {entries.map((row) => (
-          <CompactActivityChip key={row.id} event={row.event} />
-        ))}
-      </div>
-    );
-  }
-
-  const summary = summarizeTraceGroup(entries.map((e) => e.event));
+  const isMemoryOnly = entries.every(
+    (e) =>
+      e.event.type === "reflection" || e.event.type === "context_compacted",
+  );
+  const doneCount = entries.filter(
+    (e) =>
+      e.event.type === "tool_end" ||
+      e.event.type === "reflection" ||
+      e.event.type === "context_compacted" ||
+      e.event.type === "done" ||
+      e.event.type === "warning",
+  ).length;
+  const title = isMemoryOnly
+    ? `MEMORY UPDATE (${entries.length})`
+    : `TOOL INVOCATIONS (${entries.length} EXECUTED)`;
+  const status = live
+    ? "RUNNING…"
+    : doneCount >= entries.length
+      ? isMemoryOnly
+        ? "STORED"
+        : "ALL INTEGRITY CHECKS GREEN"
+      : `${doneCount}/${entries.length} COMPLETE`;
 
   return (
-    <div className="max-w-[92%] self-start pl-1">
+    <div className={`chat-tools${isMemoryOnly ? " is-memory" : ""}`}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="inline-flex max-w-full cursor-pointer items-center gap-2 border-0 bg-transparent py-0.5 text-left text-[11px] leading-snug"
-        style={{ color: summary.color }}
-        title={open ? "Collapse steps" : "Expand steps"}
+        className="chat-tools-head"
+        title={open ? "Collapse" : "Expand"}
       >
-        <span className="w-2.5 shrink-0 text-[9px] text-muted">
-          {open ? "▾" : "▸"}
-        </span>
-        <span className="w-4 shrink-0 text-center opacity-95">{summary.icon}</span>
-        <span className="truncate text-fg-dim">{summary.text}</span>
+        <span className="chat-tools-title">{title}</span>
+        <span className="chat-tools-status">{status}</span>
       </button>
-      {open && (
-        <div className="mt-0.5 ml-1 flex flex-col gap-0.5 border-l border-border pl-2">
+      {(open || live) && (
+        <div className="chat-tools-list">
           {entries.map((row) => (
-            <CompactActivityChip key={row.id} event={row.event} />
+            <CompactActivityChip
+              key={row.id}
+              event={row.event}
+              input={row.input}
+              output={
+                row.output ??
+                (row.event.type === "tool_end" ? row.event.output : undefined)
+              }
+            />
           ))}
         </div>
       )}

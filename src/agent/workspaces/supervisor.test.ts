@@ -3,12 +3,18 @@ import { describe, it } from "node:test";
 import type { WorkspaceBot } from "./bots.js";
 import {
   applyRoundBudget,
+  buildSupervisorContinuePrompt,
+  buildSupervisorInstruction,
   buildSupervisorUserPrompt,
   excludeSupervisorFromQueue,
   extractJsonObject,
   formatSupervisorSystemNote,
+  looksLikeDeferredNextActions,
+  MAX_SUPERVISOR_AUTO_CONTINUE,
   parseSupervisorVerdict,
   pickSupervisorBot,
+  resolveContinueWorkerIds,
+  shouldAutoContinue,
 } from "./supervisor.js";
 
 function bot(
@@ -93,6 +99,15 @@ describe("parseSupervisorVerdict", () => {
     assert.equal(v.status, "done");
     assert.equal(v.parsed, false);
   });
+
+  it("treats PERLU LANJUT prose as needs_more and extracts Next", () => {
+    const v = parseSupervisorVerdict(
+      "Supervisor: PERLU LANJUT\nKurang bukti file.\nNext: frontend-developer baca App.tsx; qa tulis test",
+    );
+    assert.equal(v.status, "needs_more");
+    assert.ok(v.nextActions.length >= 1);
+    assert.match(v.nextActions.join(" "), /frontend-developer/i);
+  });
 });
 
 describe("applyRoundBudget", () => {
@@ -134,6 +149,17 @@ describe("format + prompt helpers", () => {
     assert.match(p, /App\.tsx/);
   });
 
+  it("buildSupervisorInstruction forbids tool dumps", () => {
+    const text = buildSupervisorInstruction(
+      bot("senior-developer", { name: "Senior Developer", role: "Senior Dev" }),
+    );
+    assert.match(text, /NOT the implementer/i);
+    assert.match(text, /automatically re-run workers/i);
+    assert.match(text, /dump directory/i);
+    assert.match(text, /BAD nextActions/i);
+    assert.match(text, /EXECUTABLE work/i);
+  });
+
   it("formatSupervisorSystemNote labels status", () => {
     const note = formatSupervisorSystemNote(
       {
@@ -148,5 +174,131 @@ describe("format + prompt helpers", () => {
     );
     assert.match(note, /TERBLOKIR/);
     assert.match(note, /CTO/);
+  });
+
+  it("formatSupervisorSystemNote labels PERLU LANJUT", () => {
+    const note = formatSupervisorSystemNote(
+      {
+        status: "needs_more",
+        summary: "Kurang",
+        gaps: ["bukti"],
+        nextActions: ["FE baca file"],
+        raw: "",
+        parsed: true,
+      },
+      "Senior Developer",
+    );
+    assert.match(note, /PERLU LANJUT/);
+    assert.match(note, /Next:/);
+  });
+
+  it("shouldAutoContinue only for needs_more under budget", () => {
+    const v = parseSupervisorVerdict(
+      '{"status":"needs_more","summary":"x","gaps":[],"nextActions":["y"]}',
+    );
+    assert.equal(shouldAutoContinue(v, 2, 8, 0), true);
+    assert.equal(shouldAutoContinue(v, 8, 8, 0), false);
+    assert.equal(
+      shouldAutoContinue({ ...v, status: "done" }, 2, 8, 0),
+      false,
+    );
+    assert.equal(
+      shouldAutoContinue(v, 2, 8, MAX_SUPERVISOR_AUTO_CONTINUE),
+      false,
+    );
+    assert.equal(MAX_SUPERVISOR_AUTO_CONTINUE, 3);
+  });
+
+  it("buildSupervisorContinuePrompt includes gaps", () => {
+    const p = buildSupervisorContinuePrompt({
+      originalPrompt: "Cek bug",
+      verdict: parseSupervisorVerdict(
+        '{"status":"needs_more","summary":"Kurang","gaps":["bukti ls"],"nextActions":["FE ls"]}',
+      ),
+      round: 1,
+      maxRounds: 8,
+    });
+    assert.match(p, /AUTO-CONTINUE/);
+    assert.match(p, /EXECUTE NOW/i);
+    assert.match(p, /write_file/);
+    assert.match(p, /bukti ls/);
+    assert.match(p, /FE ls/);
+    assert.match(p, /FORBIDDEN/);
+  });
+
+  it("looksLikeDeferredNextActions detects audit-only endings", () => {
+    assert.equal(
+      looksLikeDeferredNextActions(
+        "Audit selesai. Yang perlu dibereskan berikutnya adalah samakan kontrak API dan port.",
+      ),
+      true,
+    );
+    assert.equal(
+      looksLikeDeferredNextActions(
+        "Sudah saya ubah backend/src/server.js pakai write_file — port 3001 + PUT title/completed.",
+      ),
+      false,
+    );
+  });
+});
+
+describe("resolveContinueWorkerIds", () => {
+  const bots = [
+    bot("frontend-developer", {
+      name: "Frontend Developer",
+      role: "Frontend",
+    }),
+    bot("qa", { name: "QA Engineer", role: "QA" }),
+    bot("senior-developer", {
+      name: "Senior Developer",
+      role: "Senior Developer",
+    }),
+  ];
+
+  it("prefers bots named in nextActions", () => {
+    const ids = resolveContinueWorkerIds({
+      previousWorkerIds: ["frontend-developer", "qa"],
+      bots,
+      verdict: parseSupervisorVerdict(
+        JSON.stringify({
+          status: "needs_more",
+          summary: "Kurang",
+          gaps: [],
+          nextActions: ["qa: tulis test untuk App.tsx"],
+        }),
+      ),
+      supervisorId: "senior-developer",
+    });
+    assert.deepEqual(ids, ["qa"]);
+  });
+
+  it("falls back to previous workers excluding supervisor", () => {
+    const ids = resolveContinueWorkerIds({
+      previousWorkerIds: ["frontend-developer", "qa"],
+      bots,
+      verdict: parseSupervisorVerdict(
+        '{"status":"needs_more","summary":"Kurang","gaps":["bukti"],"nextActions":["perbaiki"]}',
+      ),
+      supervisorId: "senior-developer",
+    });
+    assert.deepEqual(ids, ["frontend-developer", "qa"]);
+    assert.ok(!ids.includes("senior-developer"));
+  });
+
+  it("includes supervisor when named as implementer", () => {
+    const ids = resolveContinueWorkerIds({
+      previousWorkerIds: ["frontend-developer"],
+      bots,
+      verdict: parseSupervisorVerdict(
+        JSON.stringify({
+          status: "needs_more",
+          summary: "Senior harus fix",
+          gaps: [],
+          nextActions: ["Senior Developer: perbaiki bug di App.tsx"],
+        }),
+      ),
+      supervisorId: "senior-developer",
+    });
+    assert.ok(ids.includes("senior-developer"));
   });
 });

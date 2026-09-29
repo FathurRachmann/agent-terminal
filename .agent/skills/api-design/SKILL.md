@@ -40,3 +40,4 @@ Consistent envelope when the project uses one:
 
 - Auth and threats → `security-review`
 - Service layer → `backend-patterns`
+- Claude / Anthropic SDK, models, streaming, tools → `/skills/claude-api/SKILL.md`

@@ -18,7 +18,7 @@ export type ResolvedWorkspace = {
   cwd: string;
   ephemeral: boolean;
   projectId?: string | null;
-  /** Agent-root artifact dir for this project (working/project/<name>). */
+  /** Agent-root artifact dir for this project (tmp/project/<name>). */
   artifactDir?: string | null;
 };
 
@@ -27,7 +27,7 @@ export type ResolveWorkspaceOptions = {
   defaultWorkdir?: string;
   /** Profile home for project registry. */
   profileHome?: string;
-  /** Agent application root for working/project/<name> artifacts. */
+  /** Agent application root for tmp/project/<name> artifacts. */
   artifactHome?: string;
 };
 

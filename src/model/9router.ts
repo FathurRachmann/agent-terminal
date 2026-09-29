@@ -8,6 +8,14 @@ export function createRouterModel() {
     );
   }
 
+  // Streaming on by default so "Thinking" shows tokens ASAP.
+  // Opt out: AGENT_STREAMING=0 (some 9router upstreams have incomplete stream roles).
+  const streamingRaw = process.env.AGENT_STREAMING?.trim().toLowerCase();
+  const streaming =
+    streamingRaw === undefined || streamingRaw === ""
+      ? true
+      : !["0", "false", "no", "off"].includes(streamingRaw);
+
   return new ChatOpenAI({
     model: process.env.AGENT_MODEL ?? "gpt-4o",
     apiKey,
@@ -15,8 +23,6 @@ export function createRouterModel() {
       baseURL: process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1",
     },
     temperature: 0,
-    // Some 9router upstreams emit incomplete streaming roles; prefer buffered
-    // completions for agent tool-calling stability.
-    streaming: false,
+    streaming,
   });
 }

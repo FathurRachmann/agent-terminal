@@ -9,7 +9,7 @@ import {
 
 describe("preview-protocol", () => {
   it("round-trips absolute paths", () => {
-    const abs = path.resolve("/tmp/working/guide.pdf");
+    const abs = path.resolve("/tmp/tmp/guide.pdf");
     const url = encodeAgentPreviewUrl(abs);
     assert.match(url, /^agent-preview:\/\/local\//);
     assert.equal(decodeAgentPreviewUrl(url), abs);

@@ -122,7 +122,7 @@ export function extractUserPreferencesFromChat(userPrompt: string): StandardUser
     out.push(
       pref(
         "asks",
-        "to work on local folders by path; use request_folder_access and wait for approval",
+        "to work on local folders by path; call request_folder_access to open Approve/Deny UI (chat-only izin does nothing)",
       ),
     );
   }

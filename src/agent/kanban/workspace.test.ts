@@ -85,7 +85,7 @@ describe("kanban resolveWorkspace project scope", () => {
     assert.equal(ws.projectId, created.project.id);
     assert.ok(ws.artifactDir);
     assert.ok(
-      ws.artifactDir!.includes(path.join("working", "project")),
+      ws.artifactDir!.includes(path.join("tmp", "project")),
       ws.artifactDir,
     );
     assert.ok(fs.existsSync(ws.artifactDir!));

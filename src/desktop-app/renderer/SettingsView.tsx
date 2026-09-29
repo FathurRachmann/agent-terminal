@@ -20,11 +20,14 @@ type SettingsSnapshot = {
   };
   agent: {
     autoApproveDestructive: boolean;
+    runMode?: "auto-review" | "allowlist" | "run-everything";
+    toolAllowlist?: string[];
     requirePlanApproval: boolean;
     enableReflection: boolean;
     enableCheckpointer: boolean;
     autoSelfHeal?: boolean;
     selfHealErrorThreshold?: number;
+    agentKind?: "general" | "research" | "ops";
   };
   sandbox: {
     ptyTimeoutMs: number;
@@ -237,8 +240,21 @@ export function SettingsView({
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [visionModel, setVisionModel] = useState("");
   const [contextWindowTokens, setContextWindowTokens] = useState(256000);
-  const [autoApprove, setAutoApprove] = useState(true);
+  const [runMode, setRunMode] = useState<
+    "auto-review" | "allowlist" | "run-everything"
+  >("auto-review");
+  const [toolAllowlistText, setToolAllowlistText] = useState("");
   const [requirePlan, setRequirePlan] = useState(true);
+  const [permTerminal, setPermTerminal] = useState("");
+  const [permMcp, setPermMcp] = useState("");
+  const [permAllowHints, setPermAllowHints] = useState("");
+  const [permBlockHints, setPermBlockHints] = useState("");
+  const [permTeamOverride, setPermTeamOverride] = useState(false);
+  const [permTeamEnabled, setPermTeamEnabled] = useState(false);
+  const [permNote, setPermNote] = useState<string | null>(null);
+  const [agentKind, setAgentKind] = useState<"general" | "research" | "ops">(
+    "general",
+  );
   const [enableReflection, setEnableReflection] = useState(true);
   const [enableCheckpointer, setEnableCheckpointer] = useState(true);
   const [autoSelfHeal, setAutoSelfHeal] = useState(true);
@@ -265,8 +281,20 @@ export function SettingsView({
     setVisionModel(s.model.visionModel);
     setContextWindowTokens(s.model.contextWindowTokens);
     setApiKeyDraft("");
-    setAutoApprove(s.agent.autoApproveDestructive);
+    setRunMode(
+      s.agent.runMode === "allowlist" || s.agent.runMode === "run-everything"
+        ? s.agent.runMode
+        : s.agent.autoApproveDestructive
+          ? "run-everything"
+          : "auto-review",
+    );
+    setToolAllowlistText((s.agent.toolAllowlist ?? []).join("\n"));
     setRequirePlan(s.agent.requirePlanApproval);
+    setAgentKind(
+      s.agent.agentKind === "research" || s.agent.agentKind === "ops"
+        ? s.agent.agentKind
+        : "general",
+    );
     setEnableReflection(s.agent.enableReflection);
     setEnableCheckpointer(s.agent.enableCheckpointer);
     setAutoSelfHeal(s.agent.autoSelfHeal ?? true);
@@ -299,9 +327,80 @@ export function SettingsView({
       const res = await window.electronAgent.getSettings();
       hydrate(res);
       setError(null);
+      const permsApi = (
+        window as unknown as {
+          electronAgent?: {
+            getPermissions?: () => Promise<{
+              ok: boolean;
+              merged?: {
+                terminalAllowlist: string[];
+                mcpAllowlist: string[];
+                allowInstructions: string[];
+                blockInstructions: string[];
+                teamOverride: boolean;
+              };
+              project?: {
+                terminalAllowlist?: string[];
+                mcpAllowlist?: string[];
+                autoRun?: {
+                  allow_instructions?: string[];
+                  block_instructions?: string[];
+                };
+              } | null;
+              team?: Record<string, unknown> | null;
+            }>;
+          };
+        }
+      ).electronAgent;
+      if (permsApi?.getPermissions) {
+        const p = await permsApi.getPermissions();
+        if (p?.ok) {
+          const src = p.project ?? {};
+          setPermTerminal((src.terminalAllowlist ?? p.merged?.terminalAllowlist ?? []).join("\n"));
+          setPermMcp((src.mcpAllowlist ?? p.merged?.mcpAllowlist ?? []).join("\n"));
+          setPermAllowHints(
+            (src.autoRun?.allow_instructions ?? p.merged?.allowInstructions ?? []).join("\n"),
+          );
+          setPermBlockHints(
+            (src.autoRun?.block_instructions ?? p.merged?.blockInstructions ?? []).join("\n"),
+          );
+          setPermTeamOverride(Boolean(p.merged?.teamOverride));
+          setPermTeamEnabled(Boolean(p.team));
+        }
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  const savePermissions = async () => {
+    const api = (
+      window as unknown as {
+        electronAgent?: {
+          updatePermissions?: (payload: unknown) => Promise<{ ok: boolean }>;
+        };
+      }
+    ).electronAgent;
+    if (!api?.updatePermissions) {
+      setPermNote("Permissions bridge missing — rebuild desktop.");
+      return;
+    }
+    const data = {
+      terminalAllowlist: permTerminal.split("\n").map((l) => l.trim()).filter(Boolean),
+      mcpAllowlist: permMcp.split("\n").map((l) => l.trim()).filter(Boolean),
+      autoRun: {
+        allow_instructions: permAllowHints.split("\n").map((l) => l.trim()).filter(Boolean),
+        block_instructions: permBlockHints.split("\n").map((l) => l.trim()).filter(Boolean),
+      },
+    };
+    await api.updatePermissions({ scope: "project", data });
+    if (permTeamEnabled) {
+      await api.updatePermissions({ scope: "team", data });
+    } else {
+      await api.updatePermissions({ scope: "team", data: null });
+    }
+    setPermNote("permissions.json saved");
+    await refresh();
   };
 
   useEffect(() => {
@@ -380,12 +479,18 @@ export function SettingsView({
       const payload = {
         model: modelPatch,
         agent: {
-          autoApproveDestructive: autoApprove,
+          runMode,
+          toolAllowlist: toolAllowlistText
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean),
+          autoApproveDestructive: runMode === "run-everything",
           requirePlanApproval: requirePlan,
           enableReflection,
           enableCheckpointer,
           autoSelfHeal,
           selfHealErrorThreshold,
+          agentKind,
         },
         sandbox: {
           ptyTimeoutMs,
@@ -588,19 +693,154 @@ export function SettingsView({
             </div>
           ) : group === "agent" ? (
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
-              <SectionCard title="Safety & approvals">
-                <Toggle
-                  checked={autoApprove}
-                  onChange={setAutoApprove}
-                  label="Auto-approve destructive tools"
-                  hint="Skip y/n untuk execute / write / edit / desktop (kecuali plan gate)."
-                />
+              <SectionCard title="Top-level agent (3 presets)">
+                <div>
+                  <FieldLabel hint="Sama tools; beda posture. Reload agent setelah ganti.">
+                    Active agent
+                  </FieldLabel>
+                  <select
+                    className="mt-1 w-full rounded-md border border-border bg-surface-0 px-3 py-2 text-[13px] text-fg"
+                    value={agentKind}
+                    onChange={(e) =>
+                      setAgentKind(
+                        e.target.value === "research" || e.target.value === "ops"
+                          ? e.target.value
+                          : "general",
+                      )
+                    }
+                  >
+                    <option value="general">General / Coding</option>
+                    <option value="research">Research</option>
+                    <option value="ops">Ops / Desktop</option>
+                  </select>
+                  <p className="mt-1.5 text-[11px] text-muted">
+                    Subagents via task: explorer, coder, reviewer, tester,
+                    security, debugger, docs, architect (8).
+                  </p>
+                </div>
+              </SectionCard>
+              <SectionCard title="Safety & approvals (Run Modes)">
+                <div>
+                  <FieldLabel hint="Cursor-style: Auto-review (classifier), Allowlist, or Run Everything">
+                    Run Mode
+                  </FieldLabel>
+                  <select
+                    className="mt-1 w-full rounded-md border border-border bg-surface-0 px-3 py-2 text-[13px] text-fg"
+                    value={runMode}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      const mode =
+                        v === "allowlist" || v === "run-everything"
+                          ? v
+                          : "auto-review";
+                      setRunMode(mode);
+                    }}
+                  >
+                    <option value="auto-review">
+                      Auto-review (allowlist + classifier)
+                    </option>
+                    <option value="allowlist">Allowlist only</option>
+                    <option value="run-everything">Run Everything</option>
+                  </select>
+                  <p className="mt-1.5 text-[11px] text-muted">
+                    Workspace edits auto-apply (except config/secrets). Shell,
+                    MCP, and desktop follow this mode. Folder grants always need
+                    Approve.
+                  </p>
+                </div>
+                <div>
+                  <FieldLabel hint="One per line: tool name (execute) or shell prefix (git status)">
+                    Tool / command allowlist
+                  </FieldLabel>
+                  <textarea
+                    className="mt-1 min-h-[88px] w-full rounded-md border border-border bg-surface-0 px-3 py-2 font-mono text-[12px] text-fg"
+                    value={toolAllowlistText}
+                    onChange={(e) => setToolAllowlistText(e.target.value)}
+                    placeholder={"git status\nnpm test\nexecute"}
+                  />
+                </div>
                 <Toggle
                   checked={requirePlan}
                   onChange={setRequirePlan}
                   label="Require plan approval"
-                  hint="Interrupt setelah task_plan / sebelum task_todos sampai user Approve."
+                  hint="Interrupt on task_todos until user Approves (Build)."
                 />
+              </SectionCard>
+              <SectionCard title="permissions.json (Auto-review dashboard)">
+                <p className="text-[11px] text-muted">
+                  Cursor-style steering for Auto-review. Writes{" "}
+                  <code className="font-mono text-[10px]">.agent/permissions.json</code>
+                  . Enable team override to write{" "}
+                  <code className="font-mono text-[10px]">team-permissions.json</code>{" "}
+                  (overrides local).
+                  {permTeamOverride ? (
+                    <span className="ml-1 text-amber-400">
+                      Team override active.
+                    </span>
+                  ) : null}
+                </p>
+                <div>
+                  <FieldLabel hint="Shell prefixes / tool names (merged into allowlist)">
+                    terminalAllowlist
+                  </FieldLabel>
+                  <textarea
+                    className="mt-1 min-h-[64px] w-full rounded-md border border-border bg-surface-0 px-3 py-2 font-mono text-[12px] text-fg"
+                    value={permTerminal}
+                    onChange={(e) => setPermTerminal(e.target.value)}
+                    placeholder={"git status\nnpm test"}
+                  />
+                </div>
+                <div>
+                  <FieldLabel hint="server:tool · server:* · *:*">
+                    mcpAllowlist
+                  </FieldLabel>
+                  <textarea
+                    className="mt-1 min-h-[48px] w-full rounded-md border border-border bg-surface-0 px-3 py-2 font-mono text-[12px] text-fg"
+                    value={permMcp}
+                    onChange={(e) => setPermMcp(e.target.value)}
+                    placeholder={"tradingview:*\n*:*"}
+                  />
+                </div>
+                <div>
+                  <FieldLabel hint="Plain-English hints that steer Auto-review toward allow">
+                    autoRun.allow_instructions
+                  </FieldLabel>
+                  <textarea
+                    className="mt-1 min-h-[48px] w-full rounded-md border border-border bg-surface-0 px-3 py-2 text-[12px] text-fg"
+                    value={permAllowHints}
+                    onChange={(e) => setPermAllowHints(e.target.value)}
+                    placeholder="Allow routine npm test and git status"
+                  />
+                </div>
+                <div>
+                  <FieldLabel hint="Plain-English hints that steer Auto-review toward ask/deny">
+                    autoRun.block_instructions
+                  </FieldLabel>
+                  <textarea
+                    className="mt-1 min-h-[48px] w-full rounded-md border border-border bg-surface-0 px-3 py-2 text-[12px] text-fg"
+                    value={permBlockHints}
+                    onChange={(e) => setPermBlockHints(e.target.value)}
+                    placeholder="Always ask before rm -rf or curl | sh"
+                  />
+                </div>
+                <Toggle
+                  checked={permTeamEnabled}
+                  onChange={setPermTeamEnabled}
+                  label="Team dashboard override"
+                  hint="When on, saves team-permissions.json and ignores user/project files for Auto-review."
+                />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-md bg-accent px-3 py-1.5 text-[12px] font-medium text-white"
+                    onClick={() => void savePermissions()}
+                  >
+                    Save permissions.json
+                  </button>
+                  {permNote ? (
+                    <span className="text-[11px] text-muted">{permNote}</span>
+                  ) : null}
+                </div>
               </SectionCard>
               <SectionCard title="Self-heal">
                 <Toggle
@@ -858,9 +1098,11 @@ export function SettingsView({
                   ))}
                 </ul>
                 <p className="text-[10px] text-muted">
-                  Folder tambahan di-grant via tool{" "}
+                  Saat Privacy ON, folder di luar project di-grant via{" "}
                   <code className="text-accent-soft">request_folder_access</code>{" "}
-                  + approval.
+                  + Approve di UI (tersimpan di{" "}
+                  <code className="text-accent-soft">.agent/folder-allowlist.json</code>
+                  ). Saat Privacy OFF, akses mesin penuh — tidak perlu Approve folder.
                 </p>
               </SectionCard>
             </div>

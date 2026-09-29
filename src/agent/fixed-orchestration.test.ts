@@ -33,7 +33,7 @@ describe("fixed-orchestration", () => {
     assert.equal(shouldRunFixedOrchestration(sampleBoard()), true);
   });
 
-  it("builds explorer/coder/reviewer plus matched skill agents", () => {
+  it("builds explorer/coder/reviewer/tester plus matched skill agents", () => {
     const tasks = buildFixedWorkerTasks(sampleBoard(), [
       {
         skillFolder: "security/owasp",
@@ -42,12 +42,12 @@ describe("fixed-orchestration", () => {
         systemPrompt: "Audit auth.",
       },
     ]);
-    assert.equal(tasks.length, 4);
+    assert.equal(tasks.length, 5);
     assert.deepEqual(
-      tasks.slice(0, 3).map((t) => t.role),
-      ["explorer", "coder", "reviewer"],
+      tasks.slice(0, 4).map((t) => t.role),
+      ["explorer", "coder", "reviewer", "tester"],
     );
-    assert.match(tasks[3]!.goal, /owasp-agent/);
+    assert.match(tasks[4]!.goal, /owasp-agent/);
   });
 
   it("fingerprint stable for same board", () => {

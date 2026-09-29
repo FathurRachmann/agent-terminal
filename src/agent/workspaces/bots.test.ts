@@ -24,12 +24,40 @@ describe("buildWorkspaceBotInstruction", () => {
     assert.match(text, /Call tools FIRST/i);
     assert.match(text, /SAME tools as the global agent/i);
     assert.match(text, /I need to use the available tools/i);
-    assert.match(text, /NOT under working\/project/i);
+    assert.match(text, /NOT under tmp\/project/i);
     assert.match(text, /NEVER invent \"folder kosong\"/i);
-    assert.match(text, /element type `mermaid`/i);
     assert.match(text, /SIMKOPDES/);
     assert.match(text, /\/tmp\/frontend/);
     assert.match(text, /at most 3 independent `execute` calls/i);
+  });
+
+  it("includes sequential handoff snippets and tool allowlist", () => {
+    const text = buildWorkspaceBotInstruction(
+      {
+        id: "qa",
+        name: "QA",
+        role: "QA",
+        description: "Testing",
+        systemPrompt: "",
+        tools: ["ls", "read_file", "execute"],
+        skills: ["e2e-testing"],
+      },
+      {
+        priorReplies: [
+          {
+            botName: "FE",
+            content: "Login form uses wrong validation on email field.",
+          },
+        ],
+        allowedTools: ["ls", "read_file", "execute"],
+      },
+    );
+    assert.match(text, /Teammates already replied this turn/i);
+    assert.match(text, /Login form uses wrong validation/);
+    assert.match(text, /Your allowed tools this turn/i);
+    assert.match(text, /Role tool focus/i);
+    assert.match(text, /Assigned skills/i);
+    assert.doesNotMatch(text, /answering this prompt in parallel/i);
   });
 
   it("marks parallel group turns and soft-limits shell use", () => {
@@ -50,7 +78,6 @@ describe("buildWorkspaceBotInstruction", () => {
     assert.match(text, /Speak ONLY as your own role/i);
     assert.match(text, /at most 3 independent `execute` calls/i);
     assert.match(text, /shared group pool has up to 10 slots/i);
-    assert.doesNotMatch(text, /Other teammates already replied/);
+    assert.doesNotMatch(text, /Teammates already replied this turn/);
   });
 });
-

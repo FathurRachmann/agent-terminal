@@ -183,7 +183,7 @@ export function WorkspacesSidebar({
       });
       if (!res?.ok && String(res?.error || "").includes("running turns")) {
         const ok = window.confirm(
-          "Masih ada turn yang jalan. Stop dan pindah project sekarang?",
+          "Masih ada turn yang jalan. Soft-align gagal — stop turn dan pindah project sekarang?",
         );
         if (!ok) return;
         res = await window.electronAgent?.setWorkspaceActiveProject?.({

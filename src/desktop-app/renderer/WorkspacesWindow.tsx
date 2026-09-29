@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildDeliverableFileChips } from "../deliverable-chips.js";
+import { formatToolApprovalDetail } from "../../agent/interrupt-utils.js";
 import { shouldRenderAsReasoning } from "../../agent/sanitize-output.js";
 import type { AgentPhase } from "./ActivityChips.js";
 import { AppFooter } from "./AppFooter.js";
@@ -254,9 +255,8 @@ export function WorkspacesWindow() {
     document.title = "Workspaces — Agent Desktop";
   }, [refresh, refreshChrome]);
 
-  // Align sandbox only when user focuses a workspace — skip while any turn is busy.
-  // Track last aligned pair so we don't keep calling setActiveProject (which used
-  // to reboot the agent and made the chat room look like it was refreshing).
+  // Align sandbox when focusing a workspace. Soft-allows folders while turns
+  // run (no reboot) so session↔workspace stays usable concurrently.
   const alignedSandboxRef = useRef<string>("");
   useEffect(() => {
     if (!focusedId) return;
@@ -274,12 +274,6 @@ export function WorkspacesWindow() {
       void (async () => {
         const st = await window.electronAgent?.getStatus?.();
         if (cancelled) return;
-        const busy = Array.isArray(
-          (st as { busyThreadIds?: string[] } | null)?.busyThreadIds,
-        )
-          ? ((st as { busyThreadIds?: string[] }).busyThreadIds ?? [])
-          : [];
-        if (busy.length > 0) return;
         const current =
           st && "activeProjectId" in st
             ? ((st as { activeProjectId?: string | null }).activeProjectId ??
@@ -302,16 +296,19 @@ export function WorkspacesWindow() {
         if (cancelled) return;
         if (res?.ok) {
           alignedSandboxRef.current = alignKey;
+          const soft = Boolean((res as { softAligned?: boolean }).softAligned);
           if (typeof res.workspaceRoot === "string" && res.workspaceRoot) {
             setWorkspaceRoot(res.workspaceRoot);
-          } else if (!(res as { reused?: boolean }).reused) {
+          } else if (!(res as { reused?: boolean }).reused && !soft) {
             await refreshChrome();
           }
           const nextPid =
             res.activeProjectId !== undefined
               ? (res.activeProjectId ?? pid)
               : pid;
-          setActiveProjectId(nextPid);
+          if (!soft) {
+            setActiveProjectId(nextPid);
+          }
           if (Array.isArray(res.workspaces)) {
             setWorkspaces(res.workspaces as WorkspaceSummaryRow[]);
           }
@@ -382,7 +379,7 @@ export function WorkspacesWindow() {
       }
       if (event.type === "interrupt") {
         setApprovalPending(true);
-        setApprovalDetail("Tool / plan approval required");
+        setApprovalDetail(formatToolApprovalDetail(event.payload));
       }
       if (event.type === "done") {
         const evAny = event as { botName?: unknown; botId?: unknown };
@@ -610,16 +607,16 @@ export function WorkspacesWindow() {
       },
     ]);
     clearDrafts();
-    try {
-      const res = await window.electronAgent?.sendWorkspaceGroupPrompt?.({
-        workspaceId: activeChat.workspaceId,
-        chatId: activeChat.chatId,
-        prompt,
-        attachments: attachmentsForSend.map((a) => ({
-          path: a.path,
-          absPath: a.absPath,
-        })),
-      });
+
+    const applyGroupResult = (res: {
+      ok?: boolean;
+      error?: string;
+      note?: string;
+      replies?: Array<{ botId: string; botName: string; content: string }>;
+      supervisor?: { note?: string | null; status?: string } | null;
+      autoContinue?: boolean;
+      autoContinuePrompt?: string | null;
+    }) => {
       if (!res?.ok && res?.error) {
         setPhase("error");
         setItems((prev) => [
@@ -631,7 +628,9 @@ export function WorkspacesWindow() {
             at: now(),
           },
         ]);
-      } else if (res?.ok && Array.isArray(res.replies) && res.replies.length) {
+        return;
+      }
+      if (res?.ok && Array.isArray(res.replies) && res.replies.length) {
         const at = now();
         const extrasToChip: string[] = [];
         setItems((prev) => {
@@ -672,12 +671,13 @@ export function WorkspacesWindow() {
           }
           return next;
         });
-        // Only scrape chips for replies that were not already streamed via `done`.
         if (extrasToChip.length) {
           appendFileChips(extrasToChip, [], at);
         }
         setPhase("done");
-      } else if (res?.note) {
+        return;
+      }
+      if (res?.note) {
         setPhase("done");
         setItems((prev) => [
           ...prev,
@@ -688,6 +688,50 @@ export function WorkspacesWindow() {
             at: now(),
           },
         ]);
+      }
+    };
+
+    try {
+      let turnPrompt = prompt;
+      let turnAttachments = attachmentsForSend.map((a) => ({
+        path: a.path,
+        absPath: a.absPath,
+      }));
+      // Cap — server already runs auto-continue; keep a thin UI backup if an
+      // older main process still returns autoContinue:true.
+      const MAX_AUTO_CONTINUE = 2;
+      for (let depth = 0; depth <= MAX_AUTO_CONTINUE; depth++) {
+        const res = await window.electronAgent?.sendWorkspaceGroupPrompt?.({
+          workspaceId: activeChat.workspaceId,
+          chatId: activeChat.chatId,
+          prompt: turnPrompt,
+          attachments: turnAttachments,
+        });
+        if (!res) break;
+        applyGroupResult(res);
+        if (!res.ok) break;
+        if (
+          depth < MAX_AUTO_CONTINUE &&
+          res.autoContinue &&
+          typeof res.autoContinuePrompt === "string" &&
+          res.autoContinuePrompt.trim()
+        ) {
+          turnPrompt = res.autoContinuePrompt.trim();
+          turnAttachments = [];
+          setItems((prev) => [
+            ...prev,
+            {
+              id: `s-ac-${Date.now()}`,
+              kind: "system",
+              text: `Melanjutkan putaran ${depth + 2} (supervisor)…`,
+              at: now(),
+            },
+          ]);
+          setPhase("thinking");
+          setLoading(true);
+          continue;
+        }
+        break;
       }
     } catch (e) {
       setPhase("error");

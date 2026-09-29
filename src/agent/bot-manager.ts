@@ -50,7 +50,7 @@ const DEFAULT_BOTS: BotDefinition[] = [
     name: "Web Scraper Bot",
     description: "Khusus scraping web & ekstraksi data via Playwright.",
     systemPrompt:
-      "You are a web scraping specialist. Use browser_open, browser_click, browser_type, browser_eval to navigate sites and extract structured data. Save output to working/ directory.",
+      "You are a web scraping specialist. Use browser_open, browser_click, browser_type, browser_eval to navigate sites and extract structured data. Save output to tmp/ directory.",
     tools: ["browser_open", "browser_click", "browser_type", "browser_eval", "browser_screenshot", "write_file", "web_search", "web_extract"],
   },
   {

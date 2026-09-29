@@ -22,9 +22,15 @@ import {
 } from "./context-policy.js";
 import { createSpecialistSubagents } from "./subagents.js";
 import { loadSkillSubagents } from "./skill-registry.js";
+import {
+  buildAgentSystemPrompt,
+  resolveAgentPreset,
+  type AgentKind,
+} from "./agent-presets.js";
 import { createMultiTaskInjectMiddleware } from "./multi-task-inject-middleware.js";
 import { createNormalizeAiMessageMiddleware } from "./normalize-middleware.js";
 import { createCapabilityFilterMiddleware } from "./capability-filter-middleware.js";
+import { createDecisionToolFilterMiddleware } from "./decision-tool-filter-middleware.js";
 import {
   createBotScopeController,
   createBotScopeMiddleware,
@@ -36,6 +42,9 @@ import {
   resolveCapabilityFilter,
 } from "./capabilities-catalog.js";
 import { createWorkspaceAccessTools } from "./workspace-access.js";
+import { loadFolderAllowlist } from "./folder-allowlist.js";
+import { defaultSandboxAllowedRoots, privacyStrictAllowedRoots } from "./default-sandbox-roots.js";
+import { loadPrivacyMode } from "./privacy-mode.js";
 import { createTaskTools } from "./task-tools.js";
 import { createWebTools } from "./web-tools.js";
 import { createOrchestrationTools } from "./orchestration.js";
@@ -46,6 +55,27 @@ import { createPlaywrightTools } from "./playwright-tools.js";
 import { createVisionTools } from "./vision-tools.js";
 import { createDocumentTools } from "./document-tools.js";
 import { createGraphifyTools } from "./graphify-tools.js";
+import { createCodingTools } from "./coding-tools.js";
+import { loadMcpTools } from "./mcp-loader.js";
+import { createPostEditVerifyMiddleware } from "./post-edit-verify-middleware.js";
+import { createEditRetryMiddleware } from "./edit-retry-middleware.js";
+import { createToolResultCompactMiddleware } from "./tool-result-compact-middleware.js";
+import { createOfficeBinaryWriteGuardMiddleware } from "./office-binary-write-guard.js";
+import { createWritePersistMiddleware } from "./write-persist-middleware.js";
+import { createConfigEditGuardMiddleware } from "./config-edit-guard.js";
+import { createHooksToolMiddleware } from "./hooks/hooks-middleware.js";
+import { runHooks } from "./hooks/run-hooks.js";
+import {
+  buildInterruptOn,
+  createRunModeController,
+  resolveRunMode,
+  type RunMode,
+  type RunModeController,
+} from "./run-modes.js";
+import { createPlanGateController, type PlanGateController } from "./chat-mode.js";
+import { buildSkillCatalogPromptSection } from "./skill-catalog.js";
+import { loadMergedPermissions } from "./permissions-store.js";
+import { ensureTemplatesDir } from "./document-templates.js";
 import {
   createDesktopTools,
   isDesktopAutomationEnabled,
@@ -81,7 +111,7 @@ export type CreateAgentOptions = {
    */
   allowedFolders?: string[];
   /**
-   * Agent application root — `working/global|bots|project/...` artifacts live here.
+   * Agent application root — `tmp/global|bots|project/...` artifacts live here.
    * Defaults to profileHome ?? workspaceRoot.
    */
   artifactHome?: string;
@@ -91,7 +121,19 @@ export type CreateAgentOptions = {
    */
   profileHome?: string;
   profileId?: string;
+  /**
+   * Top-level agent preset: general | research | ops (default general).
+   * Same tools; different operating posture / system overlay.
+   */
+  agentKind?: string;
+  /**
+   * @deprecated Prefer `runMode`. true maps to run-everything.
+   */
   autoApprove?: boolean;
+  /** Cursor-style Run Mode (default auto-review). */
+  runMode?: RunMode;
+  /** Shell/tool allowlist entries for allowlist + auto-review short-circuit. */
+  toolAllowlist?: string[];
   /**
    * Interrupt before `task_todos` so the UI can show the plan and require
    * explicit Approve before execution continues. Independent of autoApprove.
@@ -106,6 +148,12 @@ export type CreateAgentOptions = {
    * + skill agents) and merge into the tool result. Default true.
    */
   enableFixedOrchestration?: boolean;
+  /**
+   * Privacy ON (true) = project-only allowlist.
+   * Privacy OFF (false) = whole-machine access.
+   * When omitted, loaded from profile `.agent/privacy-mode.json` (default OFF).
+   */
+  privacyMode?: boolean;
 };
 
 let profilesRegistered = false;
@@ -161,10 +209,12 @@ export type AgentBundle = {
   embedder: EmbeddingClient;
   model: BaseChatModel;
   workspaceRoot: string;
-  /** Agent repo root for working/global|bots|project artifacts. */
+  /** Agent repo root for tmp/global|bots|project artifacts. */
   artifactHome: string;
   profileHome: string;
   profileId: string;
+  /** Active top-level agent preset (general | research | ops). */
+  agentKind: AgentKind;
   contextPolicy: string;
   enableReflection: boolean;
   desktopEnabled: boolean;
@@ -172,6 +222,14 @@ export type AgentBundle = {
   botScope: BotScopeController;
   /** Mutable RAG filter for workspace/bot memory isolation. */
   memoryScope: MemoryScopeController;
+  /** Cursor Run Mode controller (live updates from Settings). */
+  runMode: RunModeController;
+  /** Plan mode Build gate — unlock after task_todos Approve. */
+  planGate: PlanGateController;
+  /** MCP server names successfully configured for this agent. */
+  mcpServerNames: string[];
+  /** Tear down MCP stdio/HTTP clients. */
+  closeMcp: () => Promise<void>;
 };
 
 export async function createTerminalAgent(
@@ -185,6 +243,9 @@ export async function createTerminalAgent(
     options.artifactHome ?? profileHome ?? workspaceRoot,
   );
   const profileId = options.profileId ?? "default";
+  const agentPreset = resolveAgentPreset(options.agentKind);
+
+  ensureTemplatesDir(artifactHome);
 
   fs.mkdirSync(path.join(profileHome, ".agent", "context"), {
     recursive: true,
@@ -195,7 +256,22 @@ export async function createTerminalAgent(
 
   ensureSoul(profileHome);
   const soul = readSoul(profileHome);
-  const systemPrompt = composeSystemPrompt(SYSTEM_PROMPT, soul);
+  const skillsDir = path.join(profileHome, ".agent", "skills");
+  fs.mkdirSync(skillsDir, { recursive: true });
+  const capabilityFilterEarly = resolveCapabilityFilter(profileHome);
+  const skillCatalog = buildSkillCatalogPromptSection(
+    skillsDir,
+    capabilityFilterEarly.disabledSkillFolders,
+  );
+  const systemPrompt = [
+    buildAgentSystemPrompt(
+      composeSystemPrompt(SYSTEM_PROMPT, soul),
+      agentPreset.id,
+    ),
+    skillCatalog,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const memoryRelativePath = ".agent/AGENTS.md";
   const memoryPath = path.join(profileHome, memoryRelativePath);
@@ -224,23 +300,51 @@ export async function createTerminalAgent(
     workspaceRoot,
     profileHome,
     profileId,
+    agentKind: agentPreset.id,
     enableCheckpointer: options.enableCheckpointer ?? false,
     enableReflection: options.enableReflection ?? true,
   });
 
+  const persistedFolders = loadFolderAllowlist(profileHome);
+  const privacyOn =
+    typeof options.privacyMode === "boolean"
+      ? options.privacyMode
+      : loadPrivacyMode(profileHome);
+  const rootOpts = {
+    workspaceRoot,
+    artifactHome,
+    projectFolders: options.allowedFolders ?? [],
+    persistedFolders,
+  };
   const sandbox = new PtySandbox({
     workingDirectory: workspaceRoot,
-    initialAllowedRoots: [
-      ...(options.allowedFolders ?? []),
-      artifactHome,
-    ],
+    initialAllowedRoots: privacyOn
+      ? privacyStrictAllowedRoots(rootOpts)
+      : defaultSandboxAllowedRoots(rootOpts),
     artifactHome,
-    autoApproveDestructive: options.autoApprove ?? false,
+    privacyStrict: privacyOn,
+    autoApproveDestructive:
+      resolveRunMode({
+        runMode: options.runMode,
+        autoApproveDestructive: options.autoApprove,
+      }) === "run-everything",
     onOutput: options.onPtyOutput,
   });
 
-  const skillsDir = path.join(profileHome, ".agent", "skills");
-  fs.mkdirSync(skillsDir, { recursive: true });
+  const runModeCtrl = createRunModeController({
+    runMode: resolveRunMode({
+      runMode: options.runMode,
+      autoApproveDestructive: options.autoApprove,
+    }),
+    toolAllowlist: [
+      ...(options.toolAllowlist ?? []),
+      ...loadMergedPermissions({
+        workspaceRoot,
+        profileHome,
+      }).terminalAllowlist,
+    ],
+  });
+  const planGate = createPlanGateController(false);
   const backend = new CompositeBackend(sandbox, {
     [SKILLS_VIRTUAL_ROOT]: new FilesystemBackend({
       rootDir: skillsDir,
@@ -283,11 +387,17 @@ export async function createTerminalAgent(
     ? createDesktopTools(workspaceRoot)
     : [];
 
+  const mcp = await loadMcpTools({
+    roots: [profileHome, workspaceRoot],
+    disabledMcpServers: capabilityFilter.disabledMcpServers,
+  });
+
   const customTools = filterToolsByCapability(
     [
       ...createMemoryTools(memoryStore, profileHome, embedder),
-      ...createWorkspaceAccessTools(sandbox),
+      ...createWorkspaceAccessTools(sandbox, { profileHome }),
       ...createTaskTools(workspaceRoot),
+      ...createCodingTools(workspaceRoot),
       ...createWebTools(),
       ...createOrchestrationTools(),
       ...createSkillManagementTools(profileHome),
@@ -298,15 +408,32 @@ export async function createTerminalAgent(
       ...createDocumentTools(workspaceRoot),
       ...createGraphifyTools(workspaceRoot),
       ...desktopTools,
+      ...mcp.tools,
     ],
     capabilityFilter.disabledToolNames,
   );
 
+  const mcpToolNames = customTools
+    .map((t) =>
+      t && typeof t === "object" && "name" in t
+        ? String((t as { name?: string }).name ?? "")
+        : "",
+    )
+    .filter((n) => n.startsWith("mcp_"));
+
   const capabilityFilterMw = createCapabilityFilterMiddleware(
+    capabilityFilter.disabledToolNames,
+  );
+  const decisionToolFilterMw = createDecisionToolFilterMiddleware(
     capabilityFilter.disabledToolNames,
   );
   const botScope = createBotScopeController();
   const botScopeMw = createBotScopeMiddleware(botScope);
+  const editRetryMw = createEditRetryMiddleware({ workspaceRoot });
+  const postEditVerifyMw = createPostEditVerifyMiddleware({
+    workspaceRoot,
+  });
+  const toolCompactMw = createToolResultCompactMiddleware();
   const skillPermissions = buildDisabledSkillPermissions(
     capabilityFilter.disabledSkillFolders,
   );
@@ -320,31 +447,17 @@ export async function createTerminalAgent(
 
   // wrapModelCall order (last = closest to model):
   // summarization → fileMemory → longTerm → normalize → capabilityFilter → botScope → model
-  // wrapToolCall: multiTaskInject last so capability/bot-scope filters run first.
-  // Skills are NOT auto-injected: agent must ls /skills/ and read only what it needs.
+  // Skills: name/description catalog is in systemPrompt; full bodies on-demand via /skills/.
   // Skill frontmatter `agent:` registers extra SubAgents for the `task` tool.
   const requirePlanApproval = options.requirePlanApproval !== false;
-  const interruptOn: Record<string, boolean> = {
-    ...(requirePlanApproval ? { task_todos: true } : {}),
-    ...(options.autoApprove
-      ? {}
-      : {
-          execute: true,
-          edit_file: true,
-          write_file: true,
-          request_folder_access: true,
-          ...(desktopEnabled
-            ? {
-                desktop_automate: true,
-                request_desktop_app_access: true,
-                computer_screenshot: true,
-                computer_click: true,
-                computer_type: true,
-                computer_key: true,
-              }
-            : {}),
-        }),
-  };
+  // Always register shell/MCP/desktop interrupts; live Run Mode resolves
+  // allow/ask/deny via tryAutoResolveRunModeInterrupt (incl. run-everything).
+  const interruptOn = buildInterruptOn({
+    runMode: "auto-review",
+    requirePlanApproval,
+    desktopEnabled,
+    extraGatedTools: mcpToolNames,
+  });
 
   const agent = await Promise.resolve(
     createDeepAgent({
@@ -361,15 +474,42 @@ export async function createTerminalAgent(
         longTerm,
         normalize,
         capabilityFilterMw,
+        decisionToolFilterMw,
         botScopeMw,
+        createConfigEditGuardMiddleware({
+          getRunMode: () => runModeCtrl.getRunMode(),
+        }),
+        createHooksToolMiddleware({
+          workspaceRoot,
+          profileHome,
+        }),
+        createOfficeBinaryWriteGuardMiddleware(),
+        createWritePersistMiddleware({
+          artifactHome,
+          workspaceRoot,
+        }),
+        editRetryMw,
+        postEditVerifyMw,
+        toolCompactMw,
         multiTaskInjectMw,
       ],
       checkpointer: options.enableCheckpointer
         ? createPersistentCheckpointer(workspaceRoot, profileHome)
         : undefined,
-      name: "terminal-agent",
+      name: agentPreset.runtimeName,
     }),
   );
+
+  void runHooks({
+    name: "sessionStart",
+    workspaceRoot,
+    profileHome,
+    payload: {
+      session_id: profileId,
+      workspace_root: workspaceRoot,
+      agent_kind: agentPreset.id,
+    },
+  }).catch(() => undefined);
 
   return {
     agent,
@@ -382,10 +522,15 @@ export async function createTerminalAgent(
     artifactHome,
     profileHome,
     profileId,
+    agentKind: agentPreset.id,
     contextPolicy: describeContextPolicy(),
     enableReflection: options.enableReflection ?? true,
     desktopEnabled,
     botScope,
     memoryScope,
+    runMode: runModeCtrl,
+    planGate,
+    mcpServerNames: mcp.serverNames,
+    closeMcp: mcp.close,
   };
 }

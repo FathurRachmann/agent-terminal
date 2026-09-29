@@ -20,12 +20,14 @@ export function formatPlanApprovalMarkdown(input: {
     ? [
         "",
         "## Proposed todos",
-        ...todos.map(
-          (t) =>
-            `- [ ] ${t.id ? `${t.id}: ` : ""}${t.content || "(empty)"}${
-              t.status && t.status !== "pending" ? ` (${t.status})` : ""
-            }`,
-        ),
+        ...todos.map((t) => {
+          const done =
+            t.status === "completed" ||
+            t.status === "done" ||
+            t.status === "finished";
+          const label = `${t.id ? `${t.id}: ` : ""}${t.content || "(empty)"}`;
+          return `- [${done ? "x" : " "}] ${label}`;
+        }),
       ]
     : [];
 

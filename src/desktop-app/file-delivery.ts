@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   mimeForPath,
+  isDeliverableChatPath,
   restoreAbsolutePathPrefix,
   WA_DOCUMENT_MAX_BYTES,
 } from "./file-delivery-shared.js";
@@ -9,6 +11,7 @@ import {
 export {
   collectChatFileChipPaths,
   collectDeliverablePaths,
+  dropTruncatedBasenames,
   isChatFileChipPath,
   isDeliverableChatPath,
   isProseFalsePositivePath,
@@ -36,7 +39,7 @@ function tryStatFile(
   }
 }
 
-/** Shallow search for basename under root (prefer working/). */
+/** Shallow search for basename under root (prefer tmp/, also legacy working/). */
 function findByBasename(
   roots: string[],
   basename: string,
@@ -54,6 +57,13 @@ function findByBasename(
   };
 
   const preferSubs = [
+    "tmp",
+    path.join("tmp", "global"),
+    path.join("tmp", "bots"),
+    path.join("tmp", "project"),
+    path.join("tmp", "uploads"),
+    path.join("tmp", "global", "uploads"),
+    path.join("tmp", "bots", "uploads"),
     "working",
     path.join("working", "global"),
     path.join("working", "bots"),
@@ -86,49 +96,54 @@ function findByBasename(
       }
       rank += 1;
     }
-    // Scan working/ up to working/project/<name>/file (depth 3).
-    const working = path.join(root, "working");
-    try {
-      if (!fs.existsSync(working) || !fs.statSync(working).isDirectory()) {
-        continue;
-      }
-      const queue = [working];
-      let depth = 0;
-      while (queue.length && depth < 3) {
-        const levelCount = queue.length;
-        for (let i = 0; i < levelCount; i++) {
-          const dir = queue.shift()!;
-          let entries: string[];
-          try {
-            entries = fs.readdirSync(dir);
-          } catch {
-            continue;
-          }
-          for (const name of entries) {
-            const child = path.join(dir, name);
-            let st: fs.Stats;
+    // Scan tmp/ and legacy working/ up to project/<name>/file (depth 3).
+    for (const artifactSeg of ["tmp", "working"] as const) {
+      const artifactRoot = path.join(root, artifactSeg);
+      try {
+        if (
+          !fs.existsSync(artifactRoot) ||
+          !fs.statSync(artifactRoot).isDirectory()
+        ) {
+          continue;
+        }
+        const queue = [artifactRoot];
+        let depth = 0;
+        while (queue.length && depth < 3) {
+          const levelCount = queue.length;
+          for (let i = 0; i < levelCount; i++) {
+            const dir = queue.shift()!;
+            let entries: string[];
             try {
-              st = fs.lstatSync(child);
+              entries = fs.readdirSync(dir);
             } catch {
               continue;
             }
-            if (st.isSymbolicLink()) continue;
-            if (st.isFile() && matchesName(name) && isInsideRoot(root, child)) {
-              hits.push({
-                abs: child,
-                basename: name,
-                size: st.size,
-                mtimeMs: st.mtimeMs,
-                rank: 1000 + depth,
-              });
+            for (const name of entries) {
+              const child = path.join(dir, name);
+              let st: fs.Stats;
+              try {
+                st = fs.lstatSync(child);
+              } catch {
+                continue;
+              }
+              if (st.isSymbolicLink()) continue;
+              if (st.isFile() && matchesName(name) && isInsideRoot(root, child)) {
+                hits.push({
+                  abs: child,
+                  basename: name,
+                  size: st.size,
+                  mtimeMs: st.mtimeMs,
+                  rank: 1000 + depth,
+                });
+              }
+              if (st.isDirectory()) queue.push(child);
             }
-            if (st.isDirectory()) queue.push(child);
           }
+          depth += 1;
         }
-        depth += 1;
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
   }
   if (!hits.length) return null;
@@ -138,10 +153,136 @@ function findByBasename(
   return { abs: best.abs, basename: best.basename, size: best.size };
 }
 
+/** Common user folders where agent-discovered deliverables often live. */
+function userContentDirs(): string[] {
+  const home = os.homedir();
+  if (!home) return [];
+  return ["Downloads", "Desktop", "Documents"]
+    .map((name) => path.join(home, name))
+    .filter((dir) => {
+      try {
+        return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+}
+
 /**
- * Resolve a workspace-relative or absolute path to an existing file under roots.
- * Falls back to basename search under working/ when the exact path is missing
- * (common when the reply truncates a spaced filename to `DIANDRA.doc`).
+ * Find basename under dirs (BFS). Used for ~/Downloads nested folders
+ * (e.g. "Bahan Tayang…/Materi 1…/Kata Kami- ….pdf").
+ */
+export function findByBasenameUnderDirs(
+  dirs: string[],
+  basename: string,
+  maxDepth = 6,
+): { abs: string; basename: string; size: number } | null {
+  const base = path.basename(String(basename || "").trim());
+  if (!base || base === "." || base === "..") return null;
+
+  const matchesName = (name: string): boolean => {
+    if (name === base) return true;
+    if (
+      name.endsWith(` ${base}`) ||
+      name.endsWith(`-${base}`) ||
+      name.endsWith(` - ${base}`)
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  type Hit = {
+    abs: string;
+    basename: string;
+    size: number;
+    mtimeMs: number;
+    depth: number;
+  };
+  const hits: Hit[] = [];
+
+  for (const root of dirs) {
+    let rootResolved: string;
+    try {
+      rootResolved = path.resolve(root);
+      if (!fs.existsSync(rootResolved) || !fs.statSync(rootResolved).isDirectory()) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+
+    // Fast path: direct child
+    const direct = tryStatFile(path.join(rootResolved, base));
+    if (direct) {
+      hits.push({ ...direct, mtimeMs: Date.now(), depth: 0 });
+    }
+
+    const queue: Array<{ dir: string; depth: number }> = [
+      { dir: rootResolved, depth: 0 },
+    ];
+    while (queue.length) {
+      const { dir, depth } = queue.shift()!;
+      if (depth >= maxDepth) continue;
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of entries) {
+        if (name === "." || name === ".." || name.startsWith(".")) continue;
+        // Skip heavy / irrelevant trees in user folders.
+        if (
+          /^(node_modules|Library|\.git|\.Trash|Applications|Caches)$/i.test(
+            name,
+          )
+        ) {
+          continue;
+        }
+        const child = path.join(dir, name);
+        let st: fs.Stats;
+        try {
+          st = fs.lstatSync(child);
+        } catch {
+          continue;
+        }
+        if (st.isSymbolicLink()) continue;
+        if (st.isFile() && matchesName(name)) {
+          hits.push({
+            abs: child,
+            basename: name,
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+            depth: depth + 1,
+          });
+          // Exact basename at this depth — good enough, keep scanning siblings
+          // at same depth only via queue order; early return after loop if exact.
+        } else if (st.isDirectory()) {
+          queue.push({ dir: child, depth: depth + 1 });
+        }
+      }
+      // Prefer exact name match as soon as we have one at this depth.
+      const exact = hits.find((h) => h.basename === base);
+      if (exact && exact.depth <= depth + 1) {
+        return { abs: exact.abs, basename: exact.basename, size: exact.size };
+      }
+    }
+  }
+
+  if (!hits.length) return null;
+  // Prefer shallower + newer
+  hits.sort((a, b) => a.depth - b.depth || b.mtimeMs - a.mtimeMs);
+  const best = hits[0]!;
+  return { abs: best.abs, basename: best.basename, size: best.size };
+}
+
+/**
+ * Resolve a workspace-relative or absolute path to an existing file.
+ * Prefer roots (project / artifact home); absolute paths that exist outside
+ * roots are still accepted so Canvas can preview Downloads / Desktop files.
+ * Falls back to basename search under working/tmp and common user folders
+ * (including nested Downloads subfolders).
  */
 export function resolveExistingWorkspaceFile(
   roots: string[],
@@ -168,8 +309,15 @@ export function resolveExistingWorkspaceFile(
   }
 
   for (const abs of candidates) {
-    const root = resolvedRoots.find((r) => isInsideRoot(r, abs));
-    if (!root) continue;
+    const inside = resolvedRoots.some((r) => isInsideRoot(r, abs));
+    if (!inside) {
+      // Outside roots only when the caller asked for an absolute path
+      // (incl. restored `/Users/...`). Relative `../secret` stays sandboxed.
+      if (!path.isAbsolute(trimmed)) continue;
+      const hit = tryStatFile(abs);
+      if (hit) return { ok: true, ...hit };
+      continue;
+    }
     const hit = tryStatFile(abs);
     if (hit) return { ok: true, ...hit };
   }
@@ -177,7 +325,21 @@ export function resolveExistingWorkspaceFile(
   const byName = findByBasename(resolvedRoots, path.basename(trimmed));
   if (byName) return { ok: true, ...byName };
 
-  return { ok: false, error: "File not found in project folders" };
+  const base = path.basename(trimmed);
+  // Nested ~/Downloads search is expensive — only for real deliverable names,
+  // never for path-escape attempts (`../secret`).
+  if (
+    base &&
+    base !== "." &&
+    base !== ".." &&
+    !trimmed.split(/[/\\]/).includes("..") &&
+    isDeliverableChatPath(base)
+  ) {
+    const inUser = findByBasenameUnderDirs(userContentDirs(), base, 5);
+    if (inUser) return { ok: true, ...inUser };
+  }
+
+  return { ok: false, error: "File not found" };
 }
 
 export function readFileForDelivery(

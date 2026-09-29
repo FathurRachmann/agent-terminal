@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
 import {
@@ -7,19 +8,29 @@ import {
   type FileDownloadResponse,
   type FileUploadResponse,
 } from "deepagents";
-import { checkCommand, checkCommandWorkspaceAccess } from "./guardrails.js";
+import { checkCommand, checkCommandWorkspaceAccess, ensureLsLongListing } from "./guardrails.js";
 import { registerPtyBackgroundProcess } from "../agent/process-manage.js";
 import { resolveWorkingAwarePath } from "../agent/working-paths.js";
+import {
+  isBroadFilesystemRoot,
+  mergeAllowedRoots,
+  unrestrictedFilesystemRoots,
+} from "../agent/default-sandbox-roots.js";
 
 export type PtySandboxOptions = {
   workingDirectory: string;
   /** Extra allowed roots beyond workingDirectory (e.g. project folders). */
   initialAllowedRoots?: string[];
   /**
-   * Agent repo root where `working/global|bots|project/...` artifacts live.
-   * Relative paths starting with `working/` resolve here instead of cwd.
+   * Agent repo root where `tmp/global|bots|project/...` artifacts live.
+   * Relative paths starting with `tmp/` (or legacy `working/`) resolve here instead of cwd.
    */
   artifactHome?: string;
+  /**
+   * Privacy ON: confine to workspace/artifact (+ explicit grants).
+   * Privacy OFF: ensure unrestricted filesystem roots stay on the allowlist.
+   */
+  privacyStrict?: boolean;
   timeoutMs?: number;
   shell?: string;
   cols?: number;
@@ -69,10 +80,16 @@ export function truncateOutput(
   const head = lines.slice(0, headLines);
   const tail = lines.slice(-tailLines);
   const omitted = lines.length - headLines - tailLines;
+  // Prefer keeping error/signal lines from the omitted middle.
+  const signalRe =
+    /\b(error|exception|traceback|failed|FAIL|ENOENT|ELIFECYCLE|TypeError|ReferenceError)\b/i;
+  const middle = lines.slice(headLines, -tailLines);
+  const signals = middle.filter((l) => signalRe.test(l)).slice(0, 20);
   return {
     text: [
       ...head,
       `\n...[${omitted} lines truncated]...\n`,
+      ...(signals.length ? ["[signal lines]", ...signals, ""] : []),
       ...tail,
     ].join("\n"),
     truncated: true,
@@ -199,8 +216,10 @@ export class PtySandbox extends BaseSandbox {
   readonly id: string;
   private workingDirectory: string;
   private allowedRoots: string[];
-  /** Agent root for remapping working/* artifact paths. */
+  /** Agent root for remapping tmp/* (and legacy working/*) artifact paths. */
   private readonly artifactHome: string | null;
+  /** Privacy ON → true: no auto-expand to Users / filesystem root. */
+  private privacyStrict: boolean;
   private readonly timeoutMs: number;
   private readonly shellPath: string;
   private readonly cols: number;
@@ -224,6 +243,7 @@ export class PtySandbox extends BaseSandbox {
     this.artifactHome = options.artifactHome
       ? path.resolve(options.artifactHome)
       : null;
+    this.privacyStrict = Boolean(options.privacyStrict);
     const extras = (options.initialAllowedRoots ?? [])
       .map((r) => path.resolve(r))
       .filter((r) => r && r !== this.workingDirectory);
@@ -235,14 +255,16 @@ export class PtySandbox extends BaseSandbox {
       extras.push(this.artifactHome);
     }
     this.allowedRoots = [this.workingDirectory, ...extras];
+    // Privacy OFF: guarantee whole-machine roots stay on the allowlist.
+    this.ensureBroadAccess();
     // Ensure scoped working dirs exist under Agent root.
     if (this.artifactHome) {
-      for (const sub of ["global", "bots"]) {
-        fs.mkdirSync(path.join(this.artifactHome, "working", sub), {
+      for (const sub of ["global", "bots", "templates"]) {
+        fs.mkdirSync(path.join(this.artifactHome, "tmp", sub), {
           recursive: true,
         });
       }
-      fs.mkdirSync(path.join(this.artifactHome, "working", "project"), {
+      fs.mkdirSync(path.join(this.artifactHome, "tmp", "project"), {
         recursive: true,
       });
     }
@@ -301,20 +323,122 @@ export class PtySandbox extends BaseSandbox {
     return this.workingDirectory;
   }
 
+  isPrivacyStrict(): boolean {
+    return this.privacyStrict;
+  }
+
   getAllowedRoots(): string[] {
+    this.ensureBroadAccess();
     return [...this.allowedRoots];
   }
 
+  /**
+   * Privacy OFF: keep unrestricted filesystem roots on the allowlist forever —
+   * project soft-allow and cwd switches must not shrink access back to Agent-only.
+   * Privacy ON: no-op (project confinement).
+   */
+  ensureBroadAccess(): void {
+    if (this.privacyStrict) return;
+    try {
+      for (const c of unrestrictedFilesystemRoots()) {
+        let real = path.resolve(c);
+        try {
+          if (fs.existsSync(real)) real = fs.realpathSync(real);
+        } catch {
+          /* keep */
+        }
+        if (!this.allowedRoots.some((r) => path.resolve(r) === real)) {
+          this.allowedRoots.push(real);
+        }
+      }
+      // Also keep /Users|home as explicit roots for clearer show_allowed_folders.
+      const home = path.resolve(os.homedir());
+      const candidates: string[] = [];
+      if (home && fs.existsSync(home)) {
+        candidates.push(home);
+        const parent = path.dirname(home);
+        const base = path.basename(parent);
+        if (
+          (parent === "/Users" || /^users$/i.test(base)) &&
+          fs.existsSync(parent)
+        ) {
+          candidates.unshift(parent);
+        }
+      }
+      for (const c of candidates) {
+        let real = c;
+        try {
+          real = fs.realpathSync(c);
+        } catch {
+          /* keep */
+        }
+        if (!this.allowedRoots.some((r) => path.resolve(r) === real)) {
+          this.allowedRoots.push(real);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** @deprecated Use ensureBroadAccess — kept for callers that still name Users. */
+  ensureUsersScopeRoot(): void {
+    this.ensureBroadAccess();
+  }
+
+  /**
+   * Apply Privacy ON/OFF. ON strips broad roots; OFF restores whole-machine access.
+   * Explicit HITL / soft-allow project folders that are not broad roots are kept.
+   */
+  setPrivacyMode(strict: boolean): {
+    privacyStrict: boolean;
+    allowedRoots: string[];
+  } {
+    this.privacyStrict = Boolean(strict);
+    if (this.privacyStrict) {
+      const keepers = this.allowedRoots.filter(
+        (r) => !isBroadFilesystemRoot(r),
+      );
+      this.allowedRoots = mergeAllowedRoots(
+        [this.workingDirectory],
+        this.artifactHome ? [this.artifactHome] : null,
+        keepers,
+      );
+    } else {
+      this.allowedRoots = mergeAllowedRoots(
+        this.allowedRoots,
+        [this.workingDirectory],
+        this.artifactHome ? [this.artifactHome] : null,
+        unrestrictedFilesystemRoots(),
+      );
+      this.ensureBroadAccess();
+    }
+    return {
+      privacyStrict: this.privacyStrict,
+      allowedRoots: [...this.allowedRoots],
+    };
+  }
+
   isPathAllowed(candidate: string): boolean {
-    const resolved = this.resolveFsPath(candidate);
+    let resolved = this.resolveFsPath(candidate);
+    try {
+      if (fs.existsSync(resolved)) resolved = fs.realpathSync(resolved);
+    } catch {
+      /* keep resolved */
+    }
     return this.allowedRoots.some((root) => {
-      const realRoot = path.resolve(root);
+      let realRoot = path.resolve(root);
+      try {
+        if (fs.existsSync(realRoot)) realRoot = fs.realpathSync(realRoot);
+      } catch {
+        /* keep */
+      }
       const rel = path.relative(realRoot, resolved);
       return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
     });
   }
 
-  /** Resolve tool paths; remap working/* onto artifactHome when set. */
+  /** Resolve tool paths; remap tmp/* (and legacy working/*) onto artifactHome when set. */
   resolveFsPath(filePath: string): string {
     if (this.artifactHome) {
       return resolveWorkingAwarePath(
@@ -326,6 +450,38 @@ export class PtySandbox extends BaseSandbox {
     return path.isAbsolute(filePath)
       ? path.resolve(filePath)
       : path.resolve(this.workingDirectory, filePath);
+  }
+
+  /**
+   * Expand the filesystem allowlist without changing cwd or killing PTYs.
+   * Used when another turn is busy so session↔workspace can share access
+   * without rebooting the agent mid-turn.
+   */
+  allowFolders(folderPaths: string[]): string[] {
+    if (this.disposed) {
+      throw new Error("PtySandbox has been disposed");
+    }
+    this.ensureBroadAccess();
+    const added: string[] = [];
+    for (const folderPath of folderPaths) {
+      const trimmed = String(folderPath || "").trim();
+      if (!trimmed) continue;
+      const resolved = path.resolve(trimmed);
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+        continue;
+      }
+      let real = resolved;
+      try {
+        real = fs.realpathSync(resolved);
+      } catch {
+        /* use resolved */
+      }
+      if (!this.allowedRoots.some((r) => path.resolve(r) === real)) {
+        this.allowedRoots.push(real);
+        added.push(real);
+      }
+    }
+    return added;
   }
 
   /**
@@ -394,6 +550,79 @@ export class PtySandbox extends BaseSandbox {
     session.write(data);
   }
 
+  /**
+   * List directory via Node fs (not the BaseSandbox find/stat shell pipeline).
+   * macOS PTY strips tabs from BSD `stat -f`, which made deepagents `ls` return
+   * empty — so Downloads looked empty. Always includes hidden files (ls -la).
+   */
+  async ls(dirPath: string): Promise<{
+    files?: Array<{
+      path: string;
+      is_dir: boolean;
+      size: number;
+      modified_at: string;
+    }>;
+    error?: string;
+  }> {
+    const resolved = this.resolveFsPath(dirPath || ".");
+    if (!this.isPathAllowed(resolved)) {
+      return { error: `Permission denied listing '${dirPath}'` };
+    }
+    try {
+      if (!fs.existsSync(resolved)) {
+        return { error: `Directory not found: ${dirPath}` };
+      }
+      const st = fs.statSync(resolved);
+      if (!st.isDirectory()) {
+        return { error: `Not a directory: ${dirPath}` };
+      }
+      const entries = fs.readdirSync(resolved, { withFileTypes: true });
+      const files: Array<{
+        path: string;
+        is_dir: boolean;
+        size: number;
+        modified_at: string;
+      }> = [];
+      for (const entry of entries) {
+        const fullPath = path.join(resolved, entry.name);
+        try {
+          const est = fs.lstatSync(fullPath);
+          const isDir = est.isDirectory();
+          // Follow symlink-to-dir for is_dir when useful, but keep listing the entry.
+          let size = 0;
+          let mtime = est.mtime;
+          let dir = isDir;
+          if (est.isSymbolicLink()) {
+            try {
+              const target = fs.statSync(fullPath);
+              dir = target.isDirectory();
+              size = dir ? 0 : target.size;
+              mtime = target.mtime;
+            } catch {
+              size = 0;
+            }
+          } else if (!isDir) {
+            size = est.size;
+          }
+          files.push({
+            path: dir ? fullPath + path.sep : fullPath,
+            is_dir: dir,
+            size,
+            modified_at: mtime.toISOString(),
+          });
+        } catch {
+          /* skip unreadable entries */
+        }
+      }
+      files.sort((a, b) => a.path.localeCompare(b.path));
+      return { files };
+    } catch (err) {
+      return {
+        error: `Error listing '${dirPath}': ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
   async execute(command: string): Promise<ExecuteResponse> {
     const session = await this.acquireSession();
     try {
@@ -433,6 +662,8 @@ export class PtySandbox extends BaseSandbox {
       // plain shell string
     }
 
+    cmd = ensureLsLongListing(cmd);
+
     const guard = checkCommand(cmd);
     if (!guard.ok) {
       return {
@@ -455,7 +686,7 @@ export class PtySandbox extends BaseSandbox {
 
     const access = checkCommandWorkspaceAccess(
       cmd,
-      this.allowedRoots,
+      this.getAllowedRoots(),
       this.workingDirectory,
     );
     if (!access.ok) {
@@ -463,7 +694,7 @@ export class PtySandbox extends BaseSandbox {
         output: [
           `Workspace confinement blocked command: ${access.reason}`,
           `Allowed folders:\n${this.allowedRoots.map((r) => `- ${r}`).join("\n")}`,
-          `Ask the user for permission, then call request_folder_access with the folder path.`,
+          `Call request_folder_access with the folder path NOW (do not ask in chat). That tool opens the Approve/Deny UI; after approval, retry this command.`,
           `Command: ${cmd}`,
         ].join("\n"),
         exitCode: 1,

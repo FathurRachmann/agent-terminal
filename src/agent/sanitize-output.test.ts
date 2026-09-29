@@ -10,6 +10,7 @@ import {
   salvageUserFacingAnswer,
   shouldRenderAsReasoning,
   stripThinkBlocks,
+  extractSuggestedModel,
 } from "./sanitize-output.js";
 
 describe("sanitize-output", () => {
@@ -92,6 +93,7 @@ describe("sanitize-output", () => {
     assert.equal(looksLikeProviderNotice(notice), true);
     assert.equal(shouldRenderAsReasoning(notice), true);
     assert.equal(shouldRenderAsReasoning("Folder created successfully."), false);
+    assert.equal(extractSuggestedModel(notice), "Gemini 3.7 Flash");
   });
 
   it("keeps longer streamed draft when done payload is shorter", () => {
@@ -106,5 +108,11 @@ describe("sanitize-output", () => {
       "Okay, let's break down the problem step by step. The user asked about memory. However,";
     const done = "Memory uses SQLite under `.agent/memory`.";
     assert.equal(resolveFinalAssistantText(done, draft), done);
+  });
+
+  it("drops truncated tool-call JSON so it never becomes the chat bubble", () => {
+    const dump = `[{"name":"task_plan","arguments":{"goal":"x"}},{"name":"execute","arguments":{"command":"ls"}},{"name":`;
+    assert.equal(resolveFinalAssistantText(dump, dump), "");
+    assert.equal(resolveFinalAssistantText("", dump), "");
   });
 });

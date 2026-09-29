@@ -1,6 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownBody } from "./MarkdownBody.js";
 import { PlanApprovalCard } from "./PlanApprovalCard.js";
+import { ToolApprovalCard } from "./ToolApprovalCard.js";
+import {
+  ContinueTurnCard,
+  type ContinueOffer,
+} from "./ContinueTurnCard.js";
 import { ChatFileCard } from "./ChatFileCard.js";
 import { UserBubbleAttachments } from "./UserBubbleAttachments.js";
 import {
@@ -43,6 +48,7 @@ import { NewProfileModal } from "./NewProfileModal.js";
 import { NewProjectModal } from "./NewProjectModal.js";
 import { type GatewayStatusSnapshot } from "./GatewayStatusBar.js";
 import { AppHeader } from "./AppHeader.js";
+import { NavIconRail, type NavRailId } from "./NavIconRail.js";
 import { SessionRowMenu } from "./SessionRowMenu.js";
 import { AppFooter } from "./AppFooter.js";
 import {
@@ -92,11 +98,17 @@ import {
   type LayoutTemplateId,
 } from "./layout-prefs.js";
 import { WorkspaceFilesPanel } from "./WorkspaceFilesPanel.js";
-import { isPlanApprovalInterrupt } from "../../agent/interrupt-utils.js";
 import {
+  formatToolApprovalDetail,
+  isPlanApprovalInterrupt,
+} from "../../agent/interrupt-utils.js";
+import {
+  extractSuggestedModel,
   resolveFinalAssistantText,
+  sanitizeAssistantText,
   shouldRenderAsReasoning,
 } from "../../agent/sanitize-output.js";
+import { looksLikeTextToolCallDump } from "../../agent/parse-text-tool-calls.js";
 import {
   emptySessionSnap,
   reduceSessionEvent,
@@ -116,6 +128,7 @@ declare global {
           basename?: string;
           kind?: string;
         }>,
+        options?: { chatMode?: string },
       ) => Promise<{
         ok: boolean;
         content?: string;
@@ -195,6 +208,7 @@ declare global {
       getStatus: () => Promise<{
         bridge: boolean;
         agentReady: boolean;
+        agentBooting?: boolean;
         error: string | null;
         model: string;
         workspaceRoot: string;
@@ -203,12 +217,24 @@ declare global {
         profileHome?: string;
         activeProjectId?: string | null;
         projectFolders?: string[] | null;
+        privacyMode?: boolean;
+        allowedRoots?: string[] | null;
         gateway?: GatewayStatusSnapshot;
         busy?: boolean;
         busyThreadId?: string | null;
         busyThreadIds?: string[];
         activeThreadId?: string;
         activeBotId?: string;
+      }>;
+      setPrivacyMode?: (
+        enabled: boolean,
+      ) => Promise<{
+        ok: boolean;
+        privacyMode?: boolean;
+        allowedRoots?: string[];
+        deferred?: boolean;
+        detail?: string;
+        error?: string;
       }>;
       getGitSummary?: () => Promise<{
         ok: boolean;
@@ -453,6 +479,8 @@ declare global {
           nextActions?: string[];
           note?: string | null;
         } | null;
+        autoContinue?: boolean;
+        autoContinuePrompt?: string | null;
         error?: string;
       }>;
       openWorkspacesWindow?: () => Promise<{ ok: boolean; error?: string }>;
@@ -501,6 +529,8 @@ declare global {
         };
         agent: {
           autoApproveDestructive: boolean;
+          runMode?: "auto-review" | "allowlist" | "run-everything";
+          toolAllowlist?: string[];
           requirePlanApproval: boolean;
           enableReflection: boolean;
           enableCheckpointer: boolean;
@@ -568,11 +598,16 @@ declare global {
           projectId?: string | null;
         }>;
       }>;
-      newSession?: () => Promise<{
+      newSession?: (opts?: {
+        projectId?: string | null;
+      }) => Promise<{
         ok: boolean;
         threadId?: string;
         activeBotId?: string;
         activeProjectId?: string | null;
+        projectId?: string | null;
+        workspaceRoot?: string;
+        projectFolders?: string[] | null;
         busyThreadId?: string | null;
         busyThreadIds?: string[];
         error?: string;
@@ -583,6 +618,10 @@ declare global {
         ok: boolean;
         threadId?: string;
         activeBotId?: string;
+        projectId?: string | null;
+        activeProjectId?: string | null;
+        workspaceRoot?: string;
+        projectFolders?: string[] | null;
         busyThreadId?: string | null;
         busyThreadIds?: string[];
         busy?: boolean;
@@ -953,7 +992,7 @@ type ChatItem =
       botRole?: string;
     }
   | { id: string; kind: "system"; text: string; at: string }
-  | { id: string; kind: "reasoning"; text: string; at: string; label?: string }
+  | { id: string; kind: "reasoning"; text: string; at: string; label?: string; durationSec?: number }
   | {
       id: string;
       kind: "file";
@@ -962,11 +1001,19 @@ type ChatItem =
       at: string;
       note?: string;
     }
-  | { id: string; kind: "trace"; event: AgentUiEvent; at: string };
+  | {
+      id: string;
+      kind: "trace";
+      event: AgentUiEvent;
+      at: string;
+      /** Args from matching tool_start (for tool_end rows). */
+      toolInput?: unknown;
+    };
 
 type BridgeStatus = {
   connected: boolean;
   agentReady: boolean;
+  agentBooting?: boolean;
   error: string | null;
   model: string;
   workspaceRoot: string;
@@ -1011,6 +1058,7 @@ export function App() {
     Array<{ id: string; kind: string; title: string; content: string; updatedAt: string; tags: string[] }>
   >([]);
   const [draftAnswer, setDraftAnswer] = useState("");
+  const [draftReasoning, setDraftReasoning] = useState("");
   const [bots, setBots] = useState<
     Array<{
       id: string;
@@ -1069,15 +1117,14 @@ export function App() {
   const [composerMode, setComposerMode] = useState<ComposerMode>(() => {
     try {
       const v = localStorage.getItem("agent.desktop.composer.mode");
-      return v === "Auto" ||
-        v === "Fixed" ||
-        v === "Rotating" ||
-        v === "Chat" ||
-        v === "Coding"
+      return v === "agent" ||
+        v === "ask" ||
+        v === "plan" ||
+        v === "debug"
         ? v
-        : "Rotating";
+        : "agent";
     } catch {
-      return "Rotating";
+      return "agent";
     }
   });
   const [composerEffort, setComposerEffort] = useState<ComposerEffort>(() => {
@@ -1108,7 +1155,30 @@ export function App() {
   });
   const [chatDropActive, setChatDropActive] = useState(false);
   const [voiceMuted, setVoiceMuted] = useState(true);
-  const [privacyMode, setPrivacyMode] = useState(false);
+  const [privacyMode, setPrivacyModeState] = useState(() => {
+    try {
+      return localStorage.getItem("agent.desktop.composer.privacy") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const applyPrivacyMode = useCallback(async (enabled: boolean) => {
+    setPrivacyModeState(enabled);
+    try {
+      localStorage.setItem(
+        "agent.desktop.composer.privacy",
+        enabled ? "1" : "0",
+      );
+    } catch {
+      /* ignore */
+    }
+    if (window.electronAgent?.setPrivacyMode) {
+      const res = await window.electronAgent.setPrivacyMode(enabled);
+      if (res && res.ok === false && res.error) {
+        console.warn("[privacy]", res.error);
+      }
+    }
+  }, []);
   const [gitChrome, setGitChrome] = useState<{
     branch: string | null;
     additions: number;
@@ -1130,6 +1200,15 @@ export function App() {
   const [planApprovalPending, setPlanApprovalPending] = useState(false);
   const [planApprovalBusy, setPlanApprovalBusy] = useState(false);
   const [pendingPlanMarkdown, setPendingPlanMarkdown] = useState<string | null>(
+    null,
+  );
+  const [toolApprovalPending, setToolApprovalPending] = useState(false);
+  const [toolApprovalBusy, setToolApprovalBusy] = useState(false);
+  const [continueOffer, setContinueOffer] = useState<ContinueOffer | null>(
+    null,
+  );
+  const [continueBusy, setContinueBusy] = useState(false);
+  const [toolApprovalDetail, setToolApprovalDetail] = useState<string | null>(
     null,
   );
 
@@ -1484,6 +1563,9 @@ export function App() {
     ]);
     setActivity([]);
     setDraftAnswer("");
+    reasoningRef.current = "";
+    setDraftReasoning("");
+    reasoningStartedAtRef.current = 0;
     setInput("");
     setPendingAttachments([]);
     setCanvasTabs([]);
@@ -1493,6 +1575,9 @@ export function App() {
     setPlanApprovalPending(false);
     setPendingPlanMarkdown(null);
     setPlanApprovalBusy(false);
+    setToolApprovalPending(false);
+    setToolApprovalDetail(null);
+    setToolApprovalBusy(false);
     setLoading(false);
     setPhase("boot");
     setMessageFeedback({});
@@ -1524,30 +1609,32 @@ export function App() {
 
     await refreshProjects();
     await refreshBots();
-    const sess = await refreshSessions({ syncBusy: true });
-
-    if (sess?.activeThreadId && window.electronAgent?.openSession) {
-      const opened = await window.electronAgent.openSession(sess.activeThreadId);
-      if (opened.ok) {
-        const nextId = opened.threadId || sess.activeThreadId;
-        activeThreadIdRef.current = nextId;
-        setActiveThreadId(nextId);
-        setSelectedBotId(opened.activeBotId || "general");
-        if ((opened.events?.length ?? 0) > 0) {
-          applyTranscript(opened.events ?? []);
-        } else {
-          setItems([
-            {
-              id: "empty",
-              kind: "assistant",
-              text: "Empty session — send a message to start.",
-              at: now(),
-            },
-          ]);
-          setActivity([]);
+    // Profile switch = clean general session (no sticky project / terminal cwd).
+    if (window.electronAgent?.newSession) {
+      const created = await window.electronAgent.newSession({ projectId: null });
+      if (created.ok && created.threadId) {
+        syncBusyFromPayload(created.busyThreadIds, created.busyThreadId);
+        activeThreadIdRef.current = created.threadId;
+        setActiveThreadId(created.threadId);
+        setSelectedBotId(created.activeBotId || "general");
+        setActiveProjectId(null);
+        setProjectsFocusId(null);
+        setActiveTab("sessions");
+        if (created.workspaceRoot) {
+          setStatus((s) => ({ ...s, workspaceRoot: created.workspaceRoot! }));
         }
+        setItems([
+          {
+            id: "welcome",
+            kind: "assistant",
+            text: `Switched to profile “${id}”. New session — what's the goal?`,
+            at: now(),
+          },
+        ]);
+        setActivity([]);
       }
     }
+    await refreshSessions({ syncBusy: true });
 
     if (window.electronAgent?.getLearnedRules) {
       const rules = await window.electronAgent.getLearnedRules();
@@ -1567,6 +1654,9 @@ export function App() {
   >([]);
   const [loading, setLoading] = useState(false);
   const [phase, setPhase] = useState<AgentPhase>("boot");
+  const [phaseDetail, setPhaseDetail] = useState<string | null>(null);
+  const [tokensPerSec, setTokensPerSec] = useState<number | null>(null);
+  const tokenRateRef = useRef({ chars: 0, startedAt: 0 });
   const [messageFeedback, setMessageFeedback] = useState<
     Record<string, BubbleFeedback>
   >({});
@@ -1633,6 +1723,8 @@ export function App() {
 
   const streamRef = useRef<HTMLDivElement>(null);
   const draftRef = useRef("");
+  const reasoningRef = useRef("");
+  const reasoningStartedAtRef = useRef(0);
   const pendingToolsRef = useRef<Array<{ name: string; input: unknown }>>([]);
   /** Deliverable paths (.docx etc.) referenced by generator scripts, opened after execute. */
   const pendingDeliverablesRef = useRef<string[]>([]);
@@ -1646,6 +1738,8 @@ export function App() {
     phase: "boot" as AgentPhase,
     planApprovalPending: false,
     pendingPlanMarkdown: null as string | null,
+    toolApprovalPending: false,
+    toolApprovalDetail: null as string | null,
     canvasTabs,
     activeCanvasId,
     railLayer,
@@ -1661,6 +1755,8 @@ export function App() {
     phase,
     planApprovalPending,
     pendingPlanMarkdown,
+    toolApprovalPending,
+    toolApprovalDetail,
     canvasTabs,
     activeCanvasId,
     railLayer,
@@ -1682,6 +1778,8 @@ export function App() {
     setPhase(snap.phase);
     setPlanApprovalPending(snap.planApprovalPending);
     setPendingPlanMarkdown(snap.pendingPlanMarkdown ?? null);
+    setToolApprovalPending(snap.toolApprovalPending);
+    setToolApprovalDetail(snap.toolApprovalDetail ?? null);
     setCanvasTabs(snap.canvasTabs);
     setActiveCanvasId(snap.activeCanvasId);
     setRailLayer(snap.railLayer === "files" ? "files" : "canvas");
@@ -1821,6 +1919,13 @@ export function App() {
 
       if (ui.type === "tool_start") {
         pendingTools.push({ name: ui.name, input: ui.input });
+        restoredItems.push({
+          id: `t-${ev.ts}-${restoredItems.length}`,
+          kind: "trace",
+          event: ui,
+          at,
+          toolInput: ui.input,
+        });
       } else if (ui.type === "tool_end") {
         let input: unknown = {};
         for (let i = pendingTools.length - 1; i >= 0; i -= 1) {
@@ -1830,12 +1935,33 @@ export function App() {
             break;
           }
         }
-        restoredItems.push({
-          id: `t-${ev.ts}-${restoredItems.length}`,
-          kind: "trace",
-          event: { type: "tool_start", name: ui.name, input },
-          at,
-        });
+        // Prefer upgrading the matching tool_start row when present.
+        let upgraded = false;
+        for (let i = restoredItems.length - 1; i >= 0; i -= 1) {
+          const row = restoredItems[i];
+          if (
+            row?.kind === "trace" &&
+            row.event.type === "tool_start" &&
+            row.event.name === ui.name
+          ) {
+            restoredItems[i] = {
+              ...row,
+              event: { type: "tool_end", name: ui.name, output: ui.output },
+              toolInput: row.toolInput ?? input,
+            };
+            upgraded = true;
+            break;
+          }
+        }
+        if (!upgraded) {
+          restoredItems.push({
+            id: `t-${ev.ts}-${restoredItems.length}`,
+            kind: "trace",
+            event: { type: "tool_end", name: ui.name, output: ui.output },
+            at,
+            toolInput: input,
+          });
+        }
       } else if (shouldMirrorInChat(ui)) {
         restoredItems.push({
           id: `t-${ev.ts}-${restoredItems.length}`,
@@ -1925,8 +2051,13 @@ export function App() {
     pendingToolsRef.current = [];
     pendingDeliverablesRef.current = [];
     setDraftAnswer("");
+    reasoningRef.current = "";
+    setDraftReasoning("");
+    reasoningStartedAtRef.current = 0;
     setPlanApprovalPending(false);
     setPendingPlanMarkdown(null);
+    setToolApprovalPending(false);
+    setToolApprovalDetail(null);
     setLoading(threadBusy);
     if (!threadBusy) {
       setPhase("boot");
@@ -1935,26 +2066,95 @@ export function App() {
 
   useEffect(() => {
     void (async () => {
-      const res = await refreshSessions({ syncBusy: true });
-      if (!res?.activeThreadId || !window.electronAgent?.openSession) return;
-      const opened = await window.electronAgent.openSession(res.activeThreadId);
-      if (!opened.ok) return;
-      if ((opened.events?.length ?? 0) > 0) {
-        applyTranscript(opened.events ?? []);
+      // Wait for main boot — MCP/tool load can take >4s on cold start.
+      let ready = false;
+      for (let i = 0; i < 120; i += 1) {
+        const st = await window.electronAgent?.getStatus?.();
+        if (st) {
+          setStatus((s) => ({
+            ...s,
+            connected: true,
+            agentReady: Boolean(st.agentReady),
+            agentBooting: Boolean(st.agentBooting),
+            error: st.error,
+            model: st.model || s.model,
+            workspaceRoot: st.workspaceRoot || s.workspaceRoot,
+            profileId: st.profileId || s.profileId,
+            gateway: st.gateway ?? s.gateway,
+          }));
+          if (st.agentReady) {
+            ready = true;
+            break;
+          }
+          if (st.error && !st.agentBooting) break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
       }
+      if (!ready) {
+        const st = await window.electronAgent?.getStatus?.();
+        if (st && !st.agentReady) {
+          setStatus((s) => ({
+            ...s,
+            agentReady: false,
+            agentBooting: Boolean(st.agentBooting),
+            error:
+              st.error ||
+              (st.agentBooting
+                ? "Agent engine is still starting…"
+                : "Agent engine not ready"),
+          }));
+        }
+      }
+      if (!window.electronAgent?.newSession) return;
+      const res = await window.electronAgent.newSession({ projectId: null });
+      if (!res.ok || !res.threadId) return;
+      syncBusyFromPayload(res.busyThreadIds, res.busyThreadId);
+      activeThreadIdRef.current = res.threadId;
+      setActiveThreadId(res.threadId);
+      setSelectedBotId(res.activeBotId || "general");
+      setActiveProjectId(null);
+      setProjectsFocusId(null);
+      setActiveTab("sessions");
+      if (res.workspaceRoot) {
+        setStatus((s) => ({ ...s, workspaceRoot: res.workspaceRoot! }));
+      }
+      setItems([
+        {
+          id: "welcome",
+          kind: "assistant",
+          text: "New session. What's the goal?",
+          at: now(),
+        },
+      ]);
+      setActivity([]);
+      setLoading(false);
+      setPhase("boot");
+      stickToBottom.current = true;
+      await refreshSessions({ syncBusy: true });
+      await refreshProjects();
+      await refreshBots();
     })();
   }, []);
 
-  const handleNewSession = async () => {
+  const handleNewSession = async (opts?: { projectId?: string | null }) => {
     if (!window.electronAgent?.newSession) return;
     stashCurrentSession();
-    const res = await window.electronAgent.newSession();
+    // Sessions tab / top button → always general (null). Project "+" → that project.
+    const wantProject =
+      opts && "projectId" in opts ? (opts.projectId ?? null) : null;
+    const res = await window.electronAgent.newSession({
+      projectId: wantProject,
+    });
     if (!res.ok || !res.threadId) return;
     syncBusyFromPayload(res.busyThreadIds, res.busyThreadId);
     activeThreadIdRef.current = res.threadId;
     setActiveThreadId(res.threadId);
     setSelectedBotId(res.activeBotId || "general");
-    const projectId = res.activeProjectId ?? activeProjectId;
+    const projectId = res.projectId ?? res.activeProjectId ?? wantProject;
+    setActiveProjectId(projectId);
+    if (res.workspaceRoot) {
+      setStatus((s) => ({ ...s, workspaceRoot: res.workspaceRoot! }));
+    }
     if (projectId) {
       setActiveTab("projects");
       setProjectsFocusId(projectId);
@@ -1974,18 +2174,40 @@ export function App() {
       },
     ]);
     setActivity([]);
+    setContinueOffer(null);
+    setContinueBusy(false);
     draftRef.current = "";
     pendingToolsRef.current = [];
     pendingDeliverablesRef.current = [];
     setDraftAnswer("");
+    reasoningRef.current = "";
+    setDraftReasoning("");
+    reasoningStartedAtRef.current = 0;
     setPlanApprovalPending(false);
     setPendingPlanMarkdown(null);
+    setToolApprovalPending(false);
+    setToolApprovalDetail(null);
     setLoading(false);
     setPhase("boot");
     stickToBottom.current = true;
     await refreshSessions({ syncBusy: true });
     await refreshBots();
+    if (projectId === null) {
+      await refreshProjects();
+    }
   };
+
+  /** Cursor: each chat mode keeps its own context — switching modes starts a fresh thread. */
+  const handleComposerModeChange = useCallback(
+    (next: ComposerMode) => {
+      if (next === composerMode) return;
+      setComposerMode(next);
+      void handleNewSession({ projectId: activeProjectId });
+    },
+    // handleNewSession closes over many setters; mode+project are the deps that matter.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [composerMode, activeProjectId],
+  );
 
   const handleOpenSession = async (
     threadId: string,
@@ -2002,24 +2224,39 @@ export function App() {
     activeThreadIdRef.current = nextId;
     setActiveThreadId(nextId);
     setSelectedBotId(res.activeBotId || "general");
+    const sessionProjectId =
+      res.projectId !== undefined
+        ? (res.projectId ?? null)
+        : (sessions.find((s) => s.threadId === nextId)?.projectId ?? null);
+    if (res.activeProjectId !== undefined) {
+      setActiveProjectId(res.activeProjectId ?? null);
+    } else if (!sessionProjectId) {
+      setActiveProjectId(null);
+    }
+    if (res.workspaceRoot) {
+      setStatus((s) => ({ ...s, workspaceRoot: res.workspaceRoot! }));
+    }
     if (opts?.tab) {
       setActiveTab(opts.tab);
     } else if (res.activeBotId && res.activeBotId !== "general") {
       setActiveTab("bots");
+    } else if (sessionProjectId) {
+      setActiveTab("projects");
+      setProjectsFocusId(sessionProjectId);
     } else {
-      const meta = sessions.find((s) => s.threadId === nextId);
-      if (meta?.projectId) {
-        setActiveTab("projects");
-        setProjectsFocusId(meta.projectId);
-      } else {
-        setActiveTab("sessions");
-      }
+      setActiveTab("sessions");
+      setProjectsFocusId(null);
     }
     setMainView("chat");
+    setContinueOffer(null);
+    setContinueBusy(false);
     restoreThreadView(nextId, res.events, res.busyThreadIds, res.busyThreadId);
     stickToBottom.current = true;
     await refreshSessions({ syncBusy: true });
     await refreshBots();
+    if (!sessionProjectId) {
+      await refreshProjects();
+    }
   };
 
   const handleClearSession = async (threadId: string) => {
@@ -2038,11 +2275,18 @@ export function App() {
       ]);
       setActivity([]);
       setDraftAnswer("");
+      reasoningRef.current = "";
+      setDraftReasoning("");
+      reasoningStartedAtRef.current = 0;
       draftRef.current = "";
       setCanvasTabs([]);
       setActiveCanvasId(null);
       setPlanApprovalPending(false);
       setPendingPlanMarkdown(null);
+      setToolApprovalPending(false);
+      setToolApprovalDetail(null);
+      setContinueOffer(null);
+      setContinueBusy(false);
       setLoading(false);
       setPhase("boot");
     }
@@ -2071,11 +2315,16 @@ export function App() {
         ]);
         setActivity([]);
         setDraftAnswer("");
+        reasoningRef.current = "";
+        setDraftReasoning("");
+        reasoningStartedAtRef.current = 0;
         draftRef.current = "";
         setCanvasTabs([]);
         setActiveCanvasId(null);
         setPlanApprovalPending(false);
         setPendingPlanMarkdown(null);
+        setToolApprovalPending(false);
+        setToolApprovalDetail(null);
         setLoading(false);
         setPhase("boot");
       }
@@ -2201,6 +2450,9 @@ export function App() {
       setActivity([]);
       draftRef.current = "";
       setDraftAnswer("");
+      reasoningRef.current = "";
+      setDraftReasoning("");
+      reasoningStartedAtRef.current = 0;
       setLoading(false);
       setPhase("boot");
     }
@@ -2213,18 +2465,37 @@ export function App() {
     if (!window.electronAgent?.setActiveProject) return;
     let res = await window.electronAgent.setActiveProject(id);
     if (!res.ok && res.error?.includes("running turns")) {
-      const busy =
-        Array.isArray(res.busyThreadIds) && res.busyThreadIds.length
-          ? `\n\nBusy: ${res.busyThreadIds.join(", ")}`
-          : "";
-      const ok = window.confirm(
-        `Masih ada turn yang jalan, jadi project belum bisa diganti.${busy}\n\nStop turn itu dan pindah sekarang?`,
-      );
-      if (!ok) return;
-      res = await window.electronAgent.setActiveProject(id, { force: true });
+      // Leaving project (id=null) should soft-detach without confirm; only prompt when switching TO a project.
+      if (id !== null && id !== undefined && id !== "") {
+        const busy =
+          Array.isArray(res.busyThreadIds) && res.busyThreadIds.length
+            ? `\n\nBusy: ${res.busyThreadIds.join(", ")}`
+            : "";
+        const ok = window.confirm(
+          `Masih ada turn yang jalan, jadi project belum bisa diganti.${busy}\n\nStop turn itu dan pindah sekarang?`,
+        );
+        if (!ok) return;
+        res = await window.electronAgent.setActiveProject(id, { force: true });
+      }
     }
     if (!res.ok) {
       window.alert(res.error || "Could not switch project");
+      return;
+    }
+    const soft =
+      Boolean((res as { softDetached?: boolean }).softDetached) ||
+      Boolean((res as { reused?: boolean }).reused);
+    if (soft || id === null) {
+      setActiveProjectId(res.activeProjectId ?? null);
+      if (!res.activeProjectId) {
+        setActiveTab("sessions");
+        setProjectsFocusId(null);
+      }
+      if (res.workspaceRoot) {
+        setStatus((s) => ({ ...s, workspaceRoot: res.workspaceRoot! }));
+      }
+      await refreshProjects();
+      await refreshSessions({ syncBusy: true });
       return;
     }
     await applyProjectContext({
@@ -2301,6 +2572,10 @@ export function App() {
       );
     }
     setActiveTab("sessions");
+    setProjectsFocusId(null);
+    if (activeProjectId) {
+      void handleActivateProject(null);
+    }
     stickToBottom.current = true;
     await refreshSessions({ syncBusy: true });
   };
@@ -2326,17 +2601,26 @@ export function App() {
         setStatus({
           connected: true,
           agentReady: s.agentReady,
+          agentBooting: Boolean(s.agentBooting),
           error: s.error,
           model: s.model,
           workspaceRoot: s.workspaceRoot,
           profileId: s.profileId || "default",
           gateway: s.gateway ?? null,
         });
-        if ("activeProjectId" in s) {
-          setActiveProjectId(
-            (s as { activeProjectId?: string | null }).activeProjectId ?? null,
-          );
+        // Push composer Privacy toggle into the sandbox allowlist.
+        if (s.agentReady && window.electronAgent?.setPrivacyMode) {
+          const localOn =
+            localStorage.getItem("agent.desktop.composer.privacy") === "1";
+          void window.electronAgent.setPrivacyMode(localOn).then((res) => {
+            if (cancelled || !res?.ok) return;
+            if (typeof res.privacyMode === "boolean") {
+              setPrivacyModeState(res.privacyMode);
+            }
+          });
         }
+        // Do not re-stick activeProjectId from getStatus on boot — launch
+        // always starts a fresh general session (see newSession mount effect).
         void refreshProjects();
         const profiles = await window.electronAgent.listProfiles?.();
         if (profiles?.ok && !cancelled) {
@@ -2416,8 +2700,19 @@ export function App() {
       if (event.type === "status") {
         setPhase(event.phase);
         const detail = String(event.detail || "").trim();
+        if (detail === "agent ready") {
+          setStatus((s) => ({
+            ...s,
+            agentReady: true,
+            agentBooting: false,
+            error: null,
+          }));
+        }
         if (detail && detail !== "turn started") {
+          setPhaseDetail(detail);
           appendAgentLog(`[status] ${event.phase} · ${detail}\n`);
+        } else if (event.phase === "thinking" || event.phase === "boot") {
+          setPhaseDetail(null);
         }
         if (
           event.phase === "waiting_approval" &&
@@ -2427,6 +2722,11 @@ export function App() {
           setRailLayer("canvas");
           setRailOpen(true);
           void hydratePlanApprovalRef.current();
+        } else if (event.phase === "waiting_approval") {
+          setToolApprovalPending(true);
+          setToolApprovalDetail(
+            String(event.detail || "").trim() || "Tool approval required",
+          );
         }
         if (event.phase === "done" || event.phase === "error") {
           setLoading(false);
@@ -2435,6 +2735,8 @@ export function App() {
           if (event.phase === "error") {
             setPlanApprovalPending(false);
             setPendingPlanMarkdown(null);
+            setToolApprovalPending(false);
+            setToolApprovalDetail(null);
           }
         }
         // Reflection is background — never keep the composer locked on it.
@@ -2449,15 +2751,64 @@ export function App() {
       if (event.type === "interrupt") {
         if (isPlanApprovalInterrupt(event.payload)) {
           setPlanApprovalPending(true);
+          setToolApprovalPending(false);
+          setToolApprovalDetail(null);
           setRailLayer("canvas");
           setRailOpen(true);
           void hydratePlanApprovalRef.current(event.payload);
+        } else {
+          setToolApprovalPending(true);
+          setToolApprovalDetail(formatToolApprovalDetail(event.payload));
+        }
+      }
+
+      const flushReasoningToChat = (stamp: string) => {
+        const text = reasoningRef.current.trim();
+        if (!text) return;
+        const started = reasoningStartedAtRef.current;
+        const durationSec =
+          started > 0 ? Math.max(0.1, (Date.now() - started) / 1000) : undefined;
+        reasoningRef.current = "";
+        setDraftReasoning("");
+        reasoningStartedAtRef.current = 0;
+        setItems((prev) => [
+          ...prev,
+          {
+            id: `r-${stamp}-${prev.length}`,
+            kind: "reasoning" as const,
+            text,
+            at: stamp,
+            durationSec,
+          },
+        ]);
+      };
+
+      if (event.type === "reasoning") {
+        const chunk = String(event.text || "");
+        if (chunk) {
+          if (!reasoningStartedAtRef.current) {
+            reasoningStartedAtRef.current = Date.now();
+          }
+          reasoningRef.current += chunk;
+          setDraftReasoning(reasoningRef.current);
         }
       }
 
       if (event.type === "token") {
-        draftRef.current += event.text;
+        if (reasoningRef.current.trim()) {
+          flushReasoningToChat(at);
+        }
+        const chunk = event.text || "";
+        draftRef.current += chunk;
         setDraftAnswer(draftRef.current);
+        const tr = tokenRateRef.current;
+        if (!tr.startedAt) tr.startedAt = Date.now();
+        tr.chars += chunk.length;
+        const elapsedSec = (Date.now() - tr.startedAt) / 1000;
+        if (elapsedSec >= 0.25) {
+          // Rough token estimate: ~4 chars per token for Latin text.
+          setTokensPerSec(tr.chars / 4 / elapsedSec);
+        }
       }
 
       if (event.type === "pty") {
@@ -2469,23 +2820,57 @@ export function App() {
         const finalText = (
           preferStreamed
             ? resolveFinalAssistantText(event.text, draftRef.current)
-            : String(event.text || draftRef.current || "")
+            : sanitizeAssistantText(
+                String(event.text || draftRef.current || ""),
+              )
         ).trim();
         draftRef.current = "";
         setDraftAnswer("");
+        if (reasoningRef.current.trim()) {
+          flushReasoningToChat(at);
+        }
         setLoading(false);
+        setTokensPerSec(null);
+        tokenRateRef.current = { chars: 0, startedAt: 0 };
         if (finalText && shouldRenderAsReasoning(finalText)) {
-          setItems((prev) => [
-            ...prev,
-            {
-              id,
-              kind: "reasoning",
-              text: finalText,
-              at,
-              label: "Model notice",
-            },
-          ]);
-        } else {
+          setItems((prev) => {
+            const next = [
+              ...prev,
+              {
+                id,
+                kind: "reasoning" as const,
+                text: finalText,
+                at,
+                label: "Model notice",
+              },
+            ];
+            if (
+              /no longer available|please switch|model.*not found|antigravity/i.test(
+                finalText,
+              )
+            ) {
+              const lastUser = [...prev]
+                .reverse()
+                .find((m) => m.kind === "user");
+              const promptText =
+                lastUser && lastUser.kind === "user" ? lastUser.text : "";
+              if (promptText.trim()) {
+                const suggested = extractSuggestedModel(finalText);
+                queueMicrotask(() => {
+                  setContinueOffer((cur) =>
+                    cur ?? {
+                      reason: "model_unavailable",
+                      prompt: promptText,
+                      suggestedModel: suggested,
+                      notice: finalText.slice(0, 500),
+                    },
+                  );
+                });
+              }
+            }
+            return next;
+          });
+        } else if (finalText) {
           const evAny = event as {
             botName?: unknown;
             botId?: unknown;
@@ -2499,7 +2884,7 @@ export function App() {
             {
               id,
               kind: "assistant",
-              text: finalText || "(empty response)",
+              text: finalText,
               at,
               botId,
               botName,
@@ -2521,6 +2906,9 @@ export function App() {
       if (event.type === "warning" && /retrying/i.test(event.message)) {
         draftRef.current = "";
         setDraftAnswer("");
+        reasoningRef.current = "";
+        setDraftReasoning("");
+        reasoningStartedAtRef.current = 0;
       }
 
       if (event.type === "warning") {
@@ -2535,6 +2923,18 @@ export function App() {
         ]);
         setPhase("error");
         setLoading(false);
+        setTokensPerSec(null);
+        tokenRateRef.current = { chars: 0, startedAt: 0 };
+      }
+
+      if (event.type === "continue_available") {
+        setContinueOffer({
+          reason: event.reason,
+          prompt: event.prompt,
+          suggestedModel: event.suggestedModel,
+          notice: event.notice,
+        });
+        setLoading(false);
       }
 
       // Keep a dense live activity log (skip raw token / pty spam)
@@ -2546,7 +2946,20 @@ export function App() {
       }
 
       if (event.type === "tool_start") {
+        if (reasoningRef.current.trim()) {
+          flushReasoningToChat(at);
+        }
         pendingToolsRef.current.push({ name: event.name, input: event.input });
+        setItems((prev) => [
+          ...prev,
+          {
+            id: `t-${id}`,
+            kind: "trace",
+            event,
+            at,
+            toolInput: event.input,
+          },
+        ]);
       }
 
       if (event.type === "tool_end") {
@@ -2663,15 +3076,39 @@ export function App() {
           });
         }
 
-        const synthetic: AgentUiEvent = {
-          type: "tool_start",
+        const endEvent: AgentUiEvent = {
+          type: "tool_end",
           name: event.name,
-          input,
+          output: event.output,
         };
-        setItems((prev) => [
-          ...prev,
-          { id: `t-${id}`, kind: "trace", event: synthetic, at },
-        ]);
+        setItems((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i -= 1) {
+            const row = next[i];
+            if (
+              row?.kind === "trace" &&
+              row.event.type === "tool_start" &&
+              row.event.name === event.name
+            ) {
+              next[i] = {
+                ...row,
+                event: endEvent,
+                toolInput: row.toolInput ?? input,
+              };
+              return next;
+            }
+          }
+          return [
+            ...next,
+            {
+              id: `t-${id}`,
+              kind: "trace",
+              event: endEvent,
+              at,
+              toolInput: input,
+            },
+          ];
+        });
       } else if (shouldMirrorInChat(event) && event.type !== "tool_start") {
         setItems((prev) => [
           ...prev,
@@ -2691,7 +3128,7 @@ export function App() {
     const el = streamRef.current;
     if (!el || !stickToBottom.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [items, draftAnswer, loading, planApprovalPending, pendingPlanMarkdown]);
+  }, [items, draftAnswer, draftReasoning, loading, planApprovalPending, pendingPlanMarkdown, toolApprovalPending, toolApprovalDetail]);
 
   const onStreamScroll = () => {
     const el = streamRef.current;
@@ -2702,16 +3139,38 @@ export function App() {
 
   const handleSend = async (
     promptOverride?: string,
-    options?: { truncateFromId?: string },
+    options?: {
+      truncateFromId?: string;
+      /** Resume after model failure — keep full history, no new user bubble. */
+      continueMode?: boolean;
+    },
   ) => {
     const prompt = (promptOverride ?? input).trim();
     const attachmentsForSend =
       promptOverride != null ? [] : [...pendingAttachments];
     if ((!prompt && attachmentsForSend.length === 0) || loading) return;
+    if (!status.agentReady) {
+      const msg = status.agentBooting
+        ? "Agent engine is still starting (tools/MCP)… wait a moment and retry."
+        : status.error ||
+          "Agent engine not ready. Check terminal for boot errors (ROUTER_API_KEY, etc).";
+      setStatus((s) => ({ ...s, error: msg }));
+      setItems((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          kind: "system",
+          text: msg,
+          at: now(),
+        },
+      ]);
+      return;
+    }
     const turnId = activeThreadIdRef.current;
     if (turnId && isThreadBusy(turnId)) return;
 
     const truncateId = options?.truncateFromId;
+    const continueMode = Boolean(options?.continueMode);
     const cutIdx = truncateId
       ? items.findIndex((m) => m.id === truncateId)
       : -1;
@@ -2740,16 +3199,23 @@ export function App() {
       setInput("");
       setPendingAttachments([]);
     }
+    setContinueOffer(null);
     setEditingUserId(null);
     setEditDraft("");
     setLoading(true);
     setPhase("thinking");
+    setPhaseDetail(null);
+    setTokensPerSec(null);
+    tokenRateRef.current = { chars: 0, startedAt: 0 };
     if (turnId) {
       addBusyThread(turnId, "thinking");
       bumpSessionInSidebar(turnId, sidebarPreview);
     }
     draftRef.current = "";
     setDraftAnswer("");
+    reasoningRef.current = "";
+    setDraftReasoning("");
+    reasoningStartedAtRef.current = 0;
     setItems((prev) => {
       const base =
         truncateId != null
@@ -2758,11 +3224,22 @@ export function App() {
               return idx < 0 ? prev : prev.slice(0, idx);
             })()
           : prev;
+      if (continueMode) {
+        return [
+          ...base,
+          {
+            id: `s-cont-${Date.now()}`,
+            kind: "system" as const,
+            text: "↩ Continuing previous task (history preserved)…",
+            at: now(),
+          },
+        ];
+      }
       return [
         ...base,
         {
           id: `u-${Date.now()}`,
-          kind: "user",
+          kind: "user" as const,
           text: displayText,
           at: now(),
           attachments: bubbleAttachments.length
@@ -2803,6 +3280,7 @@ export function App() {
           basename: a.basename,
           kind: a.kind,
         })),
+        { chatMode: composerMode },
       );
       if (!res.ok && res.error) {
         // error event may already have been emitted
@@ -3034,6 +3512,55 @@ export function App() {
     void handleSend(user.text, { truncateFromId: userId });
   };
 
+  /** Resume after model failure / self-heal — keep full chat history. */
+  const handleContinueTurn = async (opts: { switchToSuggested: boolean }) => {
+    const offer = continueOffer;
+    if (!offer || loading || continueBusy) return;
+    setContinueBusy(true);
+    try {
+      if (opts.switchToSuggested && offer.suggestedModel?.trim()) {
+        const model = offer.suggestedModel.trim();
+        if (window.electronAgent?.updateSettings) {
+          const res = await window.electronAgent.updateSettings({
+            model: { agentModel: model },
+          });
+          if (res && (res as { ok?: boolean }).ok === false) {
+            setItems((prev) => [
+              ...prev,
+              {
+                id: `s-${Date.now()}`,
+                kind: "system",
+                text: `Gagal ganti model ke ${model}. Continue tetap dicoba dengan model sekarang.`,
+                at: now(),
+              },
+            ]);
+          } else {
+            setStatus((s) => ({
+              ...s,
+              model: model,
+            }));
+            // Allow agent reload to settle.
+            await new Promise((r) => setTimeout(r, 800));
+          }
+        }
+      }
+      const continuePrompt = [
+        "[CONTINUE AFTER INTERRUPTION]",
+        "Previous attempt stopped (model unavailable or self-heal).",
+        "Continue the user's original task in THIS same thread.",
+        "Do NOT restart from scratch — reuse prior tool results, plans, and files already in context.",
+        "Reply in the user's language.",
+        "",
+        "Original request:",
+        offer.prompt,
+      ].join("\n");
+      setContinueOffer(null);
+      await handleSend(continuePrompt, { continueMode: true });
+    } finally {
+      setContinueBusy(false);
+    }
+  };
+
   const startEditUser = (userId: string, text: string) => {
     if (loading) return;
     setEditingUserId(userId);
@@ -3097,9 +3624,88 @@ export function App() {
     }
   };
 
+  const resolveToolApproval = async (approved: boolean) => {
+    setToolApprovalBusy(true);
+    try {
+      await window.electronAgent?.resolveApproval?.(
+        approved,
+        activeThreadIdRef.current,
+      );
+      setToolApprovalPending(false);
+      setToolApprovalDetail(null);
+      if (!approved) {
+        setItems((prev) => [
+          ...prev,
+          {
+            id: `s-rej-${Date.now()}`,
+            kind: "system",
+            text: "Approval rejected — turn stopped.",
+            at: now(),
+          },
+        ]);
+      }
+    } finally {
+      setToolApprovalBusy(false);
+    }
+  };
+
+  const navRailActive: NavRailId =
+    mainView === "settings"
+      ? "settings"
+      : mainView === "profiles"
+        ? "profiles"
+        : mainView === "artifacts"
+          ? "artifacts"
+          : mainView === "kanban"
+            ? "kanban"
+            : mainView === "messaging"
+              ? "messaging"
+              : railOpen && railLayer === "files"
+                ? "files"
+                : "chat";
+
+  const handleNavRailSelect = (id: NavRailId) => {
+    switch (id) {
+      case "chat":
+        setMainView("chat");
+        break;
+      case "history":
+        setMainView("chat");
+        patchLayout((prev) => ({ ...prev, sidebarOpen: true }));
+        setActiveTab("sessions");
+        break;
+      case "files":
+        setMainView("chat");
+        setRailOpen(true);
+        setRailLayer("files");
+        break;
+      case "artifacts":
+        setMainView("artifacts");
+        break;
+      case "kanban":
+        setMainView("kanban");
+        break;
+      case "messaging":
+        setMainView("messaging");
+        break;
+      case "workspaces":
+        void window.electronAgent?.openWorkspacesWindow?.();
+        break;
+      case "profiles":
+        setMainView("profiles");
+        break;
+      case "settings":
+        setSettingsFocus(null);
+        setMainView("settings");
+        break;
+      default:
+        break;
+    }
+  };
+
   return (
     <div
-      className={`flex h-screen flex-col overflow-hidden bg-surface-0 font-sans text-fg ${
+      className={`flex h-screen flex-col overflow-hidden bg-surface-1 font-mono text-fg ${
         layoutEditing ? "layout-editing" : ""
       }`}
     >
@@ -3107,7 +3713,7 @@ export function App() {
         title={
           inBotSession && activeBot
             ? `${activeBot.name} · bot session`
-            : activeThreadId || status.workspaceRoot || "Agent Desktop"
+            : activeThreadId || status.workspaceRoot || "agent:runtime"
         }
         subtitle={`${status.model}${
           inBotSession && activeBot?.tools?.length
@@ -3116,6 +3722,8 @@ export function App() {
               ? ` · ${activeBot.name}`
               : " · general session"
         }${layoutsModalOpen || layoutEditing ? " · layout" : ""}`}
+        modelLabel={status.model}
+        gatewayReady={status.gateway?.phase === "ready"}
         layoutActive={layoutsModalOpen || layoutEditing}
         sidebarOpen={sidebarOpen}
         railOpen={railOpen}
@@ -3173,175 +3781,115 @@ export function App() {
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex min-h-0 min-w-0 flex-1">
+      <NavIconRail
+        active={navRailActive}
+        onSelect={handleNavRailSelect}
+        onOpenWorkspaces={() => {
+          void window.electronAgent?.openWorkspacesWindow?.();
+        }}
+      />
       {/* Sidebar */}
       {sidebarOpen ? (
       <aside
-        className="layout-panel flex shrink-0 flex-col border-r border-border bg-surface-1"
+        className="layout-panel flex shrink-0 flex-col bg-surface-0"
         style={{ width: layout.sidebarWidth }}
       >
-        <div className="px-4 py-3">
-          <div className="font-mono text-sm font-semibold tracking-wide text-accent-soft">
-            AGENT
+        <div className="flex flex-col gap-2 bg-surface-2 p-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <span className="font-mono text-[10px] font-bold tracking-widest text-fg-dim uppercase">
+                Sessions
+              </span>
+              <span className="bg-surface-3 px-1 py-0.5 font-mono text-[9px] font-bold text-accent">
+                {busyThreadIds.length || sessions.length} ACT
+              </span>
+            </div>
+            <div className="flex items-center gap-0.5">
+              {!inBotSession ? (
+                <button
+                  type="button"
+                  onClick={() => void handleNewSession({ projectId: null })}
+                  className="p-1 text-accent transition hover:bg-surface-4 hover:text-fg"
+                  data-tip="New Session (⌘N)"
+                >
+                  <span className="material-symbols-outlined text-[15px]">
+                    add_box
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void handleReturnToSessions()}
+                  className="p-1 text-fg-dim transition hover:bg-surface-4 hover:text-fg"
+                  data-tip="Back to sessions"
+                >
+                  <span className="material-symbols-outlined text-[15px]">
+                    arrow_back
+                  </span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() =>
+                  setSessionFilter((f) => (f === "all" ? "busy" : "all"))
+                }
+                className="p-1 text-fg-dim transition hover:bg-surface-4 hover:text-fg"
+                data-tip="Filter sessions"
+              >
+                <span className="material-symbols-outlined text-[15px]">
+                  tune
+                </span>
+              </button>
+            </div>
           </div>
-          <div className="mt-0.5 text-xs text-muted">Desktop runtime</div>
-        </div>
-
-        <div className="app-no-drag flex min-h-0 flex-1 flex-col gap-3 px-3 pb-3">
-          {!inBotSession ? (
+          <div className="grid grid-cols-3 gap-1">
             <button
               type="button"
-              onClick={() => void handleNewSession()}
-              className="w-full rounded-lg border border-border bg-surface-2 px-3 py-2 text-left text-[11px] font-medium text-fg transition hover:border-accent/40 hover:bg-surface-3"
+              onClick={() => void handleNewSession({ projectId: null })}
+              className="bg-surface-1 py-1 px-1 text-center font-mono text-[10px] font-bold text-accent transition hover:bg-accent hover:text-surface-0"
             >
-              + New session
-              {activeProject ? (
-                <span className="mt-0.5 block text-[9.5px] font-normal text-muted">
-                  in {activeProject.name}
-                </span>
-              ) : null}
+              + CHAT
             </button>
-          ) : (
+            <button
+              type="button"
+              onClick={() => setNewProjectOpen(true)}
+              className="bg-surface-1 py-1 px-1 text-center font-mono text-[10px] font-bold text-fg-dim transition hover:bg-surface-4 hover:text-fg"
+            >
+              + PROJ
+            </button>
+            <button
+              type="button"
+              onClick={() => setNewProfileOpen(true)}
+              className="bg-surface-1 py-1 px-1 text-center font-mono text-[10px] font-bold text-fg-dim transition hover:bg-surface-4 hover:text-fg"
+            >
+              + BOT
+            </button>
+          </div>
+        </div>
+
+        <div className="app-no-drag flex min-h-0 flex-1 flex-col px-0 pb-0">
+          {!inBotSession ? null : (
             <button
               type="button"
               onClick={() => void handleReturnToSessions()}
-              className="w-full rounded-lg border border-border bg-surface-2 px-3 py-2 text-left text-[11px] font-medium text-fg transition hover:border-accent/40 hover:bg-surface-3"
+              className="mx-2 mb-2 w-[calc(100%-1rem)] border border-border bg-surface-2 px-3 py-2 text-left font-mono text-[11px] font-medium text-fg transition hover:border-accent/40 hover:bg-surface-3"
             >
               ← Back to sessions
             </button>
           )}
 
-          <nav className="flex flex-col gap-0.5">
+          <div className="flex border-b border-border/60 bg-surface-0">
             {(
               [
-                {
-                  id: "capabilities" as const,
-                  label: "Capabilities",
-                  tip: "Capabilities — tools & skills",
-                  icon: (
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                      <path
-                        d="M12 3l2.1 4.3 4.7.7-3.4 3.3.8 4.7L12 14.8 7.8 16l.8-4.7L5.2 8l4.7-.7L12 3z"
-                        stroke="currentColor"
-                        strokeWidth="1.6"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  ),
-                },
-                {
-                  id: "artifacts" as const,
-                  label: "Artifacts",
-                  tip: "Artifacts — generated outputs",
-                  icon: (
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                      <path
-                        d="M7 3.5h7l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-9.5A1.5 1.5 0 0 1 5.5 20V5A1.5 1.5 0 0 1 7 3.5z"
-                        stroke="currentColor"
-                        strokeWidth="1.6"
-                        strokeLinejoin="round"
-                      />
-                      <path
-                        d="M13.5 3.5V8H18"
-                        stroke="currentColor"
-                        strokeWidth="1.6"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  ),
-                },
-                {
-                  id: "kanban" as const,
-                  label: "Kanban",
-                  tip: "Kanban — multi-agent work queue",
-                  icon: (
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                      <rect x="3.5" y="4" width="5" height="16" rx="1.2" stroke="currentColor" strokeWidth="1.6" />
-                      <rect x="9.5" y="4" width="5" height="10" rx="1.2" stroke="currentColor" strokeWidth="1.6" />
-                      <rect x="15.5" y="4" width="5" height="13" rx="1.2" stroke="currentColor" strokeWidth="1.6" />
-                    </svg>
-                  ),
-                },
-                {
-                  id: "messaging" as const,
-                  label: "Messaging",
-                  tip: "Messaging — WhatsApp & bridges",
-                  icon: (
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                      <path
-                        d="M5 6.5h14a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H9l-4 3v-3H5A1.5 1.5 0 0 1 3.5 16V8A1.5 1.5 0 0 1 5 6.5z"
-                        stroke="currentColor"
-                        strokeWidth="1.6"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  ),
-                },
+                ["sessions", "Sessions"],
+                ["bots", "Bots"],
+                ["projects", "Projects"],
               ] as const
-            ).map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                data-tip={item.tip}
-                data-tip-pos="bottom"
-                onClick={() => setMainView(item.id)}
-                className={`inline-flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[11px] transition ${
-                  mainView === item.id
-                    ? "bg-accent/15 text-accent-soft"
-                    : "text-fg-dim hover:bg-surface-2 hover:text-fg"
-                }`}
-              >
-                <span className="inline-flex shrink-0 opacity-80">{item.icon}</span>
-                <span>{item.label}</span>
-              </button>
-            ))}
-            <button
-              type="button"
-              data-tip="Workspaces — divisions & group chat (new window)"
-              data-tip-pos="bottom"
-              onClick={() => {
-                void window.electronAgent?.openWorkspacesWindow?.();
-              }}
-              className="inline-flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[11px] text-fg-dim transition hover:bg-surface-2 hover:text-fg"
-            >
-              <span className="inline-flex shrink-0 opacity-80">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <path
-                    d="M4 7.5h16v11A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-11z"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinejoin="round"
-                  />
-                  <path
-                    d="M4 7.5l2.2-3h11.6L20 7.5"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinejoin="round"
-                  />
-                  <path
-                    d="M9 11.5h6M9 15h4"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinecap="round"
-                  />
-                </svg>
-              </span>
-              <span>Workspaces</span>
-              <span className="ml-auto text-[9px] text-muted">↗</span>
-            </button>
-          </nav>
-
-          <div className="flex border-b border-border">
-            {(
-              [
-                ["sessions", "Sessions — global chat"],
-                ["bots", "Bots — specialized agents"],
-                ["projects", "Projects — folder-scoped work"],
-              ] as const
-            ).map(([tab, tip]) => (
+            ).map(([tab, label]) => (
               <button
                 key={tab}
                 type="button"
-                data-tip={tip}
+                data-tip={label}
                 data-tip-pos="bottom"
                 onClick={() => {
                   setActiveTab(tab);
@@ -3358,130 +3906,209 @@ export function App() {
                     void refreshSessions({ syncBusy: true });
                   }
                 }}
-                className={`flex-1 border-b-2 py-2 text-[10px] font-semibold tracking-wider uppercase ${
+                className={`flex-1 py-1.5 font-mono text-[9px] font-bold tracking-wider uppercase transition ${
                   activeTab === tab
-                    ? "border-accent text-white"
-                    : "border-transparent text-muted hover:text-fg-dim"
+                    ? "bg-surface-2 text-accent"
+                    : "text-muted hover:text-fg-dim"
                 }`}
               >
-                {tab}
+                {label}
               </button>
             ))}
           </div>
 
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden -mx-3 px-[2px]">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             {activeTab === "sessions" ? (
               globalSessions.length === 0 ? (
-                <div className="px-1 py-2 text-xs text-muted">No sessions yet</div>
+                <div className="px-3 py-2 font-mono text-xs text-muted">
+                  No sessions yet
+                </div>
               ) : (
-                <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
-                  <div className="mb-1 flex items-center justify-between px-1">
-                    <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-wider text-accent-soft uppercase">
-                      <span aria-hidden>▦</span> Sessions
-                    </div>
-                    <div className="flex items-center gap-0.5">
-                      <button
-                        type="button"
-                        title="New session"
-                        onClick={() => void handleNewSession()}
-                        className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-surface-2 hover:text-fg"
-                      >
-                        +
-                      </button>
-                      <button
-                        type="button"
-                        title={
-                          sessionFilter === "all"
-                            ? "Show busy only"
-                            : "Show all sessions"
-                        }
-                        onClick={() =>
-                          setSessionFilter((f) => (f === "all" ? "busy" : "all"))
-                        }
-                        className={`rounded px-1.5 py-0.5 text-[10px] ${
-                          sessionFilter === "busy"
-                            ? "bg-accent/20 text-accent-soft"
-                            : "text-muted hover:bg-surface-2 hover:text-fg"
-                        }`}
-                      >
-                        ☰
-                      </button>
-                    </div>
+                <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-1 py-2">
+                  {/* PINNED & ACTIVE */}
+                  <div className="flex items-center justify-between px-2 pt-1 text-muted">
+                    <span className="font-mono text-[9px] tracking-wider text-muted uppercase">
+                      PINNED &amp; ACTIVE
+                    </span>
+                    <span className="material-symbols-outlined text-[12px]">
+                      push_pin
+                    </span>
                   </div>
                   {globalSessions
                     .filter(
                       (s) =>
-                        sessionFilter === "all" ||
-                        busyThreadIds.includes(s.threadId),
+                        (sessionFilter === "all" ||
+                          busyThreadIds.includes(s.threadId)) &&
+                        (busyThreadIds.includes(s.threadId) ||
+                          s.threadId === activeThreadId),
                     )
                     .map((s) => {
-                    const active = s.threadId === activeThreadId && !inBotSession;
-                    const sessionBusy = busyThreadIds.includes(s.threadId);
-                    const sessionPhase =
-                      threadPhases[s.threadId] ??
-                      (sessionBusy ? ("thinking" as AgentPhase) : null);
-                    const badgeColor = sessionPhase
-                      ? phaseColor(sessionPhase)
-                      : undefined;
-                    const ageLabel = sessionAgeLabel(s.updatedAt);
-                    return (
-                      <div
-                        key={s.threadId}
-                        className={`group flex w-full items-center gap-0.5 rounded-lg border px-2 py-2 text-left transition ${
-                          active
-                            ? "border-accent/30 bg-surface-3"
-                            : "border-transparent bg-transparent hover:bg-surface-2"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => void handleOpenSession(s.threadId)}
-                          className="flex min-w-0 flex-1 items-center gap-1.5 border-0 bg-transparent p-0 text-left"
+                      const active =
+                        s.threadId === activeThreadId && !inBotSession;
+                      const sessionBusy = busyThreadIds.includes(s.threadId);
+                      const ageLabel = sessionAgeLabel(s.updatedAt);
+                      const label = sessionPreviewLabel(
+                        s.preview || s.threadId,
+                      );
+                      return (
+                        <div
+                          key={s.threadId}
+                          className={`group relative cursor-pointer p-2 transition ${
+                            active
+                              ? "bg-surface-3"
+                              : "hover:bg-surface-2"
+                          }`}
                         >
-                          <span
-                            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                              sessionBusy ? "bg-accent" : "bg-muted"
-                            }`}
-                          />
-                          <div className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-fg">
-                            {sessionPreviewLabel(s.preview || s.threadId)}
+                          <button
+                            type="button"
+                            onClick={() => void handleOpenSession(s.threadId)}
+                            className="w-full border-0 bg-transparent p-0 text-left"
+                          >
+                            <div className="mb-1 flex items-start justify-between gap-1">
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <span
+                                  className={`h-1.5 w-1.5 shrink-0 ${
+                                    sessionBusy
+                                      ? "animate-pulse bg-accent"
+                                      : "bg-muted"
+                                  }`}
+                                />
+                                <span
+                                  className={`truncate font-mono text-[12px] font-bold ${
+                                    active || sessionBusy
+                                      ? "text-accent"
+                                      : "text-fg"
+                                  }`}
+                                >
+                                  {label}
+                                </span>
+                              </div>
+                              {sessionBusy ? (
+                                <span className="bg-surface-0 px-1 font-mono text-[9px] font-bold text-tertiary">
+                                  LIVE
+                                </span>
+                              ) : (
+                                <span className="font-mono text-[9px] text-muted">
+                                  {ageLabel}
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center justify-between pl-3 font-mono text-[10px] text-fg-dim">
+                              <span className="flex items-center gap-1 truncate text-fg">
+                                <span className="material-symbols-outlined text-[11px] text-accent">
+                                  alt_route
+                                </span>
+                                {s.threadId.slice(0, 12)}
+                              </span>
+                              <span className="shrink-0 font-bold">
+                                <span className="text-muted">
+                                  {s.turnCount ?? 0}t
+                                </span>
+                              </span>
+                            </div>
+                            <div className="mt-1 flex items-center justify-between pl-3 font-mono text-[9px] text-muted">
+                              <span className="truncate">
+                                {status.model?.slice(0, 18) || "agent"}
+                              </span>
+                              <span className="text-accent/80">{ageLabel}</span>
+                            </div>
+                          </button>
+                          <div className="absolute top-1 right-1 hidden items-center gap-0.5 bg-surface-4 px-1 py-0.5 group-hover:flex">
+                            <SessionRowMenu
+                              threadId={s.threadId}
+                              projects={projects.map((p) => ({
+                                id: p.id,
+                                name: p.name,
+                              }))}
+                              currentProjectId={s.projectId}
+                              onClear={handleClearSession}
+                              onDelete={handleDeleteSession}
+                              onMoveToProject={handleMoveSessionToProject}
+                            />
                           </div>
-                          {sessionBusy && sessionPhase ? (
-                            <span
-                              className="shrink-0 rounded border px-1 py-0.5 text-[8px] font-semibold tracking-wide uppercase"
-                              style={{
-                                color: badgeColor,
-                                borderColor: `${badgeColor}55`,
-                                background: `${badgeColor}14`,
-                              }}
-                            >
-                              {sessionPhase}
-                            </span>
-                          ) : (
-                            <span className="shrink-0 text-[9px] text-muted">
-                              {ageLabel}
-                            </span>
-                          )}
-                        </button>
-                        <SessionRowMenu
-                          threadId={s.threadId}
-                          projects={projects.map((p) => ({
-                            id: p.id,
-                            name: p.name,
-                          }))}
-                          currentProjectId={s.projectId}
-                          onClear={handleClearSession}
-                          onDelete={handleDeleteSession}
-                          onMoveToProject={handleMoveSessionToProject}
-                        />
-                      </div>
-                    );
-                  })}
+                        </div>
+                      );
+                    })}
+
+                  {/* BACKGROUND / IDLE */}
+                  <div className="mt-2 flex items-center justify-between px-2 pt-2 text-muted">
+                    <span className="font-mono text-[9px] tracking-wider text-muted uppercase">
+                      BACKGROUND TASKS
+                    </span>
+                    <span className="font-mono text-[9px] text-fg-dim">
+                      {
+                        globalSessions.filter(
+                          (s) =>
+                            !busyThreadIds.includes(s.threadId) &&
+                            s.threadId !== activeThreadId,
+                        ).length
+                      }
+                    </span>
+                  </div>
+                  {globalSessions
+                    .filter(
+                      (s) =>
+                        sessionFilter === "all" &&
+                        !busyThreadIds.includes(s.threadId) &&
+                        s.threadId !== activeThreadId,
+                    )
+                    .map((s) => {
+                      const ageLabel = sessionAgeLabel(s.updatedAt);
+                      const label = sessionPreviewLabel(
+                        s.preview || s.threadId,
+                      );
+                      return (
+                        <div
+                          key={s.threadId}
+                          className="group relative cursor-pointer p-2 transition hover:bg-surface-2"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => void handleOpenSession(s.threadId)}
+                            className="w-full border-0 bg-transparent p-0 text-left"
+                          >
+                            <div className="mb-1 flex items-start justify-between gap-1">
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <span className="h-1.5 w-1.5 shrink-0 bg-muted" />
+                                <span className="truncate font-mono text-[12px] text-fg-dim">
+                                  {label}
+                                </span>
+                              </div>
+                              <span className="font-mono text-[9px] text-muted">
+                                {ageLabel}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between pl-3 font-mono text-[10px] text-muted">
+                              <span className="flex items-center gap-1 truncate">
+                                <span className="material-symbols-outlined text-[11px]">
+                                  description
+                                </span>
+                                {s.threadId.slice(0, 10)}
+                              </span>
+                              <span className="text-muted">IDLE</span>
+                            </div>
+                          </button>
+                          <div className="absolute top-1 right-1 hidden items-center gap-0.5 bg-surface-4 px-1 py-0.5 group-hover:flex">
+                            <SessionRowMenu
+                              threadId={s.threadId}
+                              projects={projects.map((p) => ({
+                                id: p.id,
+                                name: p.name,
+                              }))}
+                              currentProjectId={s.projectId}
+                              onClear={handleClearSession}
+                              onDelete={handleDeleteSession}
+                              onMoveToProject={handleMoveSessionToProject}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
               )
             ) : activeTab === "bots" ? (
-              <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
-                <div className="px-1 pb-1 text-[9.5px] leading-snug text-muted">
+              <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 py-2">
+                <div className="px-1 pb-1 font-mono text-[9.5px] leading-snug text-muted">
                   Setiap bot punya sesi sendiri + tools terbatas. History ikut ter-load.
                 </div>
                 {specializedBots.length === 0 ? (
@@ -3546,7 +4173,11 @@ export function App() {
                       <button
                         type="button"
                         title="New session in project"
-                        onClick={() => void handleNewSession()}
+                        onClick={() =>
+                          void handleNewSession({
+                            projectId: focusedProject.id,
+                          })
+                        }
                         className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-surface-2 hover:text-fg"
                       >
                         +
@@ -3766,6 +4397,23 @@ export function App() {
             ) : null}
           </div>
         </div>
+        <div className="flex flex-col gap-1 bg-surface-2 p-3">
+          <div className="flex items-center justify-between font-mono text-[10px] text-muted">
+            <span className="flex items-center gap-1">
+              <span className="h-1.5 w-1.5 bg-accent" /> LOCAL WORKSPACE
+            </span>
+            <span className="font-bold text-accent">SSD</span>
+          </div>
+          <div className="h-1 w-full overflow-hidden bg-surface-3">
+            <div className="h-full w-4/5 bg-accent" />
+          </div>
+          <div className="flex items-center justify-between pt-0.5 font-mono text-[9px] text-muted">
+            <span className="max-w-[70%] truncate">
+              {status.workspaceRoot || "—"}
+            </span>
+            <span>{status.profileId || "default"}</span>
+          </div>
+        </div>
       </aside>
       ) : null}
 
@@ -3922,7 +4570,7 @@ export function App() {
       <div className="flex min-h-0 min-w-0 flex-1">
       {/* Main */}
       <section
-        className={`layout-panel flex min-w-0 flex-1 flex-col ${
+        className={`layout-panel flex min-w-0 flex-1 flex-col bg-surface-1 ${
           chatDropActive ? "chat-column-drop" : ""
         }`}
         style={{ order: layout.swapped ? 3 : 1 }}
@@ -3930,18 +4578,55 @@ export function App() {
         onDragLeave={onChatColumnDragLeave}
         onDrop={onChatColumnDrop}
       >
+        <div className="flex h-9 shrink-0 items-center justify-between gap-2 bg-surface-2 px-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="material-symbols-outlined text-[16px] text-accent">
+              account_tree
+            </span>
+            <span className="truncate font-sans text-[15px] font-bold text-accent">
+              {inBotSession && activeBot
+                ? activeBot.name
+                : activeThreadId || "agent:runtime"}
+            </span>
+            <span className="text-border-strong">|</span>
+            <span className="flex items-center gap-1 truncate font-mono text-[11px] text-fg-dim">
+              <span className="material-symbols-outlined text-[14px] text-tertiary">
+                check_circle
+              </span>
+              Policy: STRICT_TDD
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <span className="bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] text-accent">
+              AUTONOMOUS LVL 4
+            </span>
+            <button
+              type="button"
+              data-tip={railOpen ? "Hide canvas" : "Show canvas"}
+              onClick={() => setRailOpen((v) => !v)}
+              className="p-1 text-fg-dim transition hover:bg-surface-4 hover:text-fg"
+            >
+              <span className="material-symbols-outlined text-[15px]">
+                vertical_split
+              </span>
+            </button>
+          </div>
+        </div>
         <div
           ref={streamRef}
           onScroll={onStreamScroll}
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4"
+          className="chat-feed flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-3"
         >
           {(() => {
+            const draftHidden = looksLikeTextToolCallDump(draftAnswer);
             const showWaitingCard =
               loading &&
-              !draftAnswer &&
+              (!draftAnswer || draftHidden) &&
+              !draftReasoning &&
               phase !== "reflecting" &&
               phase !== "done" &&
-              !planApprovalPending;
+              !planApprovalPending &&
+              !toolApprovalPending;
             let lastUserId: string | null = null;
             for (let i = items.length - 1; i >= 0; i -= 1) {
               if (items[i]!.kind === "user") {
@@ -3957,6 +4642,9 @@ export function App() {
                     entries={seg.items.map((t) => ({
                       id: t.id,
                       event: t.event,
+                      input: t.toolInput,
+                      output:
+                        t.event.type === "tool_end" ? t.event.output : undefined,
                     }))}
                     live={seg.live}
                   />
@@ -3967,14 +4655,16 @@ export function App() {
               const isEditing = editingUserId === item.id;
               return (
                 <React.Fragment key={item.id}>
-                <div
-                  className="group flex max-w-[86%] flex-col self-end"
-                >
-                  <div className="mb-1 text-right text-[9.5px] text-muted">
-                    You · {item.at}
+                <div className="chat-msg group">
+                  <div className="chat-msg-meta">
+                    <span className="chat-msg-who">
+                      <span className="chat-dot chat-dot-you" />
+                      YOU (STAFF_ENGINEER)
+                    </span>
+                    <span className="chat-msg-time">{item.at}</span>
                   </div>
                   {isEditing ? (
-                    <div className="rounded-2xl rounded-br-md border border-accent/40 bg-surface-4 px-3 py-2.5">
+                    <div className="chat-user-bubble">
                       <textarea
                         value={editDraft}
                         rows={3}
@@ -3990,7 +4680,7 @@ export function App() {
                             setEditDraft("");
                           }
                         }}
-                        className="w-full resize-y rounded-md border border-border bg-surface-1 px-2.5 py-2 text-[12px] leading-relaxed text-fg outline-none"
+                        className="w-full resize-y border-0 bg-[var(--chat-chip,#0e0e0e)] px-2.5 py-2 font-mono text-[12px] leading-relaxed text-[var(--chat-fg,#e5e5e6)] outline-none"
                       />
                       <div className="mt-2 flex justify-end gap-1.5">
                         <button
@@ -4000,7 +4690,7 @@ export function App() {
                             setEditingUserId(null);
                             setEditDraft("");
                           }}
-                          className="rounded-md border border-border px-2.5 py-1 text-[10px] text-muted hover:text-fg"
+                          className="chat-btn-ghost"
                         >
                           Cancel
                         </button>
@@ -4008,22 +4698,22 @@ export function App() {
                           type="button"
                           disabled={loading || !editDraft.trim()}
                           onClick={() => submitEditUser(item.id)}
-                          className="rounded-md bg-accent px-2.5 py-1 text-[10px] font-semibold text-surface-0 disabled:opacity-50"
+                          className="chat-btn-primary"
                         >
                           Save & send
                         </button>
                       </div>
                     </div>
                   ) : (
-                    <div className="rounded-2xl rounded-br-md border border-accent/25 bg-surface-4 px-3.5 py-2.5 text-[12px] leading-relaxed">
+                    <div className="chat-user-bubble">
+                      {item.text ? (
+                        <div className="chat-user-text">{item.text}</div>
+                      ) : null}
                       {item.attachments?.length ? (
                         <UserBubbleAttachments attachments={item.attachments} />
                       ) : null}
-                      {item.text ? (
-                        <div className="whitespace-pre-wrap">{item.text}</div>
-                      ) : null}
                       {!item.text && !item.attachments?.length ? (
-                        <div className="whitespace-pre-wrap text-muted">
+                        <div className="chat-user-text text-[var(--chat-muted,#747676)]">
                           (empty)
                         </div>
                       ) : null}
@@ -4041,7 +4731,11 @@ export function App() {
                   />
                 </div>
                 {showWaitingCard && item.id === lastUserId ? (
-                  <WaitingCard phase={phase} />
+                  <WaitingCard
+                    phase={phase}
+                    detail={phaseDetail}
+                    tokensPerSec={tokensPerSec}
+                  />
                 ) : null}
                 </React.Fragment>
               );
@@ -4049,14 +4743,20 @@ export function App() {
             if (item.kind === "assistant") {
               const isWelcome = item.id === "welcome";
               const label = item.botName
-                ? `${item.botName}${item.botRole ? ` · ${item.botRole}` : ""}`
-                : "Agent";
+                ? `${item.botName}${item.botRole ? ` · ${item.botRole}` : ""}`.toUpperCase()
+                : status.model
+                  ? `${status.model.toUpperCase()} ARCHITECT`
+                  : "AGENT ARCHITECT";
               return (
-                <div key={item.id} className="group min-w-0 w-full max-w-[90%] self-start">
-                  <div className="mb-1 text-[9.5px] text-muted">
-                    {label} · {item.at}
+                <div key={item.id} className="chat-msg group">
+                  <div className="chat-msg-meta">
+                    <span className="chat-msg-who is-agent">
+                      <span className="chat-dot chat-dot-agent" />
+                      {label}
+                    </span>
+                    <span className="chat-msg-time">{item.at}</span>
                   </div>
-                  <div className="min-w-0 overflow-x-auto rounded-2xl rounded-bl-md border border-border bg-surface-3 px-3.5 py-3">
+                  <div className="chat-assistant-body">
                     <MarkdownBody
                       text={item.text}
                       onOpenPath={
@@ -4144,10 +4844,7 @@ export function App() {
             }
             if (item.kind === "system") {
               return (
-                <div
-                  key={item.id}
-                  className="rounded-lg border border-danger/40 bg-[#2a1518] px-3 py-2.5 text-[11px] whitespace-pre-wrap text-[#ffb4b0]"
-                >
+                <div key={item.id} className="chat-system">
                   {item.text}
                 </div>
               );
@@ -4158,7 +4855,8 @@ export function App() {
                   key={item.id}
                   text={item.text}
                   at={item.at}
-                  label={item.label ?? "Reasoning"}
+                  label={item.label}
+                  durationSec={item.durationSec}
                 />
               );
             }
@@ -4166,16 +4864,29 @@ export function App() {
             });
           })()}
 
+          {draftReasoning ? (
+            <ReasoningBlock text={draftReasoning} live />
+          ) : null}
+
           {draftAnswer &&
+            !looksLikeTextToolCallDump(draftAnswer) &&
             (shouldRenderAsReasoning(draftAnswer) ? (
               <ReasoningBlock text={draftAnswer} live label="Model notice" />
             ) : (
-              <div className="min-w-0 w-full max-w-[90%] self-start">
-                <div className="mb-1 inline-flex items-center gap-2 text-[9.5px] text-muted">
-                  Agent · streaming
-                  <TypingDots color="#9fd0ff" />
+              <div className="chat-msg">
+                <div className="chat-msg-meta">
+                  <span className="chat-msg-who is-agent">
+                    <span className="chat-dot chat-dot-agent animate-pulse" />
+                    AGENT · STREAMING
+                    <TypingDots color="#7d98ff" />
+                  </span>
+                  {tokensPerSec != null && tokensPerSec > 0 ? (
+                    <span className="chat-msg-time">
+                      {tokensPerSec.toFixed(1)} tok/s
+                    </span>
+                  ) : null}
                 </div>
-                <div className="min-w-0 overflow-x-auto rounded-2xl rounded-bl-md border border-accent/40 bg-surface-3 px-3.5 py-3">
+                <div className="chat-assistant-body">
                   <MarkdownBody
                     text={draftAnswer}
                     onOpenPath={
@@ -4184,7 +4895,7 @@ export function App() {
                         : undefined
                     }
                   />
-                  <StreamingCaret />
+                  <StreamingCaret color="#7d98ff" />
                 </div>
               </div>
             ))}
@@ -4211,25 +4922,60 @@ export function App() {
               }}
             />
           ) : null}
+
+          {toolApprovalPending && !planApprovalPending ? (
+            <ToolApprovalCard
+              detail={
+                toolApprovalDetail ||
+                "_Tool approval required._"
+              }
+              busy={toolApprovalBusy}
+              onApprove={() => {
+                void resolveToolApproval(true);
+              }}
+              onReject={() => {
+                void resolveToolApproval(false);
+              }}
+            />
+          ) : null}
+
+          {continueOffer && !loading && !planApprovalPending ? (
+            <ContinueTurnCard
+              offer={continueOffer}
+              busy={continueBusy || loading}
+              currentModel={status.model}
+              onContinue={(o) => {
+                void handleContinueTurn(o);
+              }}
+              onDismiss={() => setContinueOffer(null)}
+            />
+          ) : null}
         </div>
 
-        <div
-          className={`shrink-0 px-4 pt-3 ${
-            terminalOpen ? "pb-0" : "pb-3"
-          }`}
-        >
+        <div className="shrink-0">
           <ChatComposer
             value={input}
-            disabled={loading}
+            disabled={loading || !status.agentReady}
             loading={loading}
             placeholder={
-              inBotSession && activeBot
-                ? `Ask ${activeBot.name}…`
-                : "What should we tackle?"
+              !status.agentReady
+                ? status.agentBooting
+                  ? "Starting agent engine…"
+                  : status.error || "Agent engine not ready…"
+                : inBotSession && activeBot
+                ? `Direct ${activeBot.name} or ask architecture instructions…`
+                : "Direct terminal agent or ask architecture refactoring instructions..."
             }
             modelLabel={status.model}
-            contextLabel={
-              inBotSession && activeBot ? activeBot.name : undefined
+            repoLabel={
+              status.workspaceRoot && status.workspaceRoot !== "…"
+                ? status.workspaceRoot.split(/[/\\]/).filter(Boolean).pop()
+                : undefined
+            }
+            tokenLabel={
+              tokensPerSec != null && tokensPerSec > 0
+                ? `${tokensPerSec.toFixed(1)} tok/s`
+                : undefined
             }
             git={gitChrome}
             mode={composerMode}
@@ -4242,11 +4988,11 @@ export function App() {
             onDropActiveChange={setChatDropActive}
             onChange={setInput}
             onSend={() => void handleSend()}
-            onModeChange={setComposerMode}
+            onModeChange={handleComposerModeChange}
             onEffortChange={setComposerEffort}
             onThinkingChange={setComposerThinking}
             onToggleVoiceMute={() => setVoiceMuted((v) => !v)}
-            onTogglePrivacy={() => setPrivacyMode((v) => !v)}
+            onTogglePrivacy={() => void applyPrivacyMode(!privacyMode)}
             onAddAttachments={appendPendingAttachments}
             onAttachError={handleAttachError}
             onRemoveAttachment={(p) => {
@@ -4278,38 +5024,45 @@ export function App() {
       {/* Activity rail — Canvas + Files */}
       {railOpen && (
         <aside
-          className={`layout-panel flex shrink-0 flex-col bg-surface-1 ${
-            layout.swapped ? "border-r border-border" : "border-l border-border"
+          className={`layout-panel flex shrink-0 flex-col bg-surface-0 ${
+            layout.swapped ? "" : ""
           }`}
           style={{ width: layout.railWidth, order: layout.swapped ? 1 : 3 }}
         >
-          <div className="flex h-12 items-center justify-between gap-2 border-b border-border px-3">
-            <div className="flex items-center gap-2">
-              <div className="flex rounded-md border border-border p-0.5">
-                {(
-                  [
-                    ["canvas", `Canvas${canvasTabs.length ? ` ${canvasTabs.length}` : ""}`, "Canvas — previews & deliverables"],
-                    ["files", "Files", "Files — workspace browser"],
-                  ] as const
-                ).map(([id, label, tip]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    data-tip={tip}
-                    data-tip-pos="bottom"
-                    onClick={() => setRailLayer(id)}
-                    className={`rounded px-2 py-0.5 text-[9.5px] ${
-                      railLayer === id
-                        ? "bg-accent/20 text-accent"
-                        : "text-muted hover:text-fg"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+          <div className="flex h-9 items-center justify-between gap-2 bg-surface-2 px-3">
+            <div className="flex items-center gap-1.5 font-mono text-[11px] font-bold text-fg">
+              <span className="material-symbols-outlined text-[15px] text-accent">
+                design_services
+              </span>
+              <span>ARTIFACT WORKSPACE</span>
             </div>
-            {railLayer === "canvas" && canvasTabs.length === 0 ? (
+            <div className="flex items-center gap-1">
+              {(
+                [
+                  ["canvas", "Preview", "Canvas — previews & deliverables"],
+                  ["files", "Files", "Files — workspace browser"],
+                ] as const
+              ).map(([id, label, tip]) => (
+                <button
+                  key={id}
+                  type="button"
+                  data-tip={tip}
+                  data-tip-pos="bottom"
+                  onClick={() => setRailLayer(id)}
+                  className={`px-2 py-0.5 font-mono text-[10px] transition ${
+                    railLayer === id
+                      ? "bg-surface-1 text-accent"
+                      : "bg-surface-3 text-fg-dim hover:text-fg"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {railLayer === "canvas" && canvasTabs.length === 0 ? (
+            <div className="flex justify-end bg-surface-2 px-3 pb-1">
               <button
                 type="button"
                 data-tip="Discover deliverables from recent replies"
@@ -4322,17 +5075,17 @@ export function App() {
                       .map((m) => ("text" in m ? String(m.text) : "")),
                   });
                 }}
-                className="rounded px-2 py-0.5 text-[9.5px] text-muted hover:bg-surface-2 hover:text-fg"
+                className="px-2 py-0.5 font-mono text-[9.5px] text-muted hover:bg-surface-3 hover:text-fg"
               >
                 Discover
               </button>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
 
           {railLayer === "files" ? (
             <div className="min-h-0 flex-1 overflow-hidden">
               <WorkspaceFilesPanel
-                key={`files-${status.profileId}-${status.workspaceRoot}`}
+                key={`files-${status.profileId}-${status.workspaceRoot}-${activeProjectId ?? "none"}`}
                 workspaceRoot={status.workspaceRoot}
                 onOpenFile={(relPath) => {
                   openWorkspacePath(relPath);
@@ -4379,7 +5132,7 @@ export function App() {
       </div>
 
       <TerminalPanel
-        key={`terminal-${status.profileId}`}
+        key={`terminal-${status.profileId}-${status.workspaceRoot}-${activeProjectId ?? "none"}`}
         open={terminalOpen}
         height={layout.terminalHeight}
         ptyLog={ptyLog}

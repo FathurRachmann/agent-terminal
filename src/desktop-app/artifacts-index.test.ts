@@ -15,7 +15,7 @@ describe("artifacts index", () => {
           uiEvent: {
             type: "tool_start",
             name: "write_file",
-            input: { path: "working/report.md", content: "# hi" },
+            input: { path: "tmp/report.md", content: "# hi" },
           },
         },
       },
@@ -49,7 +49,7 @@ describe("artifacts index", () => {
         ts: "2026-09-14T08:00:03.000Z",
         threadId: "t1",
         role: "assistant",
-        content: "Saved at working/laporan_bulanan.docx and https://npmjs.com",
+        content: "Saved at tmp/laporan_bulanan.docx and https://npmjs.com",
       },
     ];
 

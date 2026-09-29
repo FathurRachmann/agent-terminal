@@ -3,6 +3,10 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { AgentBundle } from "../agent/create-agent.js";
 import {
+  loadPrivacyMode,
+  privacyModeInstruction,
+} from "../agent/privacy-mode.js";
+import {
   activeWorkspaceBots,
   assignProjectToWorkspace,
   buildReplyQueueWithOptionalLlm,
@@ -21,6 +25,7 @@ import {
   listWorkspaceSummaries,
   loadWorkspaceBots,
   memoryTagsForScope,
+  resolveBotToolAllowlist,
   setWorkspaceActiveProject,
   unassignProjectFromWorkspace,
   updateGroupChat,
@@ -33,10 +38,15 @@ import {
   applyRoundBudget,
   buildSupervisorInstruction,
   buildSupervisorUserPrompt,
+  buildSupervisorContinuePrompt,
   excludeSupervisorFromQueue,
   formatSupervisorSystemNote,
+  MAX_SUPERVISOR_AUTO_CONTINUE,
   parseSupervisorVerdict,
   pickSupervisorBot,
+  resolveContinueWorkerIds,
+  shouldAutoContinue,
+  looksLikeDeferredNextActions,
   type SupervisorVerdict,
 } from "../agent/workspaces/supervisor.js";
 import {
@@ -85,6 +95,18 @@ export type WorkspaceIpcContext = {
       }
     | { ok: false; error: string; busyThreadIds?: string[] }
   >;
+  /** Expand sandbox allowlist for a project without rebooting (safe while busy). */
+  softAllowProjectFolders: (
+    projectId: string,
+  ) =>
+    | {
+        ok: true;
+        projectId: string;
+        folders: string[];
+        added: string[];
+        softAligned: true;
+      }
+    | { ok: false; error: string };
   getActiveThreadId: () => string;
   setActiveThreadId: (id: string) => void;
   loadStoredAutoApprove: () => boolean;
@@ -232,6 +254,22 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
       const switched = await ctx.activateProjectAndReboot(
         workspace.activeProjectId,
       );
+      if (!switched.ok && workspace.activeProjectId) {
+        // Busy mid-turn: keep assignment, soft-allow folders so Files/tools work.
+        const soft = ctx.softAllowProjectFolders(workspace.activeProjectId);
+        return {
+          ok: true,
+          workspace,
+          workspaces: listWorkspaceSummaries(home()),
+          ...(soft.ok
+            ? {
+                softAligned: true,
+                projectFolders: soft.folders,
+                warning: switched.error,
+              }
+            : { warning: switched.error }),
+        };
+      }
       return {
         ok: true,
         workspace,
@@ -284,6 +322,37 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           ? null
           : String(payload.projectId).trim() || null;
       const force = Boolean(payload?.force);
+
+      // Soft-allow before mutating workspace registry when turns are busy.
+      if (
+        !force &&
+        projectId &&
+        ctx.getGlobalActiveProjectId() !== projectId &&
+        ctx.listBusyThreadIds().length > 0
+      ) {
+        const soft = ctx.softAllowProjectFolders(projectId);
+        if (!soft.ok) {
+          return {
+            ok: false,
+            error: soft.error,
+            busyThreadIds: ctx.listBusyThreadIds(),
+            workspaces: listWorkspaceSummaries(home()),
+          };
+        }
+        const result = setWorkspaceActiveProject(home(), workspaceId, projectId);
+        if (!result.ok) return result;
+        return {
+          ok: true,
+          workspace: result.workspace,
+          workspaces: listWorkspaceSummaries(home()),
+          activeProjectId: ctx.getGlobalActiveProjectId(),
+          softAligned: true,
+          projectFolders: soft.folders,
+          warning:
+            "Turns still running — project folders were added to the sandbox without reboot. Full project switch happens when idle.",
+        };
+      }
+
       const result = setWorkspaceActiveProject(home(), workspaceId, projectId);
       if (!result.ok) return result;
 
@@ -628,18 +697,19 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
         };
       }
 
-      // Hard-align sandbox to workspace project before group turns.
+      // Align sandbox to workspace project. If another turn is busy, soft-allow
+      // folders (no reboot) so session↔workspace can run concurrently.
       if (ctx.getGlobalActiveProjectId() !== projectId) {
         if (ctx.listBusyThreadIds().length > 0) {
-          return {
-            ok: false,
-            error:
-              "Finish running turns before this workspace can switch to its active project sandbox.",
-          };
-        }
-        const switched = await ctx.activateProjectAndReboot(projectId);
-        if (!switched.ok) {
-          return { ok: false, error: switched.error };
+          const soft = ctx.softAllowProjectFolders(projectId);
+          if (!soft.ok) {
+            return { ok: false, error: soft.error };
+          }
+        } else {
+          const switched = await ctx.activateProjectAndReboot(projectId);
+          if (!switched.ok) {
+            return { ok: false, error: switched.error };
+          }
         }
       }
 
@@ -731,6 +801,8 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
             replies: [],
             queue,
             note: queue.reason,
+            autoContinue: false,
+            autoContinuePrompt: null,
           };
         }
 
@@ -739,13 +811,8 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           looksLikeIncompleteReasoning,
           looksLikeToolPlanNarration,
         } = await import("../agent/sanitize-output.js");
-        const replies: Array<{
-          botId: string;
-          botName: string;
-          content: string;
-        }> = [];
 
-        // Grow shared PTY pool so several bots can run execute() concurrently.
+        // Grow shared PTY pool so several bots can run execute() if needed.
         try {
           activeBundle.sandbox.ensurePoolSize(GROUP_CHAT_PTY_POOL);
         } catch (err) {
@@ -755,9 +822,6 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           );
         }
 
-        // Same tool surface for all bots — set once before parallel turns.
-        activeBundle.botScope.setAllowedTools(null);
-
         const claimUserTranscript = createClaimGate();
         const withApprovalLock = createApprovalMutex();
         const autoApprove = ctx.loadStoredAutoApprove();
@@ -765,30 +829,64 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
         const artifactHome =
           activeBundle.artifactHome || activeBundle.workspaceRoot;
 
-        ctx.emitToRenderer({
-          type: "status",
-          phase: "thinking",
-          detail: `${workerBotIds.length} bot(s) responding in parallel…`,
-          threadId,
-        } as never);
+        // Broadcast greetings stay parallel; specialist turns run sequentially
+        // so each bot can build on prior replies (coherent thread).
+        // Auto-continue rounds always run sequential (targeted follow-up).
+        const baseSequential = queue.source !== "broadcast";
 
-        const botJobs = workerBotIds.map(async (botId, index) => {
-          // Stagger starts so parallel bots don't thundering-herd the router.
-          if (index > 0) {
-            await new Promise((r) => setTimeout(r, index * 200));
-          }
+        const originalUserPrompt = prompt;
+        let turnPromptText = prompt;
+        let turnUserContent: typeof userContent | undefined = userContent;
+        let isContinueRound = false;
+        let autoContinueDepth = 0;
+        let roundCursor = chat.roundCount;
+        const allReplies: Array<{
+          botId: string;
+          botName: string;
+          content: string;
+        }> = [];
+        let supervisorVerdict: SupervisorVerdict | null = null;
+        let supervisorNote: string | null = null;
+        const supervisorNotes: string[] = [];
+        let lastWorkerBotIds = workerBotIds;
+
+        const runOneBot = async (
+          botId: string,
+          priorReplies: Array<{
+            botId: string;
+            botName: string;
+            content: string;
+          }>,
+          opts?: { limitTools?: boolean; sequential?: boolean },
+        ): Promise<{
+          botId: string;
+          botName: string;
+          content: string;
+        } | null> => {
           const bot = getWorkspaceBot(home(), workspaceId, botId);
           if (!bot) return null;
 
+          const sequential = opts?.sequential !== false;
+          const limitTools = opts?.limitTools !== false;
+          const allowedTools = limitTools
+            ? resolveBotToolAllowlist(bot)
+            : null;
+          if (limitTools) {
+            activeBundle.botScope.setAllowedTools(allowedTools);
+          }
+
           const scopeTags = memoryTagsForScope({ workspaceId, botId: bot.id });
           const instruction = buildWorkspaceBotInstruction(bot, {
-            // Parallel: teammates may still be answering — stay complementary.
-            priorBotNames: workerBotIds
-              .filter((id) => id !== bot.id)
-              .map((id) => getWorkspaceBot(home(), workspaceId, id)?.name)
-              .filter((n): n is string => Boolean(n)),
+            priorBotNames: priorReplies.map((r) => r.botName),
+            priorReplies: sequential
+              ? priorReplies.map((r) => ({
+                  botName: r.botName,
+                  content: r.content,
+                }))
+              : undefined,
+            parallelGroup: !sequential,
+            allowedTools: limitTools ? allowedTools : null,
             project: projectCtx,
-            parallelGroup: true,
           });
 
           const workScope = resolveWorkingScope({
@@ -804,9 +902,19 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
             workingScopeAbs(artifactHome, workScope).uploadsAbsDir,
             { recursive: true },
           );
-          const workingScopeNudge = workingScopeInstruction(workScope, absDir);
+          const workingScopeNudge = [
+            workingScopeInstruction(workScope, absDir),
+            privacyModeInstruction(
+              ctx.getBundle()?.sandbox.isPrivacyStrict()
+                ? true
+                : loadPrivacyMode(ctx.agentStateRoot()),
+            ),
+          ]
+            .filter(Boolean)
+            .join("\n\n");
           const runThreadId = workspaceBotRunThreadId(threadId, bot.id);
-          const writeUser = claimUserTranscript();
+          // First user bubble only on the initial round; continue rounds are system handoffs.
+          const writeUser = !isContinueRound && claimUserTranscript();
 
           ctx.emitToRenderer({
             type: "status",
@@ -818,7 +926,6 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           const forwardEvent = (ev: AgentUiEvent) => {
             ctx.emitToRenderer({
               ...ev,
-              // UI filters on the group thread; keep checkpointer on runThreadId.
               threadId,
               botId: bot.id,
               botName: bot.name,
@@ -828,12 +935,42 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           const requestApproval = () =>
             withApprovalLock(() => ctx.requestApproval(threadId));
 
+          // Put teammate replies in the USER turn itself so the model continues
+          // the thread (instruction-only handoff gets ignored too often).
+          const turnPrompt =
+            sequential && priorReplies.length > 0
+              ? [
+                  turnPromptText,
+                  "",
+                  "[TEAMMATES THIS TURN — continue from here; do not restart]",
+                  ...priorReplies.map((r) => {
+                    const body = r.content
+                      .replace(/\s+/g, " ")
+                      .trim()
+                      .slice(0, 2200);
+                    return `### ${r.botName}\n${body}${r.content.length > 2200 ? "…" : ""}`;
+                  }),
+                  "",
+                  `[YOUR TURN — ${bot.name}${bot.role ? ` / ${bot.role}` : ""}]`,
+                  "Build on teammates, fill gaps for YOUR role, disagree only with evidence. Do not repeat them.",
+                ].join("\n")
+              : turnPromptText;
+
           return activeBundle.memoryScope.runWithTags(scopeTags, async () => {
             try {
               let answer = await runAgentTurn({
                 agent: activeBundle.agent,
-                prompt,
-                userContent,
+                prompt: turnPrompt,
+                // Multimodal parts stay on the original user message only for the
+                // first responder of the first round.
+                userContent:
+                  !isContinueRound &&
+                  sequential &&
+                  priorReplies.length > 0
+                    ? undefined
+                    : isContinueRound
+                      ? undefined
+                      : turnUserContent,
                 botInstruction: instruction,
                 workingScopeNudge,
                 threadId,
@@ -842,9 +979,17 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
                 workspaceId,
                 chatId: chat.id,
                 autoApprove,
+                chatMode: "agent",
+                runMode: activeBundle.runMode,
+                planGate: activeBundle.planGate,
+                isPrivacyStrict: () => activeBundle.sandbox.isPrivacyStrict(),
                 requestApproval,
                 desktopEnabled,
                 skipUserTranscript: !writeUser,
+                toolScope: {
+                  get: () => activeBundle.botScope.getAllowedTools(),
+                  set: (tools) => activeBundle.botScope.setAllowedTools(tools),
+                },
                 assistantMeta: {
                   botId: bot.id,
                   botName: bot.name,
@@ -881,7 +1026,7 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
                 answer = await runAgentTurn({
                   agent: activeBundle.agent,
                   prompt: [
-                    prompt,
+                    turnPrompt,
                     "",
                     "[SYSTEM NUDGE]",
                     "Jawaban sebelumnya hanya merencanakan eksplorasi — itu salah.",
@@ -897,9 +1042,17 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
                   workspaceId,
                   chatId: chat.id,
                   autoApprove,
+                  chatMode: "agent",
+                  runMode: activeBundle.runMode,
+                  planGate: activeBundle.planGate,
+                  isPrivacyStrict: () => activeBundle.sandbox.isPrivacyStrict(),
                   requestApproval,
                   desktopEnabled,
                   skipUserTranscript: true,
+                  toolScope: {
+                    get: () => activeBundle.botScope.getAllowedTools(),
+                    set: (tools) => activeBundle.botScope.setAllowedTools(tools),
+                  },
                   assistantMeta: {
                     botId: bot.id,
                     botName: bot.name,
@@ -940,105 +1093,264 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
               return null;
             }
           });
-        });
+        };
 
-        const settled = await Promise.allSettled(botJobs);
-        for (const result of settled) {
-          if (result.status !== "fulfilled" || !result.value) continue;
-          // Don't surface unresolved tool-plan CoT as a team reply.
-          if (
-            looksLikeToolPlanNarration(result.value.content) ||
-            looksLikeIncompleteReasoning(result.value.content)
-          ) {
-            continue;
-          }
-          replies.push(result.value);
-        }
+        // Worker round → supervisor review → auto-continue (server-side) until
+        // done/blocked/budget. UI must not need a second IPC hop for PERLU LANJUT.
+        for (;;) {
+          const sequentialHandoff = isContinueRound ? true : baseSequential;
+          const roundReplies: Array<{
+            botId: string;
+            botName: string;
+            content: string;
+          }> = [];
 
-        const nextRound = replies.length > 0 ? chat.roundCount + 1 : chat.roundCount;
-        let supervisorVerdict: SupervisorVerdict | null = null;
-        let supervisorNote: string | null = null;
-
-        if (runSupervisorReview && supervisor && replies.length > 0) {
           ctx.emitToRenderer({
             type: "status",
             phase: "thinking",
-            detail: `Supervisor (${supervisor.name}) reviewing…`,
+            detail: isContinueRound
+              ? `Melanjutkan putaran ${autoContinueDepth + 1} (supervisor)…`
+              : sequentialHandoff
+                ? `${workerBotIds.length} bot(s) responding in sequence…`
+                : `${workerBotIds.length} bot(s) responding in parallel…`,
             threadId,
           } as never);
 
-          const instruction = buildSupervisorInstruction(supervisor);
-          const supervisorPrompt = buildSupervisorUserPrompt({
-            userPrompt: prompt,
-            workerReplies: replies,
-            round: nextRound,
-            maxRounds: chat.maxRounds,
-          });
-
           try {
-            // Lightweight judge call — no tools / agent loop (avoids double bubbles + cost).
-            const rawVerdict = await llmInvokeFromModel(activeBundle.model)(
-              instruction,
-              supervisorPrompt,
-            );
+            if (sequentialHandoff) {
+              for (const botId of workerBotIds) {
+                const result = await runOneBot(botId, roundReplies, {
+                  sequential: true,
+                });
+                if (!result) continue;
+                if (
+                  looksLikeToolPlanNarration(result.content) ||
+                  looksLikeIncompleteReasoning(result.content)
+                ) {
+                  continue;
+                }
+                roundReplies.push(result);
+                allReplies.push(result);
+              }
+            } else {
+              activeBundle.botScope.setAllowedTools(null);
+              const botJobs = workerBotIds.map(async (botId, index) => {
+                if (index > 0) {
+                  await new Promise((r) => setTimeout(r, index * 200));
+                }
+                return runOneBot(botId, [], {
+                  limitTools: false,
+                  sequential: false,
+                });
+              });
+              const settled = await Promise.allSettled(botJobs);
+              for (const result of settled) {
+                if (result.status !== "fulfilled" || !result.value) continue;
+                if (
+                  looksLikeToolPlanNarration(result.value.content) ||
+                  looksLikeIncompleteReasoning(result.value.content)
+                ) {
+                  continue;
+                }
+                roundReplies.push(result.value);
+                allReplies.push(result.value);
+              }
+            }
+          } finally {
+            activeBundle.botScope.setAllowedTools(null);
+          }
 
+          lastWorkerBotIds = workerBotIds;
+
+          if (roundReplies.length === 0) {
+            break;
+          }
+
+          roundCursor += 1;
+          const reviewReplies = isContinueRound
+            ? allReplies.slice(-Math.max(roundReplies.length, 6))
+            : roundReplies;
+
+          if (runSupervisorReview && supervisor) {
+            ctx.emitToRenderer({
+              type: "status",
+              phase: "thinking",
+              detail: `Supervisor (${supervisor.name}) reviewing…`,
+              threadId,
+            } as never);
+
+            const instruction = buildSupervisorInstruction(supervisor);
+            const supervisorPrompt = buildSupervisorUserPrompt({
+              userPrompt: originalUserPrompt,
+              workerReplies: reviewReplies,
+              round: roundCursor,
+              maxRounds: chat.maxRounds,
+            });
+
+            try {
+              // Lightweight judge call — no tools / agent loop.
+              const rawVerdict = await llmInvokeFromModel(activeBundle.model)(
+                instruction,
+                supervisorPrompt,
+              );
+
+              supervisorVerdict = applyRoundBudget(
+                parseSupervisorVerdict(rawVerdict),
+                roundCursor,
+                chat.maxRounds,
+              );
+
+              // Workers that only listed "next" without editing files are not done.
+              const deferredOnly =
+                roundReplies.length > 0 &&
+                roundReplies.every((r) =>
+                  looksLikeDeferredNextActions(r.content),
+                );
+              if (
+                deferredOnly &&
+                supervisorVerdict.status === "done" &&
+                roundCursor < chat.maxRounds
+              ) {
+                supervisorVerdict = {
+                  ...supervisorVerdict,
+                  status: "needs_more",
+                  summary: `${supervisorVerdict.summary} (runtime: jawaban masih daftar next tanpa eksekusi — lanjut otomatis)`.trim(),
+                  nextActions:
+                    supervisorVerdict.nextActions.length > 0
+                      ? supervisorVerdict.nextActions
+                      : [
+                          "Eksekusi perbaikan dengan write_file/edit_file sekarang — jangan audit ulang.",
+                        ],
+                };
+              }
+
+              supervisorNote = formatSupervisorSystemNote(
+                supervisorVerdict,
+                supervisor.name,
+              );
+              supervisorNotes.push(supervisorNote);
+
+              activeBundle.sessionStore.appendTranscript({
+                threadId,
+                role: "system",
+                content: supervisorNote,
+              });
+
+              ctx.emitToRenderer({
+                type: "status",
+                phase: "thinking",
+                detail: supervisorNote.split("\n")[0] || "Supervisor review",
+                threadId,
+              } as never);
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.warn("[workspaces] supervisor review failed:", message);
+              ctx.emitToRenderer({
+                type: "warning",
+                message: `Supervisor review failed: ${message}`,
+                threadId,
+              } as never);
+              break;
+            }
+          } else if (roundCursor >= chat.maxRounds) {
             supervisorVerdict = applyRoundBudget(
-              parseSupervisorVerdict(rawVerdict),
-              nextRound,
+              {
+                status: "needs_more",
+                summary: "Batas putaran diskusi tercapai.",
+                gaps: [],
+                nextActions: [],
+                raw: "",
+                parsed: false,
+              },
+              roundCursor,
               chat.maxRounds,
             );
             supervisorNote = formatSupervisorSystemNote(
               supervisorVerdict,
-              supervisor.name,
+              supervisor?.name ?? "system",
             );
-
+            supervisorNotes.push(supervisorNote);
             activeBundle.sessionStore.appendTranscript({
               threadId,
               role: "system",
               content: supervisorNote,
             });
-
-            ctx.emitToRenderer({
-              type: "status",
-              phase: "done",
-              detail: supervisorNote.split("\n")[0] || "Supervisor done",
-              threadId,
-            } as never);
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            console.warn("[workspaces] supervisor review failed:", message);
-            ctx.emitToRenderer({
-              type: "warning",
-              message: `Supervisor review failed: ${message}`,
-              threadId,
-            } as never);
           }
-        } else if (
-          replies.length > 0 &&
-          chat.roundCount + 1 >= chat.maxRounds
-        ) {
-          supervisorVerdict = applyRoundBudget(
-            {
-              status: "needs_more",
-              summary: "Batas putaran diskusi tercapai.",
-              gaps: [],
-              nextActions: [],
-              raw: "",
-              parsed: false,
-            },
-            chat.roundCount + 1,
-            chat.maxRounds,
-          );
-          supervisorNote = formatSupervisorSystemNote(
-            supervisorVerdict,
-            supervisor?.name ?? "system",
-          );
+
+          const canContinue =
+            runSupervisorReview &&
+            shouldAutoContinue(
+              supervisorVerdict,
+              roundCursor,
+              chat.maxRounds,
+              autoContinueDepth,
+            );
+
+          if (!canContinue || !supervisorVerdict) {
+            break;
+          }
+
+          const continuePrompt = buildSupervisorContinuePrompt({
+            originalPrompt: originalUserPrompt,
+            verdict: supervisorVerdict,
+            round: roundCursor,
+            maxRounds: chat.maxRounds,
+          });
+
+          const nextWorkers = resolveContinueWorkerIds({
+            previousWorkerIds: lastWorkerBotIds,
+            bots,
+            verdict: supervisorVerdict,
+            supervisorId: supervisor?.id,
+          });
+
+          if (nextWorkers.length === 0) {
+            break;
+          }
+
+          autoContinueDepth += 1;
+          isContinueRound = true;
+          turnPromptText = continuePrompt;
+          turnUserContent = undefined;
+          workerBotIds = nextWorkers;
+          // If supervisor was pulled in as implementer, still review after
+          // (judge call is tool-free). Solo-supervisor first-round skips review.
+
+          const handoffNote = `Melanjutkan putaran ${autoContinueDepth + 1} — ${nextWorkers.join(", ")}`;
+          supervisorNotes.push(handoffNote);
           activeBundle.sessionStore.appendTranscript({
             threadId,
             role: "system",
-            content: supervisorNote,
+            content: handoffNote,
+          });
+          ctx.emitToRenderer({
+            type: "status",
+            phase: "thinking",
+            detail: handoffNote,
+            threadId,
+          } as never);
+        }
+
+        if (
+          supervisorVerdict?.status === "needs_more" &&
+          autoContinueDepth >= MAX_SUPERVISOR_AUTO_CONTINUE
+        ) {
+          const budgetNote = `(auto-continue ${MAX_SUPERVISOR_AUTO_CONTINUE}x habis — kirim pesan baru untuk lanjut)`;
+          supervisorNotes.push(budgetNote);
+          supervisorNote = supervisorNote
+            ? `${supervisorNote}\n${budgetNote}`
+            : budgetNote;
+          activeBundle.sessionStore.appendTranscript({
+            threadId,
+            role: "system",
+            content: budgetNote,
           });
         }
+
+        const combinedNote =
+          supervisorNotes.length > 0
+            ? supervisorNotes.join("\n---\n")
+            : supervisorNote;
 
         // Advance round budget only when workers produced replies.
         // Reset after a clean "done" so the next user task starts fresh.
@@ -1046,17 +1358,28 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
           projectId: string;
           roundCount?: number;
         } = { projectId };
-        if (replies.length > 0) {
+        if (allReplies.length > 0) {
           chatPatch.roundCount =
-            supervisorVerdict?.status === "done" ? 0 : nextRound;
+            supervisorVerdict?.status === "done" ? 0 : roundCursor;
         }
         updateGroupChat(home(), workspaceId, chat.id, chatPatch);
+
+        ctx.emitToRenderer({
+          type: "status",
+          phase: "done",
+          detail:
+            supervisorNote?.split("\n")[0] ||
+            (allReplies.length
+              ? `${allReplies.length} reply(ies)`
+              : "Group turn done"),
+          threadId,
+        } as never);
 
         return {
           ok: true,
           threadId,
-          replies,
-          queue: { ...queue, botIds: workerBotIds },
+          replies: allReplies,
+          queue: { ...queue, botIds: lastWorkerBotIds },
           projectId,
           workspaceRoot: activeBundle.workspaceRoot,
           supervisor: supervisorVerdict
@@ -1064,10 +1387,14 @@ export function registerWorkspaceIpc(ctx: WorkspaceIpcContext): void {
                 botId: supervisor?.id ?? null,
                 botName: supervisor?.name ?? null,
                 ...supervisorVerdict,
-                note: supervisorNote,
+                note: combinedNote,
               }
             : null,
-          note: supervisorNote,
+          note: combinedNote,
+          // Server already ran continue rounds; UI must not kick a second loop.
+          autoContinue: false,
+          autoContinuePrompt: null,
+          autoContinueRounds: autoContinueDepth,
         };
       } finally {
         activeBundle.memoryScope.setRequiredTags(undefined);

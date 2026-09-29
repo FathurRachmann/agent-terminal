@@ -1,8 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  extractFolderAccessPath,
   extractInterruptActionNames,
+  formatToolApprovalDetail,
+  isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
+  requiresExplicitApproval,
 } from "./interrupt-utils.js";
 
 describe("interrupt utils", () => {
@@ -19,6 +23,47 @@ describe("interrupt utils", () => {
         actionRequests: [{ name: "execute", args: {} }],
       }),
       false,
+    );
+  });
+
+  it("detects request_folder_access and extracts path", () => {
+    const payload = {
+      actionRequests: [
+        {
+          name: "request_folder_access",
+          args: { folderPath: "/Users/me/Desktop" },
+        },
+      ],
+    };
+    assert.equal(isFolderAccessInterrupt(payload), true);
+    assert.equal(requiresExplicitApproval(payload), true);
+    assert.equal(
+      requiresExplicitApproval(payload, { privacyOn: true }),
+      true,
+    );
+    assert.equal(
+      requiresExplicitApproval(payload, { privacyOn: false }),
+      false,
+    );
+    assert.equal(extractFolderAccessPath(payload), "/Users/me/Desktop");
+    assert.match(
+      formatToolApprovalDetail(payload),
+      /Allow folder access[\s\S]*\/Users\/me\/Desktop/,
+    );
+  });
+
+  it("requires explicit approval for plan and folder only", () => {
+    assert.equal(
+      requiresExplicitApproval({
+        actionRequests: [{ name: "execute", args: {} }],
+      }),
+      false,
+    );
+    assert.equal(
+      requiresExplicitApproval({
+        actionRequests: [{ name: "task_todos", args: {} }],
+      }),
+      true,
     );
   });
 });

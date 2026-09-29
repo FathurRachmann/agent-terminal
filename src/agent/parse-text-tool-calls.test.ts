@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { AIMessage } from "@langchain/core/messages";
 import {
   contentLooksLikeTextToolCall,
+  looksLikeTextToolCallDump,
   parseTextToolCalls,
 } from "./parse-text-tool-calls.js";
 import { promoteTextToolCalls } from "./normalize-middleware.js";
@@ -29,6 +30,23 @@ describe("parseTextToolCalls", () => {
   it("returns empty for normal prose", () => {
     assert.equal(parseTextToolCalls("Memory has two layers.").length, 0);
     assert.equal(contentLooksLikeTextToolCall("hello"), false);
+  });
+
+  it("detects truncated tool-call dumps that fail JSON.parse", () => {
+    const truncated = `[{"name": "task_plan", "arguments": {"goal": "Explain race"}},{"name": "execute", "arguments": {"command": "ls -la /tmp"}},{"name":`;
+    assert.equal(parseTextToolCalls(truncated).length, 0);
+    assert.equal(looksLikeTextToolCallDump(truncated), true);
+    assert.equal(looksLikeTextToolCallDump("Normal answer about races."), false);
+  });
+
+  it("detects bracket-tagged tool dumps (READ DOCUMENT / EDIT FILE)", () => {
+    const dump =
+      "[READ DOCUMENT]File Path: /tmp/hello.txtFile Contents:Hello World [EDIT FILE]File Path: /tmp/hello.txtFile Contents:Hello World [WEB SEARCH]File Path: /tmp/hello.txtFile Contents:Hello World";
+    assert.equal(looksLikeTextToolCallDump(dump), true);
+    assert.equal(
+      looksLikeTextToolCallDump("Halo! Ada yang bisa saya bantu?"),
+      false,
+    );
   });
 });
 

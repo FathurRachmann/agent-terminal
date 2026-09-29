@@ -17,20 +17,21 @@ description: >-
 ## Rules
 
 1. Shell + filesystem tools only touch **allowlisted roots** (starts as `--cwd`).
-2. Before reading/writing/executing outside the current allowlist, call **`request_folder_access`** and **wait for y/n**.
+2. Before reading/writing/executing outside the current allowlist, call **`request_folder_access`** immediately — **do not ask in chat**. The runtime shows Approve/Deny; wait for that UI, then continue.
 3. After approval, confirm with `show_allowed_folders`.
 4. Do not invent workarounds (`cd` outside, `cat /etc/passwd`, symlink tricks).
+5. Verbal "izin" / "yes" alone does nothing — only Approve on the interrupt (or calling the tool so the UI appears) expands the allowlist.
 
 ## Workflow
 
-1. Detect absolute or `~/` path in the user message
-2. `request_folder_access({ folderPath: "…" })`
-3. Wait for human approval
+1. Detect absolute or `~/` path in the user message (or a confinement error)
+2. `request_folder_access({ folderPath: "…" })` — existing parent folder (e.g. Desktop)
+3. Wait for Approve in the UI (not chat text)
 4. Continue the task inside the granted folder
 
 ## Tools
 
-- `request_folder_access` — HITL expand allowlist
+- `request_folder_access` — HITL expand allowlist (opens Approve/Deny)
 - `show_allowed_folders` — current roots + cwd
 - `ls` / `read_file` / `write_file` / `edit_file` / `glob` / `grep` / `execute` — confined
 

@@ -13,6 +13,18 @@ const phaseLabel: Record<AgentPhase, string> = {
   error: "Error",
 };
 
+const phaseDetailFallback: Record<AgentPhase, string> = {
+  boot: "booting runtime…",
+  thinking: "planning next steps…",
+  reasoning: "working through the problem…",
+  tool: "executing tools…",
+  pty: "running shell command…",
+  waiting_approval: "awaiting your approval…",
+  reflecting: "storing session learnings…",
+  done: "turn complete",
+  error: "something went wrong",
+};
+
 export function TypingDots({ color = "#8b98a8" }: { color?: string }) {
   return (
     <span
@@ -53,33 +65,58 @@ export function ShimmerLine({ color = "#35507a" }: { color?: string }) {
   );
 }
 
-export function WaitingCard({ phase }: { phase: AgentPhase }) {
-  const color = phaseColor(phase);
-  const label = phaseLabel[phase] ?? phase;
+type WaitingCardProps = {
+  phase: AgentPhase;
+  detail?: string | null;
+  /** Estimated tokens per second from the live stream (chars/4). */
+  tokensPerSec?: number | null;
+};
+
+const phaseTitleLabel: Record<AgentPhase, string> = {
+  boot: "Starting:",
+  thinking: "Thinking:",
+  reasoning: "Reasoning:",
+  tool: "Tool pipeline:",
+  pty: "Shell pipeline:",
+  waiting_approval: "Awaiting sign-off:",
+  reflecting: "Self-Heal check:",
+  done: "Done:",
+  error: "Error:",
+};
+
+export function WaitingCard({
+  phase,
+  detail,
+  tokensPerSec = null,
+}: WaitingCardProps) {
+  const detailText =
+    (detail && detail.trim()) || phaseDetailFallback[phase] || "working…";
+  const rate =
+    tokensPerSec != null && Number.isFinite(tokensPerSec) && tokensPerSec > 0
+      ? tokensPerSec.toFixed(1)
+      : null;
+  const phaseTitle = phaseTitleLabel[phase] ?? `${phaseLabel[phase] ?? phase}:`;
+
   return (
     <div
-      className="max-w-[86%] min-w-[200px] self-start"
+      className="chat-wait"
       role="status"
       aria-live="polite"
-      aria-label={`${label}, please wait`}
+      aria-label={`${phaseTitle} ${detailText}${rate ? `, ${rate} tokens per second` : ""}`}
     >
-      <div className="mb-1 text-xs text-muted">Agent · {label.toLowerCase()}</div>
-      <div
-        className="rounded-[10px] border bg-surface-3 px-3.5 py-3"
-        style={{
-          borderColor: `${color}55`,
-          boxShadow: `0 0 0 1px ${color}18`,
-        }}
-      >
-        <div
-          className="flex items-center gap-2.5 font-mono text-[11px]"
-          style={{ color }}
-        >
-          <span className="agent-pulse-ring" style={{ borderColor: color }} />
-          <span>{label}</span>
-          <TypingDots color={color} />
+      <div className="chat-wait-main">
+        <span className="chat-wait-dot" aria-hidden />
+        <div className="chat-wait-stack">
+          <span className="chat-wait-phase">{phaseTitle}</span>
+          <span className="chat-wait-detail">{detailText}</span>
         </div>
-        <ShimmerLine color={color} />
+      </div>
+      <div className="chat-wait-rate">
+        <div className="chat-wait-rate-copy">
+          <span className="chat-wait-rate-label">Tokens/sec</span>
+          <span className="chat-wait-rate-value">{rate ?? "—"}</span>
+        </div>
+        <span className="chat-wait-rate-bar" aria-hidden />
       </div>
     </div>
   );
@@ -99,7 +136,7 @@ export function PhasePill({
       style={{ color }}
     >
       {busy && <TypingDots color={color} />}
-      {phase}
+      {phaseLabel[phase] ?? phase}
     </span>
   );
 }

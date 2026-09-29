@@ -270,7 +270,11 @@ export function buildWorkspaceBotInstruction(
   bot: WorkspaceBot,
   extras?: {
     priorBotNames?: string[];
+    /** Clipped teammate replies already posted this turn (sequential handoff). */
+    priorReplies?: Array<{ botName: string; content: string }>;
     parallelGroup?: boolean;
+    /** When set, remind the bot to stay within this tool allowlist. */
+    allowedTools?: string[] | null;
     project?: {
       id: string;
       name: string;
@@ -283,6 +287,36 @@ export function buildWorkspaceBotInstruction(
   const folderLines = project?.folders?.length
     ? project.folders.map((f) => `  - ${f}`).join("\n")
     : "";
+  const priorBlock =
+    extras?.priorReplies?.length && !extras.parallelGroup
+      ? [
+          "Teammates already replied this turn — continue the thread, do not restart from scratch:",
+          ...extras.priorReplies.map((r) => {
+            const clip = r.content.replace(/\s+/g, " ").trim().slice(0, 2200);
+            return `- ${r.botName}: ${clip}${r.content.length > 2200 ? "…" : ""}`;
+          }),
+          "Build on their points, fill gaps for YOUR role, and disagree briefly only with evidence.",
+        ].join("\n")
+      : extras?.parallelGroup
+        ? [
+            "Other teammates may be answering this prompt in parallel. Stay complementary; do not wait for them or repeat the same points.",
+            "Speak ONLY as your own role. Do NOT write numbered sections for other roles (no fake CTO/PM/FE/QA report in one bubble).",
+            "If you are CTO: lead briefly (prioritas + arahan), then let teammates detail their domains.",
+          ].join("\n")
+        : extras?.priorBotNames?.length
+          ? `Other teammates already replied in this turn: ${extras.priorBotNames.join(", ")}. Add complementary insight; do not repeat them.`
+          : "";
+
+  const toolLines = extras?.allowedTools?.length
+    ? [
+        `Your allowed tools this turn: ${extras.allowedTools.join(", ")}.`,
+        "Prefer these tools only — do not invent work that needs disabled tools; hand off via your reply if another role should act.",
+      ].join("\n")
+    : [
+        "You have the SAME tools as the global agent (files, shell, browser, vision, docs, graphify, desktop when enabled).",
+        "Role focus guides what you prioritize — it does not limit which tools you may call.",
+      ].join("\n");
+
   const lines = [
     `You are "${bot.name}"${bot.role ? ` (${bot.role})` : ""} in a workspace group chat.`,
     bot.description ? `Role focus: ${bot.description}` : "",
@@ -293,6 +327,9 @@ export function buildWorkspaceBotInstruction(
           "Load each skill with: `read_file /skills/<skill-id>/SKILL.md` before applying its workflow.",
         ].join("\n")
       : "",
+    bot.tools?.length
+      ? `Role tool focus: ${bot.tools.join(", ")}.`
+      : "",
     project
       ? [
           `Assigned project: "${project.name}" (id=${project.id}).`,
@@ -302,31 +339,24 @@ export function buildWorkspaceBotInstruction(
           folderLines ? `Project folders:\n${folderLines}` : "",
           "You CAN access this project via tools (ls, read_file, execute, glob).",
           "Hard rules when asked about project contents / bugs / laporan / potensi bug / apakah bisa lihat isi project:",
-          "1) Call tools FIRST on the project primary folder (absolute path above). Start with `ls` there — NOT under working/project/… (that folder is artifacts only).",
+          "1) Call tools FIRST on the project primary folder (absolute path above). Start with `ls` there — NOT under tmp/project/… (that folder is artifacts only).",
           project.primaryFolder
             ? `2) Example: \`ls ${project.primaryFolder}\` then \`ls ${project.primaryFolder}/frontend\` (or \`src\`) before claiming anything is empty.`
             : "2) After tool results, answer briefly in Indonesian with evidence (folders, files, concrete bug risks).",
           "3) After tool results, answer briefly in Indonesian with evidence (real paths + what you saw). NEVER invent \"folder kosong\" without tool output proving it.",
           "4) NEVER reply with English planning like \"I need to use the available tools…\", \"First, I should start by listing…\", \"I can use the ls command…\", or \"I need to remember to keep my response…\". That is not an answer — call tools silently.",
           "5) Do NOT ask the user for the folder path or repo URL — it is already configured.",
-          "6) PDF deliverables: use pdf skill `pdf_create.py`. Diagrams = element type `mermaid` (PNG image), never raw Mermaid source text. Tables = element type `table` (black 0.5pt borders).",
-          "7) Save generated files under working/project/<project-name>/ (Agent root), not in the project source tree.",
+          "6) Office/PDF deliverables: NEVER write_file/edit_file a .docx/.xlsx/.pptx/.pdf (binary). First `ls tmp/templates/` + read matching TEMPLATE.md/sample. Then `/skills/productivity/pdf|docx|xlsx|powerpoint/SKILL.md` and generate via execute + python-docx/openpyxl/reportlab. reportlab Table: never raw `<b>` strings in cells (use FONTNAME or Paragraph). Fix format = edit .py + execute once, no long loops.",
+          "7) Save generated files under tmp/project/<project-name>/ (Agent root), not in the project source tree.",
           "8) For bug hunts / laporan: cite specific files from tool results (file + why). No empty \"I'll check eslint\" plans.",
         ]
           .filter(Boolean)
           .join("\n")
       : "No project is assigned to this workspace yet — say so briefly if file access is required.",
-    extras?.parallelGroup
-      ? [
-          "Other teammates may be answering this prompt in parallel. Stay complementary; do not wait for them or repeat the same points.",
-          "Speak ONLY as your own role. Do NOT write numbered sections for other roles (no fake CTO/PM/FE/QA report in one bubble).",
-          "If you are CTO: lead briefly (prioritas + arahan), then let teammates detail their domains.",
-        ].join("\n")
-      : extras?.priorBotNames?.length
-        ? `Other teammates already replied in this turn: ${extras.priorBotNames.join(", ")}. Add complementary insight; do not repeat them.`
-        : "",
-    "You have the SAME tools as the global agent (files, shell, browser, vision, docs, graphify, desktop when enabled).",
-    "Role focus guides what you prioritize — it does not limit which tools you may call.",
+    priorBlock,
+    toolLines,
+    "Office/PDF: never write_file a .docx/.xlsx/.pptx/.pdf — use productivity skills + Python (reportlab for PDF). Never ship a one-line .md as a 'laporan PDF'.",
+    "Templates: before laporan/BOD/quotation, `ls tmp/templates/` and follow matching TEMPLATE.md / sample.",
     "Shell: emit at most 3 independent `execute` calls in one turn (shared group pool has up to 10 slots for all bots).",
     "Reply as this persona only. Keep answers concise and useful for the team thread.",
   ];
@@ -341,6 +371,19 @@ export const WORKSPACE_PROJECT_TOOL_BASE = [
   "glob",
 ] as const;
 
+/** Sensible default when a bot has no explicit `tools` list. */
+export const WORKSPACE_DEFAULT_GROUP_TOOLS = [
+  ...WORKSPACE_PROJECT_TOOL_BASE,
+  "grep",
+  "edit_file",
+  "write_file",
+  "web_search",
+  "web_extract",
+  "read_document",
+  "request_folder_access",
+  "show_allowed_folders",
+] as const;
+
 export function mergeBotToolsForProject(
   botTools: string[] | undefined | null,
 ): string[] {
@@ -349,4 +392,27 @@ export function mergeBotToolsForProject(
     ...(botTools ?? []),
   ]);
   return [...set];
+}
+
+/**
+ * Per-bot allowlist for group turns: declared tools, else a lean coding default
+ * (not the full desktop/vault/browser surface).
+ */
+export function resolveBotToolAllowlist(bot: WorkspaceBot): string[] {
+  if (bot.tools?.length) return mergeBotToolsForProject(bot.tools);
+  const role = `${bot.id} ${bot.role ?? ""}`.toLowerCase();
+  const extras: string[] = [];
+  if (/fe|front|ui|design/.test(role)) {
+    extras.push("browser_open", "browser_screenshot", "vision_analyze");
+  }
+  if (/devops|ops|sre/.test(role)) {
+    extras.push("process_manage");
+  }
+  if (/qa|test/.test(role)) {
+    extras.push("browser_open", "browser_click", "browser_type");
+  }
+  return mergeBotToolsForProject([
+    ...WORKSPACE_DEFAULT_GROUP_TOOLS,
+    ...extras,
+  ]);
 }

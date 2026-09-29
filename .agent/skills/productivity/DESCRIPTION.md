@@ -1,3 +1,3 @@
 ---
-description: Skills for document creation, presentations, spreadsheets, and other productivity workflows.
+description: Document skills (Anthropic packs) — PDF, DOCX, XLSX, PowerPoint — loaded on demand.
 ---

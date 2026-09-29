@@ -3,7 +3,12 @@ import type { DelegateTaskItem } from "./orchestration.js";
 import type { TaskBoard } from "./task-tools.js";
 import type { SkillAgentSpec } from "./skill-registry.js";
 
-const DEFAULT_ROLES = ["explorer", "coder", "reviewer"] as const;
+const DEFAULT_ROLES = [
+  "explorer",
+  "coder",
+  "reviewer",
+  "tester",
+] as const;
 
 /**
  * Stable fingerprint so middleware does not re-run workers on every
@@ -41,24 +46,33 @@ function boardContext(board: TaskBoard): string {
 }
 
 /**
- * Fixed worker set: explorer + coder + reviewer, plus any skill-registered
- * agents matched by board.skillsUsed (capped to keep cost bounded).
+ * Fixed worker set: explorer + coder + reviewer + tester, plus any skill-registered
+ * agents matched by board.skillsUsed (capped to keep cost bounded; max 8).
  */
 export function buildFixedWorkerTasks(
   board: TaskBoard,
   skillAgents: SkillAgentSpec[] = [],
   options?: { maxWorkers?: number },
 ): DelegateTaskItem[] {
-  const maxWorkers = Math.max(3, Math.min(options?.maxWorkers ?? 6, 8));
+  const maxWorkers = Math.max(4, Math.min(options?.maxWorkers ?? 8, 8));
   const context = boardContext(board);
+  const goalFor = (role: (typeof DEFAULT_ROLES)[number]): string => {
+    switch (role) {
+      case "explorer":
+        return "Map relevant paths/symbols and risks from the plan. Read-only analysis; list files to touch.";
+      case "coder":
+        return "Propose a minimal implementation outline (files + steps) that fulfills the plan and todos.";
+      case "reviewer":
+        return "Review the plan for bugs, missing tests, and security risks. Ordered findings only.";
+      case "tester":
+        return "Propose verification: tests to run/add, edge cases, and acceptance checks for the plan.";
+      default:
+        return "Contribute specialist analysis for this plan.";
+    }
+  };
   const tasks: DelegateTaskItem[] = DEFAULT_ROLES.map((role) => ({
     role,
-    goal:
-      role === "explorer"
-        ? "Map relevant paths/symbols and risks from the plan. Read-only analysis; list files to touch."
-        : role === "coder"
-          ? "Propose a minimal implementation outline (files + steps) that fulfills the plan and todos."
-          : "Review the plan for bugs, missing tests, and security risks. Ordered findings only.",
+    goal: goalFor(role),
     context,
   }));
 
@@ -92,7 +106,7 @@ export function mergeOrchestrationResult(
     "",
     "## Parallel worker synthesis (runtime — fixed orchestration)",
     "",
-    "The runtime ran explorer / coder / reviewer (and matched skill agents) in parallel after plan approval. Use this synthesis to execute todos; do not re-call delegate_task for the same plan unless the plan changed.",
+    "The runtime ran explorer / coder / reviewer / tester (and matched skill agents) in parallel after plan approval. Use this synthesis to execute todos; do not re-call delegate_task for the same plan unless the plan changed. Full subagent roster via `task`: explorer, coder, reviewer, tester, security, debugger, docs, architect.",
     "",
     workers,
   ].join("\n");

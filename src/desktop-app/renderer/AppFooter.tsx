@@ -30,7 +30,19 @@ type Props = {
   onManageGateways?: () => void;
 };
 
-/** Bottom app chrome: profile + live phase + local gateway status. */
+function Ms({ name, size = 14 }: { name: string; size?: number }) {
+  return (
+    <span
+      className="material-symbols-outlined"
+      style={{ fontSize: size }}
+      aria-hidden
+    >
+      {name}
+    </span>
+  );
+}
+
+/** Bottom status strip — TERMINAL.SYS footer chrome. */
 export function AppFooter({
   status,
   profileId,
@@ -113,15 +125,92 @@ export function AppFooter({
   return (
     <footer
       ref={rootRef}
-      className="relative flex h-9 shrink-0 items-center gap-2 border-t border-border bg-surface-1 px-3"
+      className="relative z-50 flex h-7 shrink-0 items-center justify-between bg-surface-0 px-3 shadow-[0_-1px_6px_rgba(0,0,0,0.4)]"
     >
-      <div className="relative">
+      <div className="flex min-w-0 items-center gap-4">
+        <button
+          type="button"
+          data-tip="Gateway activity"
+          onClick={() =>
+            setMenu((m) => (m === "activity" ? "none" : "activity"))
+          }
+          className="flex items-center gap-1.5 font-mono text-[10px] tracking-wider uppercase transition hover:bg-surface-3"
+        >
+          <span
+            className={`h-1.5 w-1.5 ${ready ? "bg-tertiary" : "bg-muted"}`}
+          />
+          <span className="text-fg-dim">GATEWAY:</span>
+          <span
+            className={`font-bold ${ready ? "text-tertiary" : "text-muted"}`}
+          >
+            {ready ? "CONNECTED" : "OFFLINE"}
+          </span>
+        </button>
+
+        {showFooterPhase ? (
+          <div
+            className="flex min-w-0 items-center gap-1.5 font-mono text-[10px] tracking-wider uppercase"
+            data-tip={phaseTip}
+            role="status"
+            aria-live="polite"
+          >
+            <span className="text-fg-dim">PHASE:</span>
+            <span
+              className="truncate font-bold"
+              style={{ color: processColor }}
+            >
+              {phase.replace(/_/g, "_").toUpperCase()}
+            </span>
+            {backgroundBusyCount > 0 ? (
+              <span className="text-warn">· BG {backgroundBusyCount}</span>
+            ) : null}
+            {statusError ? (
+              <span className="text-danger">· ERROR</span>
+            ) : null}
+          </div>
+        ) : null}
+
+        {showLearnedInFooter ? (
+          <button
+            type="button"
+            data-tip="Learned memory & rules"
+            onClick={() => {
+              setMenu((m) => {
+                const next = m === "learned" ? "none" : "learned";
+                if (next === "learned") onRefreshLearned?.();
+                return next;
+              });
+            }}
+            className="flex items-center gap-1 bg-surface-4 px-1.5 py-0.5 font-mono text-[10px] font-bold text-tertiary transition hover:bg-surface-3"
+          >
+            <Ms name="psychology" size={12} />
+            <span>{learnedRules.length} LEARNED RULES</span>
+          </button>
+        ) : null}
+
+        <div className="hidden items-center gap-0.5 sm:flex">
+          <FootBtn tip="Home" onClick={onHome}>
+            <Ms name="home" size={13} />
+          </FootBtn>
+          <FootBtn tip="New profile" onClick={onNewProfile}>
+            <Ms name="person_add" size={13} />
+          </FootBtn>
+          <FootBtn tip="Manage gateways" onClick={onManageGateways}>
+            <Ms name="hub" size={13} />
+          </FootBtn>
+        </div>
+      </div>
+
+      <div className="relative flex items-center gap-3">
+        <div className="hidden items-center gap-1 font-mono text-[10px] md:flex">
+          <span className="tracking-wider text-fg-dim uppercase">MEM:</span>
+          <span className="text-fg">512MB / 4096MB</span>
+        </div>
+
         <button
           type="button"
           data-tip="Switch profile"
-          aria-label="Switch profile"
           aria-expanded={menu === "profiles"}
-          aria-haspopup="listbox"
           disabled={switching}
           onClick={() =>
             setMenu((m) => {
@@ -130,18 +219,33 @@ export function AppFooter({
               return next;
             })
           }
-          className="rounded bg-fg/90 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-surface-0 transition hover:bg-fg disabled:opacity-60"
+          className="flex items-center gap-1 px-1 font-mono text-[10px] text-accent transition hover:bg-surface-3 disabled:opacity-60"
         >
-          {profileId || "default"}
+          <Ms name="account_tree" size={14} />
+          <span className="font-bold tracking-wider uppercase">
+            PROFILE: {profileId || "default"}
+          </span>
+          <Ms name="unfold_more" size={12} />
+        </button>
+
+        <button
+          type="button"
+          data-tip={label}
+          onClick={() =>
+            setMenu((m) => (m === "activity" ? "none" : "activity"))
+          }
+          className="flex items-center gap-1 font-mono text-[10px] text-fg-dim transition hover:text-fg"
+        >
+          <PulseIcon ready={ready} />
         </button>
 
         {menu === "profiles" ? (
           <div
             role="listbox"
             aria-label="Profiles"
-            className="absolute bottom-full left-0 z-30 mb-1 min-w-[160px] max-w-[240px] overflow-hidden rounded-md border border-border bg-surface-2 py-1 shadow-xl"
+            className="absolute bottom-full right-0 z-30 mb-1 min-w-[160px] max-w-[240px] overflow-hidden border border-border bg-surface-3 py-1 shadow-xl"
           >
-            <div className="px-2.5 py-1 text-[9px] font-semibold tracking-wider text-muted uppercase">
+            <div className="px-2.5 py-1 font-mono text-[9px] font-bold tracking-wider text-muted uppercase">
               Profiles
             </div>
             {profileList.map((id) => {
@@ -154,13 +258,15 @@ export function AppFooter({
                   aria-selected={active}
                   disabled={switching}
                   onClick={() => void handleSwitch(id)}
-                  className={`flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left font-mono text-[11px] transition hover:bg-surface-3 ${
-                    active ? "text-accent-soft" : "text-fg"
+                  className={`flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left font-mono text-[11px] transition hover:bg-surface-4 ${
+                    active ? "text-accent" : "text-fg"
                   }`}
                 >
                   <span className="min-w-0 truncate">{id}</span>
                   {active ? (
-                    <span className="shrink-0 text-[9px] text-muted">active</span>
+                    <span className="shrink-0 text-[9px] text-muted">
+                      active
+                    </span>
                   ) : null}
                 </button>
               );
@@ -168,7 +274,7 @@ export function AppFooter({
             <div className="my-1 border-t border-border" />
             <button
               type="button"
-              className="block w-full px-2.5 py-1.5 text-left text-[11px] text-fg-dim transition hover:bg-surface-3 hover:text-fg"
+              className="block w-full px-2.5 py-1.5 text-left font-mono text-[11px] text-fg-dim transition hover:bg-surface-4 hover:text-fg"
               onClick={() => {
                 setMenu("none");
                 onNewProfile?.();
@@ -178,7 +284,7 @@ export function AppFooter({
             </button>
             <button
               type="button"
-              className="block w-full px-2.5 py-1.5 text-left text-[11px] text-fg-dim transition hover:bg-surface-3 hover:text-fg"
+              className="block w-full px-2.5 py-1.5 text-left font-mono text-[11px] text-fg-dim transition hover:bg-surface-4 hover:text-fg"
               onClick={() => {
                 setMenu("none");
                 onManageProfiles?.();
@@ -188,38 +294,11 @@ export function AppFooter({
             </button>
           </div>
         ) : null}
-      </div>
-
-      <div className="relative flex items-center gap-0.5">
-        <FootBtn tip="Home" onClick={onHome}>
-          <HomeIcon />
-        </FootBtn>
-        <FootBtn tip="New profile" onClick={onNewProfile}>
-          <PlusIcon />
-        </FootBtn>
-        <FootBtn tip="Cloud (unavailable)" disabled>
-          <CloudIcon />
-        </FootBtn>
-        {showLearnedInFooter ? (
-          <FootBtn
-            tip="Learned memory & rules"
-            active={menu === "learned"}
-            onClick={() => {
-              setMenu((m) => {
-                const next = m === "learned" ? "none" : "learned";
-                if (next === "learned") onRefreshLearned?.();
-                return next;
-              });
-            }}
-          >
-            <LearnedIcon />
-          </FootBtn>
-        ) : null}
 
         {showLearnedInFooter && menu === "learned" ? (
-          <div className="absolute bottom-full left-0 z-30 mb-2 max-h-72 w-[360px] overflow-auto rounded-lg border border-border bg-surface-2 p-3 shadow-xl">
+          <div className="absolute bottom-full left-0 z-30 mb-2 max-h-72 w-[360px] overflow-auto border border-border bg-surface-3 p-3 shadow-xl">
             <div className="mb-2 flex items-center justify-between gap-2">
-              <div className="text-[11px] text-fg">
+              <div className="font-mono text-[11px] text-fg">
                 Learned memory & rules
                 <span className="ml-1.5 text-muted">
                   ({learnedRules.length})
@@ -228,26 +307,21 @@ export function AppFooter({
               <button
                 type="button"
                 onClick={() => onRefreshLearned?.()}
-                className="rounded px-1.5 py-0.5 text-[9.5px] text-accent hover:bg-accent/10"
+                className="px-1.5 py-0.5 font-mono text-[9.5px] text-accent hover:bg-accent/10"
               >
                 ↻ Refresh
               </button>
             </div>
-            <div className="mb-1 text-[9px] tracking-wider text-muted uppercase">
-              Recent learned
-            </div>
             {learnedRules.length === 0 ? (
-              <div className="text-[10px] text-muted">
+              <div className="font-mono text-[10px] text-muted">
                 Belum ada aturan yang dipelajari.
               </div>
             ) : (
               <ul className="space-y-2.5">
                 {learnedRules.slice(0, 12).map((r) => (
-                  <li key={r.id} className="text-[10px] leading-snug">
+                  <li key={r.id} className="font-mono text-[10px] leading-snug">
                     <div className="mb-0.5 flex items-center gap-1.5">
-                      <span className="font-semibold text-emerald-400">
-                        LEARNED
-                      </span>
+                      <span className="font-bold text-tertiary">LEARNED</span>
                       <span className="truncate text-muted">
                         {r.kind || "rule"}
                       </span>
@@ -264,75 +338,10 @@ export function AppFooter({
             )}
           </div>
         ) : null}
-      </div>
-
-      {showFooterPhase ? (
-        <div
-          className="ml-1 flex min-w-0 items-center gap-1.5 font-mono text-[10.5px]"
-          data-tip={phaseTip}
-          role="status"
-          aria-live="polite"
-          aria-label={`phase: ${phase}`}
-        >
-          <span className="text-muted">phase:</span>
-          <span
-            className="inline-flex min-w-0 truncate"
-            style={{ color: processColor }}
-          >
-            {phase.replace(/_/g, " ")}
-          </span>
-          {backgroundBusyCount > 0 ? (
-            <span className="truncate text-[9.5px] text-amber-300/90">
-              · bg {backgroundBusyCount}
-            </span>
-          ) : null}
-          {statusError ? (
-            <span className="truncate text-[9.5px] text-danger">· error</span>
-          ) : null}
-        </div>
-      ) : null}
-
-      <div className="relative ml-auto flex items-center gap-1">
-        <FootBtn
-          tip="More"
-          onClick={() => setMenu((m) => (m === "more" ? "none" : "more"))}
-        >
-          <DotsIcon />
-        </FootBtn>
-        <FootBtn tip="Manage gateways" onClick={onManageGateways}>
-          <PlugIcon />
-        </FootBtn>
-        <button
-          type="button"
-          data-tip="Gateway activity"
-          onClick={() =>
-            setMenu((m) => (m === "activity" ? "none" : "activity"))
-          }
-          className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[10.5px] text-muted transition hover:bg-surface-2 hover:text-fg-dim"
-        >
-          <span className="opacity-70">⌘</span>
-          <PulseIcon ready={ready} />
-          <span>{label}</span>
-        </button>
-
-        {menu === "more" ? (
-          <div className="absolute bottom-full right-8 z-30 mb-1 min-w-[150px] rounded-md border border-border bg-fg px-2 py-1.5 text-[11px] font-medium text-surface-0 shadow-lg">
-            <button
-              type="button"
-              className="block w-full text-left"
-              onClick={() => {
-                setMenu("none");
-                onManageProfiles?.();
-              }}
-            >
-              Manage profiles…
-            </button>
-          </div>
-        ) : null}
 
         {menu === "activity" && status ? (
-          <div className="absolute bottom-full right-0 z-30 mb-2 max-h-64 w-[360px] overflow-auto rounded-lg border border-border bg-surface-2 p-3 shadow-xl">
-            <div className="mb-2 flex items-center gap-3 text-[11px]">
+          <div className="absolute bottom-full right-0 z-30 mb-2 max-h-64 w-[360px] overflow-auto border border-border bg-surface-3 p-3 shadow-xl">
+            <div className="mb-2 flex items-center gap-3 font-mono text-[11px]">
               <span className="flex items-center gap-1.5">
                 <Dot on={status.connected} /> Connected
               </span>
@@ -340,22 +349,27 @@ export function AppFooter({
                 <Dot on={status.inferenceReady} /> Inference ready
               </span>
             </div>
-            <div className="mb-1 text-[9px] tracking-wider text-muted uppercase">
+            <div className="mb-1 font-mono text-[9px] tracking-wider text-muted uppercase">
               Recent activity
             </div>
             {status.recentActivity.length === 0 ? (
-              <div className="text-[10px] text-muted">No recent gateway logs.</div>
+              <div className="font-mono text-[10px] text-muted">
+                No recent gateway logs.
+              </div>
             ) : (
               <ul className="space-y-2">
                 {status.recentActivity.slice(0, 8).map((row, i) => (
-                  <li key={`${row.at}-${i}`} className="text-[10px] leading-snug">
+                  <li
+                    key={`${row.at}-${i}`}
+                    className="font-mono text-[10px] leading-snug"
+                  >
                     <span
                       className={
                         row.level === "ERROR"
                           ? "text-danger"
                           : row.level === "WARNING"
-                            ? "text-amber-300"
-                            : "text-accent-soft"
+                            ? "text-warn"
+                            : "text-accent"
                       }
                     >
                       {row.level}
@@ -376,9 +390,7 @@ export function AppFooter({
 function Dot({ on }: { on: boolean }) {
   return (
     <span
-      className={`inline-block h-1.5 w-1.5 rounded-full ${
-        on ? "bg-accent" : "bg-muted"
-      }`}
+      className={`inline-block h-1.5 w-1.5 ${on ? "bg-accent" : "bg-muted"}`}
     />
   );
 }
@@ -404,10 +416,10 @@ function FootBtn({
       disabled={disabled}
       onClick={onClick}
       aria-pressed={active || undefined}
-      className={`inline-flex h-6 w-6 items-center justify-center rounded-md transition disabled:cursor-not-allowed disabled:opacity-40 ${
+      className={`inline-flex h-5 w-5 items-center justify-center transition disabled:cursor-not-allowed disabled:opacity-40 ${
         active
           ? "bg-accent/20 text-accent"
-          : "text-fg-dim hover:bg-surface-2 hover:text-fg"
+          : "text-fg-dim hover:bg-surface-3 hover:text-fg"
       }`}
     >
       {children}
@@ -415,65 +427,15 @@ function FootBtn({
   );
 }
 
-function HomeIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1v-9.5z" />
-    </svg>
-  );
-}
-function PlusIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M12 5v14M5 12h14" />
-    </svg>
-  );
-}
-function CloudIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M7 18h10a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.7 1.5A3.5 3.5 0 0 0 7 18z" />
-      <path d="M12 11v5M12 16l-2-2M12 16l2-2" />
-    </svg>
-  );
-}
-function LearnedIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
-      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-      <path d="M8 7h8M8 11h6" />
-    </svg>
-  );
-}
-function DotsIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <circle cx="6" cy="12" r="1.5" />
-      <circle cx="12" cy="12" r="1.5" />
-      <circle cx="18" cy="12" r="1.5" />
-    </svg>
-  );
-}
-function PlugIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M9 7v4M15 7v4M8 11h8v2a4 4 0 0 1-4 4h0a4 4 0 0 1-4-4v-2zM12 17v3" />
-    </svg>
-  );
-}
 function PulseIcon({ ready }: { ready: boolean }) {
   return (
-    <svg
-      width="13"
-      height="13"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke={ready ? "currentColor" : "#6b7280"}
-      strokeWidth="1.8"
-      className={ready ? "text-accent-soft" : ""}
+    <span
+      className={`material-symbols-outlined text-[14px] ${
+        ready ? "text-accent" : "text-muted"
+      }`}
+      aria-hidden
     >
-      <path d="M3 12h3l2-5 3 10 2-5h8" />
-    </svg>
+      monitor_heart
+    </span>
   );
 }

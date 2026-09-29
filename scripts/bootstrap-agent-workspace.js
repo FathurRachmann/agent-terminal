@@ -75,6 +75,9 @@ ensureDir(sessionsDir);
 ensureDir(contextDir);
 ensureDir(taskDir);
 ensureDir(skillsDir);
+ensureDir(path.join(root, "working", "templates"));
+ensureDir(path.join(root, "working", "global"));
+ensureDir(path.join(root, "working", "bots"));
 ensureAgentsMd();
 ensurePersistentSchema();
 

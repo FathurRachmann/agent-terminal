@@ -25,7 +25,7 @@ describe("inbound-attachments", () => {
     assert.equal(attachmentKindFor("notes.pdf"), "file");
   });
 
-  it("saves buffer under working/uploads", () => {
+  it("saves buffer under tmp/uploads", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "in-att-"));
     try {
       const saved = saveAttachmentBuffer(root, {
@@ -37,7 +37,7 @@ describe("inbound-attachments", () => {
       assert.equal(saved.ok, true);
       if (!saved.ok) return;
       assert.equal(saved.attachment.kind, "file");
-      assert.ok(saved.attachment.relPath.startsWith("working/global/uploads/"));
+      assert.ok(saved.attachment.relPath.startsWith("tmp/global/uploads/"));
       assert.equal(
         fs.readFileSync(saved.attachment.absPath, "utf8"),
         "hello",
@@ -145,7 +145,7 @@ describe("inbound-attachments", () => {
       fs.writeFileSync(pdfPath, "%PDF-1.4 fake");
       const att = {
         absPath: pdfPath,
-        relPath: "working/global/uploads/x.pdf",
+        relPath: "tmp/global/uploads/x.pdf",
         basename: "x.pdf",
         mime: "application/pdf",
         size: 12,

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ToolMessage } from "@langchain/core/messages";
 import {
+  BOT_SCOPE_ALWAYS_TOOLS,
   buildBotScopeInstruction,
   createBotScopeController,
   filterToolsByBotAllowlist,
   rejectBotScopedToolCall,
+  withBotScopeAlwaysTools,
 } from "./bot-scope-middleware.js";
 
 describe("buildBotScopeInstruction", () => {
@@ -17,7 +19,9 @@ describe("buildBotScopeInstruction", () => {
       tools: ["browser_open", "write_file"],
     });
     assert.match(text, /Web Scraper Bot/);
-    assert.match(text, /browser_open, write_file/);
+    assert.match(text, /browser_open/);
+    assert.match(text, /write_file/);
+    assert.match(text, /request_folder_access/);
     assert.match(text, /Refuse requests outside this specialty/i);
     assert.match(text, /Use browser tools only/);
   });
@@ -28,6 +32,8 @@ describe("bot allowlist enforcement", () => {
     { name: "browser_open" },
     { name: "execute" },
     { name: "write_file" },
+    { name: "request_folder_access" },
+    { name: "show_allowed_folders" },
     { name: "" },
     {},
   ];
@@ -37,14 +43,19 @@ describe("bot allowlist enforcement", () => {
     assert.equal(filtered?.length, tools.length);
   });
 
-  it("keeps only allowlisted named tools", () => {
+  it("keeps allowlisted tools plus folder-access always-tools", () => {
     const filtered = filterToolsByBotAllowlist(tools, [
       "browser_open",
       "write_file",
     ]);
     assert.deepEqual(
-      filtered?.map((t) => ("name" in t ? t.name : undefined)),
-      ["browser_open", "write_file"],
+      filtered?.map((t) => ("name" in t ? t.name : undefined)).sort(),
+      [
+        "browser_open",
+        "request_folder_access",
+        "show_allowed_folders",
+        "write_file",
+      ].sort(),
     );
   });
 
@@ -66,6 +77,16 @@ describe("bot allowlist enforcement", () => {
     assert.equal(msg.status, "error");
   });
 
+  it("allows folder access even when not in specialty list", () => {
+    assert.equal(
+      rejectBotScopedToolCall(
+        { name: "request_folder_access", id: "call-f" },
+        ["browser_open"],
+      ),
+      null,
+    );
+  });
+
   it("allows in-scope tool calls", () => {
     const msg = rejectBotScopedToolCall(
       { name: "browser_open", id: "call-2" },
@@ -74,15 +95,18 @@ describe("bot allowlist enforcement", () => {
     assert.equal(msg, null);
   });
 
-  it("controller updates allowlist used by filters", () => {
+  it("controller merges always-tools into allowlist", () => {
     const ctrl = createBotScopeController();
     assert.equal(ctrl.getAllowedTools(), null);
     ctrl.setAllowedTools(["browser_open"]);
-    assert.deepEqual(ctrl.getAllowedTools(), ["browser_open"]);
-    const filtered = filterToolsByBotAllowlist(tools, ctrl.getAllowedTools());
     assert.deepEqual(
-      filtered?.map((t) => ("name" in t ? t.name : undefined)),
-      ["browser_open"],
+      ctrl.getAllowedTools()?.sort(),
+      withBotScopeAlwaysTools(["browser_open"])!.sort(),
+    );
+    assert.ok(
+      BOT_SCOPE_ALWAYS_TOOLS.every((t) =>
+        ctrl.getAllowedTools()!.includes(t),
+      ),
     );
     ctrl.setAllowedTools(null);
     assert.equal(ctrl.getAllowedTools(), null);

@@ -7,6 +7,7 @@ import {
   discoverDeliverables,
   listWorkspaceDir,
   readWorkspacePreview,
+  readWorkspacePreviewMulti,
   wrapMermaidForMarkdownPreview,
 } from "./workspace-preview.js";
 
@@ -128,13 +129,46 @@ describe("workspace preview", () => {
     assert.ok(res.sizeLabel);
   });
 
+  it("previews absolute file outside workspace roots via multi", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "prev-ws-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "prev-out-"));
+    dirs.push(root, outside);
+    const abs = path.join(outside, "(08122025) Undangan.pdf");
+    fs.writeFileSync(abs, "%PDF-1.4\n%fake\n");
+    const res = await readWorkspacePreviewMulti([root], abs);
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.kind, "pdf");
+    assert.equal(res.basename, "(08122025) Undangan.pdf");
+  });
+
+  it("multi does not false-fail on missing basename in first root", async () => {
+    const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "prev-a-"));
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "prev-b-"));
+    dirs.push(rootA, rootB);
+    fs.mkdirSync(path.join(rootB, "tmp"), { recursive: true });
+    fs.writeFileSync(
+      path.join(rootB, "tmp", "laporan.md"),
+      "# Laporan\n",
+      "utf8",
+    );
+    const res = await readWorkspacePreviewMulti(
+      [rootA, rootB],
+      "laporan.md",
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.basename, "laporan.md");
+    assert.equal(res.kind, "markdown");
+  });
+
   it("discovers docx from python script command", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "prev-"));
     dirs.push(root);
     fs.mkdirSync(path.join(root, "working"), { recursive: true });
     fs.writeFileSync(
       path.join(root, "working", "make_doc.py"),
-      'doc.save("working/laporan_bulanan.docx")\n',
+      'doc.save("tmp/laporan_bulanan.docx")\n',
       "utf8",
     );
     fs.writeFileSync(
@@ -143,7 +177,7 @@ describe("workspace preview", () => {
       "utf8",
     );
     const res = discoverDeliverables(root, {
-      command: "python3 working/make_doc.py",
+      command: "python3 tmp/make_doc.py",
     });
     assert.ok(
       res.paths.some((p) =>
