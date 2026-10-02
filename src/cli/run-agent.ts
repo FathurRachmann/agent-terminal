@@ -50,16 +50,8 @@ type DesktopFastPathResult =
       followUpPrompt: string;
     };
 
-export type MemoryRuntime = {
-  sessionStore: SessionStore;
-  memoryStore: PersistentMemoryStore;
-  embedder: EmbeddingClient;
-  model: BaseChatModel;
-  workspaceRoot: string;
-  /** Profile home for AGENTS.md / reflection sync. Falls back to workspaceRoot. */
-  profileHome?: string;
-  enableReflection?: boolean;
-};
+import type { MemoryRuntime } from "../agent/agent-runner.js";
+export type { MemoryRuntime };
 
 import {
   buildApprovalDecisions,
