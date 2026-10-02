@@ -1,6 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
+import { dynamicTierRouter, WorkflowPhase } from "./dynamic-tier-router.js";
 
-export function createRouterModel() {
+export async function createRouterModel(phase: WorkflowPhase = "execute", failureCount = 0) {
   const apiKey = process.env.ROUTER_API_KEY;
   if (!apiKey) {
     throw new Error(
@@ -19,8 +20,10 @@ export function createRouterModel() {
   const baseURL =
     process.env.ROUTER_BASE_URL?.trim() || "http://127.0.0.1:27128/v1";
 
+  const modelId = await dynamicTierRouter.resolveModelForPhase(phase, { failureCount });
+
   return new ChatOpenAI({
-    model: process.env.AGENT_MODEL ?? "gpt-4o",
+    model: modelId,
     apiKey,
     configuration: {
       baseURL,

@@ -292,7 +292,7 @@ export async function createTerminalAgent(
 
   const sessionStore = new SessionStore(workspaceRoot, profileHome);
   const embedder = createEmbeddingClientOrFallback();
-  const model = createRouterModel();
+  const model = await createRouterModel("chat");
 
   sessionStore.writeConfigSnapshot({
     model: process.env.AGENT_MODEL ?? "gpt-4o",

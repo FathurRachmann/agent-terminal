@@ -2,7 +2,9 @@
  * Model Hub IPC helpers — talk to the *copied* engine HTTP API (no dashboard
  * login, no BrowserView embed of upstream UI).
  */
-import { shell, type BrowserWindow as BW } from "electron";
+import type { BrowserWindow as BW } from "electron";
+import * as electron from "electron";
+const shell = electron.shell || (electron as any).default?.shell;
 import {
   getModelHubBaseUrl,
   getModelHubStatus,

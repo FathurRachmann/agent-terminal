@@ -22,6 +22,7 @@ import {
 import { startCapabilitiesWatch } from "./capabilities-watch.js";
 import type { CapabilitiesWatchHandle } from "./capabilities-watch.js";
 import { createRouterModel } from "../model/9router.js";
+import { syncAutoCombos } from "../model-hub/auto-combo-sync.js";
 import { createDeepAgent } from "deepagents";
 import { FilesystemBackend } from "deepagents";
 import { openBoardStore } from "../agent/kanban/store.js";
@@ -749,11 +750,11 @@ async function runSelfHealTurn(opts: {
         sessionStore: agentBundle.sessionStore,
         memoryStore: agentBundle.memoryStore,
         embedder: agentBundle.embedder,
-        model: agentBundle.model,
+        model: await createRouterModel("execute"),
         workspaceRoot: agentBundle.workspaceRoot,
         profileHome: agentBundle.profileHome,
         enableReflection: agentBundle.enableReflection,
-      },
+      } as any,
       onEvent: (ev) =>
         emitToRenderer({ ...ev, threadId: turnThreadId } as never),
     });
@@ -1356,7 +1357,7 @@ app.whenReady().then(async () => {
         if (opts.projectId) {
           process.env.AGENT_KANBAN_PROJECT = opts.projectId;
         }
-        const model = createRouterModel();
+        const model = await createRouterModel("chat");
         // Confine FS tools to the project (or scratch) cwd. Artifact dir is
         // mentioned in the prompt; keep virtual root at workspaceCwd.
         const backend = new FilesystemBackend({
@@ -1370,7 +1371,7 @@ app.whenReady().then(async () => {
           createDeepAgent({
             model,
             systemPrompt:
-              "You are a Kanban worker. Use kanban_* tools to read and close out your assigned task. Prefer concrete evidence in summaries." +
+              "You are the Kanban Agent. Your job is to update `kanban.db` status, assignees, or create tasks based on events." +
               scopeHint,
             backend,
             tools: opts.tools as never[],
@@ -1391,10 +1392,11 @@ app.whenReady().then(async () => {
                 sessionStore: agentBundle.sessionStore,
                 memoryStore: agentBundle.memoryStore,
                 embedder: agentBundle.embedder,
-                model: createRouterModel(),
+                model: await createRouterModel("chat"),
                 workspaceRoot: opts.workspaceCwd,
+                profileHome: agentBundle.profileHome,
                 enableReflection: false,
-              }
+              } as any
             : undefined,
         });
       } finally {
@@ -1495,7 +1497,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle("modelHub:ensureSession", async () => {
     const result = await ensureModelHubSession();
-    if (result.ok) syncModelHubGatewayToSettings();
+    if (result.ok) {
+      syncModelHubGatewayToSettings();
+      void syncAutoCombos().catch(() => null);
+    }
     return result;
   });
 
@@ -1757,7 +1762,9 @@ app.whenReady().then(async () => {
       const patch: { isActive?: boolean; name?: string } = {};
       if (typeof payload?.isActive === "boolean") patch.isActive = payload.isActive;
       if (payload?.name != null) patch.name = String(payload.name);
-      return updateModelHubConnection(id, patch);
+      const res = await updateModelHubConnection(id, patch);
+      if (res.ok) void syncAutoCombos().catch(() => null);
+      return res;
     },
   );
 
@@ -1786,11 +1793,13 @@ app.whenReady().then(async () => {
         return { ok: false, error: "alias and modelIds required" };
       }
       try {
-        return await setModelHubModelEnabled({
+        const res = await setModelHubModelEnabled({
           alias,
           modelIds,
           enabled: payload?.enabled !== false,
         });
+        if (res.ok) void syncAutoCombos().catch(() => null);
+        return res;
       } catch (e) {
         return {
           ok: false,
@@ -1895,13 +1904,15 @@ app.whenReady().then(async () => {
       if (!provider || !code) {
         return { ok: false, error: "Missing provider or code" };
       }
-      return exchangeModelHubOAuth({
+      const res = await exchangeModelHubOAuth({
         provider,
         code,
         redirectUri: payload?.redirectUri,
         codeVerifier: payload?.codeVerifier,
         state: payload?.state,
       });
+      if (res.ok) void syncAutoCombos().catch(() => null);
+      return res;
     },
   );
 
@@ -1920,11 +1931,13 @@ app.whenReady().then(async () => {
       if (!provider || !deviceCode) {
         return { status: "error", error: "Missing provider or deviceCode" };
       }
-      return pollModelHubDeviceToken({
+      const res = await pollModelHubDeviceToken({
         provider,
         deviceCode,
         codeVerifier: payload?.codeVerifier,
       });
+      if (res.status === "done") void syncAutoCombos().catch(() => null);
+      return res;
     },
   );
 

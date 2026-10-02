@@ -34,7 +34,7 @@ export async function runParallelWorkers(
   options?: { concurrency?: number },
 ): Promise<string> {
   const concurrency = Math.max(1, Math.min(options?.concurrency ?? 3, 8));
-  const model = createRouterModel();
+  const model = await createRouterModel("plan");
   const results: string[] = new Array(tasks.length);
 
   let next = 0;

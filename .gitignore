@@ -43,6 +43,7 @@ sandbox-workspace/
 coverage/
 working
 tmp
+tmp-*.txt
 
 # Python venv (Laya decision bridge)
 .venv/
