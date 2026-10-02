@@ -7,7 +7,7 @@ import {
 } from "./activity-artifact.js";
 import {
   detectTestPassSummary,
-  extractDiffFromToolOutput,
+  resolveToolDiff,
   summarizePatchStats,
 } from "./tool-diff.js";
 
@@ -35,6 +35,13 @@ export type AgentUiEvent =
   | { type: "reflection"; memoryIds: string[] }
   | { type: "warning"; message: string }
   | { type: "pty"; text: string }
+  | {
+      type: "job_progress";
+      text: string;
+      path: string;
+      fraction?: number | null;
+      done?: boolean;
+    }
   | {
       type: "continue_available";
       reason: "model_unavailable" | "self_heal";
@@ -98,6 +105,8 @@ function eventTitle(ev: AgentUiEvent): string {
       return "done";
     case "pty":
       return "pty";
+    case "job_progress":
+      return "job progress";
     case "continue_available":
       return "continue available";
     default:
@@ -314,6 +323,7 @@ export function compactActivityLabel(ev: AgentUiEvent): {
 /** Whether this event should appear as a compact chip in the main chat. */
 export function shouldMirrorInChat(ev: AgentUiEvent): boolean {
   // tool chips are added on tool_end (with start input) in App.tsx
+  if (ev.type === "job_progress") return false;
   if (ev.type === "warning" || ev.type === "reflection") return true;
   if (ev.type === "context_compacted") return true;
   if (ev.type === "status") {
@@ -376,7 +386,7 @@ export function CompactActivityChip({
     const toolLabel =
       name === "write_file" || name === "write" ? "write_file" : "edit_file";
     action = `${toolLabel}: \`${truncate(file || path, 48)}\``;
-    result = summarizePatchStats(out) || (done ? "patched" : "");
+    result = summarizePatchStats(out, name, args) || (done ? "patched" : "");
   } else if (name) {
     const label = compactActivityLabel({
       type: "tool_start",
@@ -403,7 +413,7 @@ export function CompactActivityChip({
       : undefined,
   );
   const expandable = richDetail.trim().length > 0;
-  const diff = done ? extractDiffFromToolOutput(out) : null;
+  const diff = done ? resolveToolDiff(name, out, args) : null;
   const badge = err ? "ERR" : done ? "OK" : running ? "RUNNING" : "•";
   const badgeClass = err
     ? "is-err"
@@ -566,6 +576,7 @@ export type TraceChatItem = {
   kind: "trace";
   event: AgentUiEvent;
   at: string;
+  toolInput?: unknown;
 };
 
 export type ChatSegmentItem = { id: string; kind: string };

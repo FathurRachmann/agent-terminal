@@ -34,7 +34,16 @@ export function CodeBlock({
     null,
   );
   const trimmed = code.replace(/\n$/, "");
-  const title = filename || guessFilename(language);
+  const looksUnified =
+    (/^--- /m.test(trimmed) && /^\+\+\+ /m.test(trimmed)) ||
+    /^@@ /m.test(trimmed);
+  const isDiffLang =
+    /^(diff|patch)$/i.test(language) ||
+    (looksUnified && !/^(tsx?|jsx?|javascript|typescript|json|python|py)$/i.test(language));
+  const effectiveLang = isDiffLang ? "diff" : language;
+  const title =
+    filename ||
+    (isDiffLang ? "diff.patch" : guessFilename(language));
   const { added, removed } = useMemo(() => countDiff(trimmed), [trimmed]);
 
   useEffect(() => {
@@ -68,7 +77,7 @@ export function CodeBlock({
             <span className="text-[9.5px] font-semibold text-success">+{added}</span>
           )}
           <span className="text-[9px] tracking-wider text-muted uppercase">
-            {language}
+            {isDiffLang ? "DIFF" : language}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -93,7 +102,7 @@ export function CodeBlock({
         <div className="relative">
           {Highlighter ? (
             <Highlighter
-              language={normalizeLang(language)}
+              language={normalizeLang(effectiveLang)}
               style={cursorDark}
               customStyle={{
                 margin: 0,
@@ -108,7 +117,7 @@ export function CodeBlock({
                   fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
                 },
               }}
-              showLineNumbers={trimmed.split("\n").length > 3}
+              showLineNumbers={!isDiffLang && trimmed.split("\n").length > 3}
               lineNumberStyle={{
                 minWidth: "2.5em",
                 paddingRight: 12,
@@ -134,6 +143,16 @@ export function CodeBlock({
                     style: {
                       background: "rgba(63, 185, 80, 0.12)",
                       borderLeft: "2px solid #3fb950",
+                      display: "block",
+                      width: "100%",
+                    },
+                  };
+                }
+                if (isDiffLang && /^@@ /.test(line)) {
+                  return {
+                    style: {
+                      background: "rgba(56, 139, 253, 0.1)",
+                      color: "#79c0ff",
                       display: "block",
                       width: "100%",
                     },

@@ -13,6 +13,7 @@ import {
   contextMentionQueryFromValue,
 } from "./ContextMentionSuggest.js";
 import type { MentionSuggestItem } from "./mention-suggest-static.js";
+import type { GitBranchOption } from "./GitStatusBar.js";
 
 export type ComposerMode = "agent" | "ask" | "plan" | "debug";
 export type ComposerEffort =
@@ -30,7 +31,7 @@ export type ComposerAttachment = {
   basename: string;
   mime?: string;
   size?: number;
-  kind: "image" | "file";
+  kind: "image" | "audio" | "file";
   label?: string;
   subtitle?: string;
   previewUrl?: string;
@@ -49,7 +50,7 @@ type ImportedFile = {
   basename: string;
   mime: string;
   size: number;
-  kind: "image" | "file";
+  kind: "image" | "audio" | "file";
   previewUrl?: string;
   label?: string;
 };
@@ -67,6 +68,10 @@ type Props = {
   /** e.g. "$0.042 est" */
   costLabel?: string;
   git?: GitChrome | null;
+  branches?: GitBranchOption[];
+  switchingBranch?: boolean;
+  onSelectBranch?: (branch: string) => void | Promise<void>;
+  onRefreshBranches?: () => void | Promise<void>;
   mode: ComposerMode;
   effort: ComposerEffort;
   voiceMuted: boolean;
@@ -255,6 +260,10 @@ export function ChatComposer({
   tokenLabel,
   costLabel,
   git = null,
+  branches = [],
+  switchingBranch = false,
+  onSelectBranch,
+  onRefreshBranches,
   mode,
   effort,
   voiceMuted,
@@ -280,7 +289,8 @@ export function ChatComposer({
     null,
   );
   const dragDepthRef = useRef(0);
-  const [menu, setMenu] = useState<"attach" | "mode" | "effort" | null>(null);
+  const [menu, setMenu] = useState<"attach" | "mode" | "effort" | "branch" | null>(null);
+  const [branchQuery, setBranchQuery] = useState("");
   const [modelQuery, setModelQuery] = useState("");
   const [localDrop, setLocalDrop] = useState(false);
   const [busyAttach, setBusyAttach] = useState(false);
@@ -921,15 +931,108 @@ export function ChatComposer({
       {/* Git chrome & model metadata strip */}
       <div className="composer-chrome">
         <div className="composer-chrome-left">
-          <div className="composer-chrome-branch">
-            <span className="material-symbols-outlined composer-chrome-git-icon">
-              fork_right
-            </span>
-            <span className="composer-chrome-key">branch:</span>
-            <span className="composer-chrome-branch-name">
-              {git?.branch || "—"}
-            </span>
+          <div className="relative">
+            <button
+              type="button"
+              disabled={switchingBranch || !onSelectBranch}
+              onClick={() => {
+                if (!onSelectBranch) return;
+                setMenu((m) => (m === "branch" ? null : "branch"));
+                if (menu !== "branch") {
+                  void onRefreshBranches?.();
+                }
+              }}
+              className={`composer-chrome-branch${
+                onSelectBranch ? " is-clickable" : ""
+              }${menu === "branch" ? " is-active" : ""}`}
+              title={
+                onSelectBranch
+                  ? "Click to switch git branch"
+                  : "Current git branch"
+              }
+            >
+              <span className="material-symbols-outlined composer-chrome-git-icon">
+                fork_right
+              </span>
+              <span className="composer-chrome-key">branch:</span>
+              <span className="composer-chrome-branch-name">
+                {switchingBranch ? "switching…" : git?.branch || "—"}
+              </span>
+              {onSelectBranch ? (
+                <span className="composer-chrome-chevron">▾</span>
+              ) : null}
+            </button>
+
+            {menu === "branch" && onSelectBranch ? (
+              <div
+                className="composer-popover composer-popover-branch"
+                role="menu"
+              >
+                <div className="composer-popover-search">
+                  <input
+                    autoFocus
+                    value={branchQuery}
+                    onChange={(e) => setBranchQuery(e.target.value)}
+                    placeholder="Filter branches…"
+                    aria-label="Filter branches"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                      }
+                    }}
+                  />
+                </div>
+                <div className="composer-popover-section-label">
+                  Git Branches ({branches.length})
+                </div>
+                <div className="composer-popover-scroll">
+                  {branches.length === 0 ? (
+                    <div className="composer-popover-empty">
+                      No branches found
+                    </div>
+                  ) : (
+                    branches
+                      .filter((b) =>
+                        b.name.toLowerCase().includes(branchQuery.toLowerCase().trim()),
+                      )
+                      .map((b) => {
+                        const isCurrent = b.current || b.name === git?.branch;
+                        return (
+                          <button
+                            key={b.name}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={isCurrent}
+                            disabled={isCurrent || switchingBranch}
+                            className={`composer-menu-item composer-menu-item-row ${
+                              isCurrent ? "is-selected" : ""
+                            }`}
+                            onClick={() => {
+                              void (async () => {
+                                setMenu(null);
+                                setBranchQuery("");
+                                await onSelectBranch(b.name);
+                              })();
+                            }}
+                          >
+                            <span className="truncate flex items-center gap-1.5">
+                              <span>{isCurrent ? "●" : "○"}</span>
+                              <span className="font-mono">{b.name}</span>
+                            </span>
+                            {b.remote ? (
+                              <span className="composer-branch-tag">remote</span>
+                            ) : isCurrent ? (
+                              <span className="composer-check">✓</span>
+                            ) : null}
+                          </button>
+                        );
+                      })
+                  )}
+                </div>
+              </div>
+            ) : null}
           </div>
+
           {git ? (
             <div className="composer-chrome-status">
               <span className="composer-chrome-muted">STATUS:</span>

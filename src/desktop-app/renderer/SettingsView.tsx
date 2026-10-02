@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { ModelHubSettingsPanel } from "./ModelHubSettingsPanel.js";
 
 type BotDraft = {
   id: string;
@@ -60,6 +61,10 @@ type SettingsSnapshot = {
 };
 
 type SettingsGroup =
+  | "providers"
+  | "combos"
+  | "usage"
+  | "quota"
   | "model"
   | "agent"
   | "bots"
@@ -71,15 +76,31 @@ type SettingsGroup =
   | "gateways";
 
 const GROUPS: Array<{ id: SettingsGroup; label: string; blurb: string }> = [
-  { id: "model", label: "Model & API", blurb: "Gateway, model, embeddings" },
+  {
+    id: "providers",
+    label: "Providers",
+    blurb: "Manage AI provider connections",
+  },
+  {
+    id: "combos",
+    label: "Combo & Vision",
+    blurb: "Fallback / Round Robin / Fusion",
+  },
+  { id: "usage", label: "Usage", blurb: "Requests, tokens, cost" },
+  {
+    id: "quota",
+    label: "Quota Tracker",
+    blurb: "Track API quota limits",
+  },
+  { id: "model", label: "Model", blurb: "Default model & embeddings" },
   { id: "agent", label: "Agent Behavior", blurb: "Approvals, reflection, checkpoints" },
   { id: "bots", label: "Bots", blurb: "Specialized sessions & tool scopes" },
   { id: "gateways", label: "Gateways", blurb: "Local runtime connection" },
   { id: "desktop", label: "Desktop", blurb: "macOS automation allowlist" },
   { id: "sandbox", label: "Sandbox & PTY", blurb: "Shell pool, timeouts, folders" },
   { id: "memory", label: "Memory", blurb: "AGENTS.md, reflection & chat context" },
-  { id: "ui", label: "Interface", blurb: "Footer, chat paths, activity rail" },
-  { id: "paths", label: "Paths & Files", blurb: "Where config lives on disk" },
+  { id: "ui", label: "UI", blurb: "Rail, footer, chat path clicks" },
+  { id: "paths", label: "Paths", blurb: "Workspace & profile locations" },
 ];
 
 type Props = {
@@ -234,12 +255,49 @@ export function SettingsView({
     if (initialGroup) setGroup(initialGroup);
   }, [initialGroup]);
 
+  useEffect(() => {
+    if (group !== "model" && group !== "combos") return;
+    void (async () => {
+      const api = window.electronAgent as
+        | {
+            modelHubFetchModels?: () => Promise<{ ok?: boolean; data?: { data?: Array<{ id?: string; owned_by?: string }> } }>;
+            modelHubFetchCombos?: () => Promise<{ ok?: boolean; data?: Array<{ name?: string; kind?: string | null }> | { combos?: Array<{ name?: string; kind?: string | null }> } }>;
+          }
+        | undefined;
+
+      const [rModels, rCombos] = await Promise.all([
+        api?.modelHubFetchModels?.(),
+        api?.modelHubFetchCombos?.(),
+      ]);
+
+      const comboNames: string[] = [];
+      if (rCombos?.ok && rCombos.data) {
+        const raw = Array.isArray(rCombos.data)
+          ? rCombos.data
+          : (rCombos.data as { combos?: Array<{ name?: string }> })?.combos || [];
+        for (const c of raw) {
+          const name = String(c?.name || "").trim();
+          if (name && !comboNames.includes(name)) comboNames.push(name);
+        }
+      }
+      setHubCombos(comboNames);
+
+      if (rModels?.ok && Array.isArray(rModels.data?.data)) {
+        setHubModelIds(
+          rModels.data!.data!.map((m) => String(m.id || "")).filter(Boolean),
+        );
+      }
+    })();
+  }, [group]);
+
   // Draft fields
   const [agentModel, setAgentModel] = useState("");
   const [routerBaseUrl, setRouterBaseUrl] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [visionModel, setVisionModel] = useState("");
-  const [contextWindowTokens, setContextWindowTokens] = useState(256000);
+  const [hubModelIds, setHubModelIds] = useState<string[]>([]);
+  const [hubCombos, setHubCombos] = useState<string[]>([]);
+  const [contextWindowTokens, setContextWindowTokens] = useState(128000);
   const [runMode, setRunMode] = useState<
     "auto-review" | "allowlist" | "run-everything"
   >("auto-review");
@@ -272,6 +330,71 @@ export function SettingsView({
   const [showLearnedInFooter, setShowLearnedInFooter] = useState(true);
   const [openChatPathsInCanvas, setOpenChatPathsInCanvas] = useState(true);
   const [preferStreamedAnswer, setPreferStreamedAnswer] = useState(true);
+  const [graphifyStatus, setGraphifyStatus] = useState<{
+    ready: boolean;
+    graphPath?: string;
+    updatedAt?: string | null;
+    sizeBytes?: number;
+    workspaceRoot?: string;
+  } | null>(null);
+  const [graphifyBusy, setGraphifyBusy] = useState(false);
+  const [graphifyNote, setGraphifyNote] = useState<string | null>(null);
+
+  const refreshGraphify = async () => {
+    const api = window.electronAgent as
+      | {
+          graphifyStatus?: () => Promise<{
+            ok: boolean;
+            ready?: boolean;
+            graphPath?: string;
+            updatedAt?: string | null;
+            sizeBytes?: number;
+            workspaceRoot?: string;
+            error?: string;
+          }>;
+        }
+      | undefined;
+    if (!api?.graphifyStatus) return;
+    const res = await api.graphifyStatus();
+    if (res.ok) {
+      setGraphifyStatus({
+        ready: Boolean(res.ready),
+        graphPath: res.graphPath,
+        updatedAt: res.updatedAt,
+        sizeBytes: res.sizeBytes,
+        workspaceRoot: res.workspaceRoot,
+      });
+    }
+  };
+
+  const runGraphifyUpdate = async (force = false) => {
+    const api = window.electronAgent as
+      | {
+          graphifyUpdate?: (p?: {
+            force?: boolean;
+          }) => Promise<{
+            ok: boolean;
+            ready?: boolean;
+            error?: string;
+            stdout?: string;
+          }>;
+        }
+      | undefined;
+    if (!api?.graphifyUpdate) return;
+    setGraphifyBusy(true);
+    setGraphifyNote(null);
+    try {
+      const res = await api.graphifyUpdate({ force });
+      if (!res.ok) {
+        setGraphifyNote(res.error || "Index failed");
+      } else {
+        setGraphifyNote(res.ready ? "Index ready." : "Update finished.");
+      }
+      await refreshGraphify();
+    } finally {
+      setGraphifyBusy(false);
+    }
+  };
 
   const hydrate = (s: SettingsSnapshot) => {
     setSnap(s);
@@ -371,6 +494,7 @@ export function SettingsView({
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+    void refreshGraphify();
   };
 
   const savePermissions = async () => {
@@ -624,43 +748,77 @@ export function SettingsView({
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {!snap ? (
             <div className="text-[12px] text-muted">Loading settings…</div>
+          ) : group === "providers" ||
+            group === "combos" ||
+            group === "usage" ||
+            group === "quota" ? (
+            <ModelHubSettingsPanel page={group} />
           ) : group === "model" ? (
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
-              <SectionCard title="Model gateway">
-                <div>
-                  <FieldLabel hint="OpenAI-compatible base URL (9router, etc.)">
-                    Router base URL
-                  </FieldLabel>
-                  <TextInput
-                    mono
-                    value={routerBaseUrl}
-                    onChange={setRouterBaseUrl}
-                    placeholder="https://api.9router.com/v1"
-                  />
+              <SectionCard title="Model defaults">
+                <p className="text-[11px] leading-relaxed text-muted">
+                  Gateway dari source{" "}
+                  <span className="text-accent-soft">src/model-hub</span> —
+                  tanpa login dashboard. Endpoint &amp; API Key sync otomatis
+                  saat desktop start.
+                </p>
+                <div className="rounded-lg border border-border bg-surface-0 px-3 py-2 text-[10.5px] text-muted">
+                  <div>
+                    Base:{" "}
+                    <span className="font-mono text-fg-dim">
+                      {routerBaseUrl || "(Model Hub belum ready)"}
+                    </span>
+                  </div>
+                  <div className="mt-0.5">
+                    API key:{" "}
+                    {snap.model.routerApiKeyConfigured
+                      ? snap.model.routerApiKeyMasked
+                      : "belum — tunggu Model Hub boot"}
+                  </div>
                 </div>
                 <div>
-                  <FieldLabel
-                    hint={
-                      snap.model.routerApiKeyConfigured
-                        ? `Configured: ${snap.model.routerApiKeyMasked}`
-                        : "Belum ada API key"
-                    }
-                  >
-                    Router API key
-                  </FieldLabel>
-                  <TextInput
-                    mono
-                    type="password"
-                    value={apiKeyDraft}
-                    onChange={setApiKeyDraft}
-                    placeholder="Paste new key to rotate (leave blank to keep)"
-                  />
-                </div>
-                <div>
-                  <FieldLabel hint="Prefer model dengan context ≥256k">
+                  <FieldLabel hint="Pilih dari Model Hub (/v1/models) atau ketik id/combo">
                     Agent model
                   </FieldLabel>
-                  <TextInput mono value={agentModel} onChange={setAgentModel} />
+                  {hubCombos.length > 0 || hubModelIds.length > 0 ? (
+                    <select
+                      className="mt-1 w-full rounded-md border border-border bg-surface-0 px-3 py-2 font-mono text-[12px] text-fg"
+                      value={hubCombos.includes(agentModel) || hubModelIds.includes(agentModel) ? agentModel : ""}
+                      onChange={(e) => {
+                        if (e.target.value) setAgentModel(e.target.value);
+                      }}
+                    >
+                      <option value="">— pilih model / combo —</option>
+                      {hubCombos.length > 0 ? (
+                        <optgroup label="Combos">
+                          {hubCombos.map((name) => (
+                            <option key={`combo-${name}`} value={name}>
+                              ◆ {name} (combo)
+                            </option>
+                          ))}
+                        </optgroup>
+                      ) : null}
+                      {hubModelIds.length > 0 ? (
+                        <optgroup label="Models">
+                          {hubModelIds
+                            .filter((id) => !hubCombos.includes(id))
+                            .map((id) => (
+                              <option key={id} value={id}>
+                                {id}
+                              </option>
+                            ))}
+                        </optgroup>
+                      ) : null}
+                    </select>
+                  ) : null}
+                  <div className="mt-1.5">
+                    <TextInput
+                      mono
+                      value={agentModel}
+                      onChange={setAgentModel}
+                      placeholder="ag/gemini-… atau nama-combo"
+                    />
+                  </div>
                 </div>
               </SectionCard>
               <SectionCard title="Embeddings & vision">
@@ -676,10 +834,28 @@ export function SettingsView({
                 </div>
                 <div>
                   <FieldLabel hint="vision_analyze tool">Vision model</FieldLabel>
-                  <TextInput mono value={visionModel} onChange={setVisionModel} />
+                  {hubModelIds.length > 0 ? (
+                    <select
+                      className="mt-1 w-full rounded-md border border-border bg-surface-0 px-3 py-2 font-mono text-[12px] text-fg"
+                      value={hubModelIds.includes(visionModel) ? visionModel : ""}
+                      onChange={(e) => {
+                        if (e.target.value) setVisionModel(e.target.value);
+                      }}
+                    >
+                      <option value="">— pilih model —</option>
+                      {hubModelIds.map((id) => (
+                        <option key={`v-${id}`} value={id}>
+                          {id}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <div className="mt-1.5">
+                    <TextInput mono value={visionModel} onChange={setVisionModel} />
+                  </div>
                 </div>
                 <div>
-                  <FieldLabel hint="Budget token sebelum auto-summarize">
+                  <FieldLabel hint="Budget token; auto-summarize ~55% (lebih agresif). Session baru = history bersih.">
                     Context window (tokens)
                   </FieldLabel>
                   <NumberInput
@@ -688,6 +864,10 @@ export function SettingsView({
                     min={8000}
                     step={1000}
                   />
+                  <p className="mt-1.5 text-[10.5px] leading-snug text-muted">
+                    Default 128k. Turunkan (mis. 64k–96k) untuk hemat. Mulai
+                    session baru untuk task baru agar history tidak numpuk.
+                  </p>
                 </div>
               </SectionCard>
             </div>
@@ -1104,6 +1284,67 @@ export function SettingsView({
                   <code className="text-accent-soft">.agent/folder-allowlist.json</code>
                   ). Saat Privacy OFF, akses mesin penuh — tidak perlu Approve folder.
                 </p>
+              </SectionCard>
+              <SectionCard title="Codebase index (Graphify)">
+                <p className="text-[10px] text-muted">
+                  AST knowledge graph for architecture questions (
+                  <code className="text-accent-soft">graphify-out/graph.json</code>
+                  ). Project-scoped — not per chat.
+                </p>
+                <div className="rounded-md border border-border bg-surface-1 px-2.5 py-2 font-mono text-[10px]">
+                  <div>
+                    Status:{" "}
+                    <span
+                      className={
+                        graphifyStatus?.ready ? "text-tertiary" : "text-warn"
+                      }
+                    >
+                      {graphifyStatus == null
+                        ? "…"
+                        : graphifyStatus.ready
+                          ? "Ready"
+                          : "Missing"}
+                    </span>
+                  </div>
+                  {graphifyStatus?.updatedAt ? (
+                    <div className="mt-0.5 text-muted">
+                      Updated: {graphifyStatus.updatedAt}
+                      {typeof graphifyStatus.sizeBytes === "number"
+                        ? ` · ${(graphifyStatus.sizeBytes / 1024).toFixed(1)} KB`
+                        : ""}
+                    </div>
+                  ) : null}
+                  {graphifyStatus?.graphPath ? (
+                    <div className="mt-0.5 truncate text-muted" title={graphifyStatus.graphPath}>
+                      {graphifyStatus.graphPath}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={graphifyBusy}
+                    onClick={() => void runGraphifyUpdate(false)}
+                    className="rounded-md bg-accent px-3 py-1.5 text-[11px] font-semibold text-surface-0 disabled:opacity-50"
+                  >
+                    {graphifyBusy
+                      ? "Indexing…"
+                      : graphifyStatus?.ready
+                        ? "Refresh index"
+                        : "Index repo"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={graphifyBusy}
+                    onClick={() => void refreshGraphify()}
+                    className="rounded-md border border-border bg-surface-2 px-3 py-1.5 text-[11px] text-fg disabled:opacity-50"
+                  >
+                    Check status
+                  </button>
+                </div>
+                {graphifyNote ? (
+                  <p className="text-[10px] text-muted">{graphifyNote}</p>
+                ) : null}
               </SectionCard>
             </div>
           ) : group === "memory" ? (

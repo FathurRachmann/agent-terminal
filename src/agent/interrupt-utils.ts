@@ -1,3 +1,49 @@
+export function countInterruptActionRequests(payload: unknown): number {
+  let count = 0;
+  const visit = (node: unknown) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const rec = node as Record<string, unknown>;
+    if (Array.isArray(rec.actionRequests)) {
+      count += rec.actionRequests.length;
+    }
+    if (rec.value != null) visit(rec.value);
+    if (rec.actionRequest != null) visit(rec.actionRequest);
+    if (Array.isArray(rec.__interrupt__)) visit(rec.__interrupt__);
+  };
+  visit(payload);
+  return count > 0 ? count : 1;
+}
+
+export function buildApprovalDecisions(
+  type: "approve" | "reject",
+  payload?: unknown,
+): Array<{ type: "approve" | "reject" }> {
+  const count = payload ? countInterruptActionRequests(payload) : 1;
+  return Array.from({ length: Math.max(1, count) }, () => ({ type }));
+}
+
+/**
+ * Expand a single approve/reject intent to one decision per hanging actionRequest.
+ * LangGraph HITL rejects resume when counts don't match.
+ */
+export function normalizeApprovalDecision(
+  decision: { decisions: Array<{ type: "approve" | "reject" }> },
+  payload: unknown,
+): { decisions: Array<{ type: "approve" | "reject" }> } {
+  const needed = countInterruptActionRequests(payload);
+  const current = Array.isArray(decision?.decisions) ? decision.decisions : [];
+  if (current.length === needed && needed > 0) {
+    return { decisions: current };
+  }
+  const type = current.some((d) => d?.type === "approve") ? "approve" : "reject";
+  return { decisions: buildApprovalDecisions(type, payload) };
+}
+
 /** Shared helpers for Deep Agents / LangGraph interrupt payloads. */
 
 export function extractInterruptActionNames(payload: unknown): string[] {

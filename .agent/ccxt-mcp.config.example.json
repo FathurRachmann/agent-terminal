@@ -1,0 +1,29 @@
+{
+  "accounts": {
+    "binance-testnet": {
+      "exchange": "binance",
+      "apiKey": "REPLACE_WITH_TESTNET_API_KEY",
+      "secret": "REPLACE_WITH_TESTNET_SECRET",
+      "sandbox": true,
+      "trading": true,
+      "maxOrderValue": 100,
+      "maxDailyValue": 500,
+      "confirm": "always",
+      "allowedSymbols": ["BTC/USDT", "ETH/USDT", "BNB/USDT"]
+    },
+    "binance-live": {
+      "exchange": "binance",
+      "apiKey": "REPLACE_WITH_LIVE_API_KEY",
+      "secret": "REPLACE_WITH_LIVE_SECRET",
+      "trading": "live",
+      "funds": false,
+      "maxOrderValue": 50,
+      "maxDailyValue": 200,
+      "confirm": "live",
+      "allowedSymbols": ["BTC/USDT", "ETH/USDT"]
+    }
+  },
+  "settings": {
+    "strictPermissions": true
+  }
+}

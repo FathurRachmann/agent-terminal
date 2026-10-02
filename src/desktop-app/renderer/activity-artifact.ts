@@ -5,6 +5,7 @@ import { restoreAbsolutePathPrefix } from "../path-normalize.js";
 export type PreviewKind =
   | "markdown"
   | "code"
+  | "diff"
   | "html"
   | "csv"
   | "spreadsheet"
@@ -106,6 +107,8 @@ export function canvasResultRank(kind: PreviewKind): number {
       return 62;
     case "markdown":
       return 60;
+    case "diff":
+      return 95;
     case "binary":
       return 40;
     case "text":
@@ -376,20 +379,44 @@ export function extractResultPathsFromText(text: string): string[] {
   const tickRe =
     /`([^`\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))`/gi;
   let m: RegExpExecArray | null;
-  while ((m = tickRe.exec(text)) !== null) push(m[1] || "", true);
+  while ((m = tickRe.exec(text)) !== null) {
+    const raw = m[1] || "";
+    const base = raw.split("/").pop() || raw;
+    if (!/^(document|window|element|node|process|global|console|navigator|location)\.[a-z0-9]+$/i.test(base)) {
+      push(raw, true);
+    }
+  }
 
   // 2) Double / single quoted paths (may contain spaces)
   const dqRe =
     /"([^"\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))"/gi;
-  while ((m = dqRe.exec(text)) !== null) push(m[1] || "", true);
+  while ((m = dqRe.exec(text)) !== null) {
+    const raw = m[1] || "";
+    const base = raw.split("/").pop() || raw;
+    if (!/^(document|window|element|node|process|global|console|navigator|location)\.[a-z0-9]+$/i.test(base)) {
+      push(raw, true);
+    }
+  }
   const sqRe =
     /'([^'\n]+?\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))'/gi;
-  while ((m = sqRe.exec(text)) !== null) push(m[1] || "", true);
+  while ((m = sqRe.exec(text)) !== null) {
+    const raw = m[1] || "";
+    const base = raw.split("/").pop() || raw;
+    if (!/^(document|window|element|node|process|global|console|navigator|location)\.[a-z0-9]+$/i.test(base)) {
+      push(raw, true);
+    }
+  }
 
   // 3) Unquoted paths (no spaces) — classic working/foo.docx
   const unquoted =
     /(?:^|[\s"'=`(,\[{])((?:\.?\.?\/)?[\w./\\-]+\.(?:docx?|docs|pdf|xlsx?|xlsm|csv|tsv|ods|odt|rtf|html?|mdx?|markdown))/gi;
-  while ((m = unquoted.exec(text)) !== null) push(m[1] || "", false);
+  while ((m = unquoted.exec(text)) !== null) {
+    const raw = m[1] || "";
+    const base = raw.split("/").pop() || raw;
+    if (!/^(document|window|element|node|process|global|console|navigator|location)\.[a-z0-9]+$/i.test(base)) {
+      push(raw, false);
+    }
+  }
 
   // Drop bare basenames that are clearly truncated from a longer path match
   return found.filter((p) => {

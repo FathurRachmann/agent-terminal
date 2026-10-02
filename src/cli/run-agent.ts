@@ -34,6 +34,10 @@ import {
 } from "../desktop/intent.js";
 import { runDesktopAction } from "../desktop/actions.js";
 import {
+  formatToolEndOutput,
+  truncateOneLine,
+} from "../agent/tool-end-output.js";
+import {
   isDesktopAutomationEnabled,
   isDesktopAutomationSupported,
 } from "../desktop/macos.js";
@@ -58,10 +62,12 @@ export type MemoryRuntime = {
 };
 
 import {
+  buildApprovalDecisions,
   extractInterruptActionNames,
   formatToolApprovalDetail,
   isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
+  normalizeApprovalDecision,
   requiresExplicitApproval,
 } from "../agent/interrupt-utils.js";
 import {
@@ -200,6 +206,13 @@ export type AgentUiEvent =
   | { type: "warning"; message: string }
   | { type: "pty"; text: string }
   | {
+      type: "job_progress";
+      text: string;
+      path: string;
+      fraction?: number | null;
+      done?: boolean;
+    }
+  | {
       type: "continue_available";
       reason: "model_unavailable" | "self_heal";
       /** Last user prompt to resume. */
@@ -255,7 +268,10 @@ async function promptApproval(payload: unknown): Promise<ApprovalDecision> {
     const answer = (await rl.question("Approve? [y/N] ")).trim().toLowerCase();
     const approved = answer === "y" || answer === "yes";
     return {
-      decisions: [{ type: approved ? "approve" : "reject" }],
+      decisions: buildApprovalDecisions(
+        approved ? "approve" : "reject",
+        payload,
+      ),
     };
   } finally {
     rl.close();
@@ -346,27 +362,27 @@ function sanitizeEventForPersist(event: AgentUiEvent): AgentUiEvent {
     return {
       type: "tool_start",
       name: event.name,
-      input: truncate(event.input, 1200),
+      input: truncateOneLine(event.input, 1200),
     };
   }
   if (event.type === "tool_end") {
     return {
       type: "tool_end",
       name: event.name,
-      output: truncate(event.output, 1200),
+      output: formatToolEndOutput(event.name, event.output, 1200),
     };
   }
   if (event.type === "interrupt") {
     return {
       type: "interrupt",
-      payload: truncate(event.payload, 1200),
+      payload: truncateOneLine(event.payload, 1200),
     };
   }
   if (event.type === "error") {
-    return { type: "error", message: truncate(event.message, 800) };
+    return { type: "error", message: truncateOneLine(event.message, 800) };
   }
   if (event.type === "warning") {
-    return { type: "warning", message: truncate(event.message, 800) };
+    return { type: "warning", message: truncateOneLine(event.message, 800) };
   }
   return event;
 }
@@ -435,18 +451,6 @@ export function persistActivityEvent(
     content: activitySummary(uiEvent),
     meta: { uiEvent },
   });
-}
-
-function truncate(value: unknown, max = 240): string {
-  let text: string;
-  try {
-    text =
-      typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
-  } catch {
-    text = String(value);
-  }
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
 
 /**
@@ -548,7 +552,7 @@ async function runOnce(
             }
             try {
               const out = await Promise.resolve(call.output);
-              const text = truncate(out, 400);
+              const text = formatToolEndOutput(call.name, out, 400);
               emit(onEvent, {
                 type: "tool_end",
                 name: call.name,
@@ -867,34 +871,17 @@ export async function runAgentTurn(
 
         // Privacy OFF: folder grants expand an already-open allowlist — no HITL UI.
         if (folderGate && !privacyOn && !planGate) {
-          resumeValue = { decisions: [{ type: "approve" as const }] };
+          resumeValue = {
+            decisions: buildApprovalDecisions("approve", interrupt),
+          };
           emit(options.onEvent, {
             type: "status",
             phase: "thinking",
             detail: "privacy off — folder access auto-approved",
           });
         } else {
-          emit(options.onEvent, {
-            type: "status",
-            phase: "waiting_approval",
-            detail: planGate
-              ? "plan approval required"
-              : folderGate
-                ? formatToolApprovalDetail(interrupt)
-                : "human approval required",
-          });
-          emit(options.onEvent, { type: "interrupt", payload: interrupt });
-          mem?.sessionStore.appendTranscript({
-            threadId,
-            role: "interrupt",
-            content: JSON.stringify(interrupt).slice(0, 4000),
-            meta: planGate
-              ? { kind: "plan_approval" }
-              : folderGate
-                ? { kind: "folder_access" }
-                : undefined,
-          });
-
+          // Auto-resolve BEFORE emitting waiting_approval so Run Everything /
+          // allowlist / classifier never flash a sticky Approve card.
           if (!explicitGate) {
             const runMode =
               options.runMode?.getRunMode() ??
@@ -932,14 +919,36 @@ export async function runAgentTurn(
             }
           }
 
-          // Plan + (Privacy ON) folder grants need an explicit UI/stdin decision.
           if (!resumeValue) {
+            emit(options.onEvent, {
+              type: "status",
+              phase: "waiting_approval",
+              detail: planGate
+                ? "plan approval required"
+                : folderGate
+                  ? formatToolApprovalDetail(interrupt)
+                  : "human approval required",
+            });
+            emit(options.onEvent, { type: "interrupt", payload: interrupt });
+            mem?.sessionStore.appendTranscript({
+              threadId,
+              role: "interrupt",
+              content: JSON.stringify(interrupt).slice(0, 4000),
+              meta: planGate
+                ? { kind: "plan_approval" }
+                : folderGate
+                  ? { kind: "folder_access" }
+                  : undefined,
+            });
+
             resumeValue =
               options.autoApprove && !explicitGate
-                ? { decisions: [{ type: "approve" as const }] }
+                ? { decisions: buildApprovalDecisions("approve", interrupt) }
                 : options.requestApproval
                   ? await options.requestApproval(interrupt)
                   : await promptApproval(interrupt);
+            // HITL requires one decision per hanging tool call.
+            resumeValue = normalizeApprovalDecision(resumeValue, interrupt);
           }
         }
 
@@ -954,7 +963,10 @@ export async function runAgentTurn(
           }
         }
 
-        inputPayload = new Command({ resume: resumeValue });
+        // Always pad decisions to hanging action count before resume.
+        inputPayload = new Command({
+          resume: normalizeApprovalDecision(resumeValue, interrupt),
+        });
         continue;
       }
 

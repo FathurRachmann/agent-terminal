@@ -59,6 +59,7 @@ export const SAFE_READ_TOOLS = new Set([
   "git_log",
   "read_document",
   "vision_analyze",
+  "speech_transcribe",
   "task_status",
   "task_verify",
   "task_todo_update",

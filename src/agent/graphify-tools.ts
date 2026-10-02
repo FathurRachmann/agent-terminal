@@ -17,7 +17,7 @@ export function graphifyGraphPath(workspaceRoot: string): string {
 export function hasGraphifyGraph(workspaceRoot: string): boolean {
   try {
     const p = graphifyGraphPath(workspaceRoot);
-    return fs.existsSync(p) && fs.statSync(p).isFile();
+    return fs.existsSync(p) && fs.statSync(p).isFile() && fs.statSync(p).size > 0;
   } catch {
     return false;
   }
@@ -52,7 +52,15 @@ export async function runGraphifyCommand(
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
       cwd: options.cwd,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        PATH: [
+          path.join(process.env.HOME || "", ".local", "bin"),
+          "/opt/homebrew/bin",
+          "/usr/local/bin",
+          process.env.PATH || "/usr/bin:/bin",
+        ].join(":"),
+      },
       shell: false,
     });
     let stdout = "";
@@ -249,7 +257,8 @@ export function createGraphifyTools(workspaceRoot: string) {
 
   const graphifyUpdate = tool(
     async ({ force }: { force?: boolean }) => {
-      const args = ["update", root, "--no-viz"];
+      // ponytail: graphify update only supports --force / --no-cluster (no --no-viz)
+      const args = ["update", root];
       if (force) args.push("--force");
       const res = await runGraphifyCommand(args, {
         cwd: root,

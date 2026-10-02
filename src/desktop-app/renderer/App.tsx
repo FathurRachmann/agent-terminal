@@ -7,6 +7,7 @@ import {
   type ContinueOffer,
 } from "./ContinueTurnCard.js";
 import { ChatFileCard } from "./ChatFileCard.js";
+import { ChatDiffCard } from "./ChatDiffCard.js";
 import { UserBubbleAttachments } from "./UserBubbleAttachments.js";
 import {
   parseUserMessageContent,
@@ -41,6 +42,7 @@ import { ReasoningBlock } from "./ReasoningBlock.js";
 import { CapabilitiesView } from "./CapabilitiesView.js";
 import { ArtifactsView, type ArtifactRecord } from "./ArtifactsView.js";
 import { SettingsView } from "./SettingsView.js";
+import { ModelHubLivePanel } from "./ModelHubLivePanel.js";
 import { MessagingView } from "./MessagingView.js";
 import { ProfilesView } from "./ProfilesView.js";
 import { KanbanView } from "./KanbanView.js";
@@ -70,6 +72,10 @@ import {
   shouldAutoFocusCanvas,
   type ActivityArtifact,
 } from "./activity-artifact.js";
+import {
+  parseAgentFileDiffPayload,
+  fileDiffPayloadFromEditArgs,
+} from "./tool-diff.js";
 import {
   AssistantBubbleActions,
   UserBubbleActions,
@@ -117,6 +123,23 @@ import {
 
 type DesktopAgentEvent = AgentUiEvent & { threadId?: string };
 
+type CapabilityItemLike = {
+  id: string;
+  kind: "skills" | "tools" | "mcp";
+  name: string;
+  category: string;
+  description: string;
+  badge?: string;
+  enabled: boolean;
+  detailMarkdown: string;
+  authStatus?: "none" | "required" | "connected" | "expired";
+  authMode?: "none" | "oauth" | "bearer" | "env";
+  authEnvKeys?: string[];
+  canOAuth?: boolean;
+  canBearer?: boolean;
+  canEnv?: boolean;
+};
+
 declare global {
   interface Window {
     electronAgent?: {
@@ -151,7 +174,7 @@ declare global {
           basename: string;
           mime: string;
           size: number;
-          kind: "image" | "file";
+          kind: "image" | "audio" | "file";
           previewUrl?: string;
           label?: string;
         }>;
@@ -166,7 +189,7 @@ declare global {
           basename: string;
           mime: string;
           size: number;
-          kind: "image" | "file";
+          kind: "image" | "audio" | "file";
           previewUrl?: string;
           label?: string;
         }>;
@@ -185,7 +208,7 @@ declare global {
           basename: string;
           mime: string;
           size: number;
-          kind: "image" | "file";
+          kind: "image" | "audio" | "file";
           previewUrl?: string;
           label?: string;
         } | null;
@@ -317,6 +340,25 @@ declare global {
           primaryFolder: string | null;
           isActive: boolean;
         }>;
+      }>;
+      graphifyStatus?: () => Promise<{
+        ok: boolean;
+        ready?: boolean;
+        graphPath?: string;
+        updatedAt?: string | null;
+        sizeBytes?: number;
+        workspaceRoot?: string;
+        error?: string;
+      }>;
+      graphifyUpdate?: (payload?: {
+        force?: boolean;
+      }) => Promise<{
+        ok: boolean;
+        ready?: boolean;
+        graphPath?: string;
+        stdout?: string;
+        stderr?: string;
+        error?: string;
       }>;
       createProject?: (payload: {
         name: string;
@@ -746,6 +788,13 @@ declare global {
         }>;
         counts: { skills: number; tools: number; mcp: number };
       }>;
+      onCapabilitiesChanged?: (
+        callback: (payload: {
+          at?: number;
+          reason?: string;
+          root?: string;
+        }) => void,
+      ) => () => void;
       listArtifacts?: () => Promise<{
         artifacts: ArtifactRecord[];
         counts: {
@@ -770,6 +819,12 @@ declare global {
           badge?: string;
           enabled: boolean;
           detailMarkdown: string;
+          authStatus?: "none" | "required" | "connected" | "expired";
+          authMode?: "none" | "oauth" | "bearer" | "env";
+          authEnvKeys?: string[];
+          canOAuth?: boolean;
+          canBearer?: boolean;
+          canEnv?: boolean;
         }>;
         tools?: Array<{
           id: string;
@@ -790,7 +845,59 @@ declare global {
           badge?: string;
           enabled: boolean;
           detailMarkdown: string;
+          authStatus?: "none" | "required" | "connected" | "expired";
+          authMode?: "none" | "oauth" | "bearer" | "env";
+          authEnvKeys?: string[];
+          canOAuth?: boolean;
+          canBearer?: boolean;
+          canEnv?: boolean;
         }>;
+        counts?: { skills: number; tools: number; mcp: number };
+        reloaded?: boolean;
+        reloadReason?: string;
+      }>;
+      mcpConnectOAuth?: (serverName: string) => Promise<{
+        ok: boolean;
+        error?: string;
+        skills?: CapabilityItemLike[];
+        tools?: CapabilityItemLike[];
+        mcp?: CapabilityItemLike[];
+        counts?: { skills: number; tools: number; mcp: number };
+        reloaded?: boolean;
+        reloadReason?: string;
+      }>;
+      mcpSaveBearer?: (
+        serverName: string,
+        token: string,
+      ) => Promise<{
+        ok: boolean;
+        error?: string;
+        skills?: CapabilityItemLike[];
+        tools?: CapabilityItemLike[];
+        mcp?: CapabilityItemLike[];
+        counts?: { skills: number; tools: number; mcp: number };
+        reloaded?: boolean;
+        reloadReason?: string;
+      }>;
+      mcpSaveEnv?: (
+        serverName: string,
+        env: Record<string, string>,
+      ) => Promise<{
+        ok: boolean;
+        error?: string;
+        skills?: CapabilityItemLike[];
+        tools?: CapabilityItemLike[];
+        mcp?: CapabilityItemLike[];
+        counts?: { skills: number; tools: number; mcp: number };
+        reloaded?: boolean;
+        reloadReason?: string;
+      }>;
+      mcpDisconnect?: (serverName: string) => Promise<{
+        ok: boolean;
+        error?: string;
+        skills?: CapabilityItemLike[];
+        tools?: CapabilityItemLike[];
+        mcp?: CapabilityItemLike[];
         counts?: { skills: number; tools: number; mcp: number };
         reloaded?: boolean;
         reloadReason?: string;
@@ -862,10 +969,13 @@ declare global {
       resolveApproval?: (
         approve: boolean,
         threadId?: string,
+        always?: boolean,
       ) => Promise<{
         ok: boolean;
         approve?: boolean;
         threadId?: string;
+        always?: boolean;
+        remembered?: string[];
         error?: string;
       }>;
       getMessagingConfig?: () => Promise<{
@@ -1000,6 +1110,15 @@ type ChatItem =
       basename: string;
       at: string;
       note?: string;
+    }
+  | {
+      id: string;
+      kind: "file_diff";
+      path: string;
+      language: string;
+      before: string;
+      after: string;
+      at: string;
     }
   | {
       id: string;
@@ -1185,6 +1304,10 @@ export function App() {
     deletions: number;
     dirty: boolean;
   } | null>(null);
+  const [gitBranches, setGitBranches] = useState<
+    Array<{ name: string; current: boolean; remote: boolean }>
+  >([]);
+  const [branchSwitching, setBranchSwitching] = useState(false);
   const [railLayer, setRailLayer] = useState<"canvas" | "files">("canvas");
   const [uiPrefs, setUiPrefs] = useState({
     showFooterPhase: true,
@@ -1245,6 +1368,7 @@ export function App() {
     | "messaging"
     | "profiles"
     | "kanban"
+    | "hub-live"
   >("chat");
   const [settingsFocus, setSettingsFocus] = useState<string | null>(null);
   const [newProfileOpen, setNewProfileOpen] = useState(false);
@@ -1655,6 +1779,13 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [phase, setPhase] = useState<AgentPhase>("boot");
   const [phaseDetail, setPhaseDetail] = useState<string | null>(null);
+  const [liveProgress, setLiveProgress] = useState<string | null>(null);
+  const [liveProgressFraction, setLiveProgressFraction] = useState<
+    number | null
+  >(null);
+  const liveProgressClearRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const [tokensPerSec, setTokensPerSec] = useState<number | null>(null);
   const tokenRateRef = useRef({ chars: 0, startedAt: 0 });
   const [messageFeedback, setMessageFeedback] = useState<
@@ -1688,6 +1819,15 @@ export function App() {
         });
       } catch {
         /* ignore */
+      }
+      if (window.electronAgent?.listGitBranches) {
+        try {
+          const listed = await window.electronAgent.listGitBranches();
+          if (cancelled || !listed?.ok || !Array.isArray(listed.branches)) return;
+          setGitBranches(listed.branches);
+        } catch {
+          /* ignore */
+        }
       }
     };
     void refreshGit();
@@ -2686,6 +2826,30 @@ export function App() {
       }
 
       const isLive = !tid || tid === activeThreadIdRef.current;
+
+      // Job progress is global footer state — apply even for background threads.
+      if (event.type === "job_progress") {
+        const text = String(event.text || "").trim();
+        if (text) {
+          setLiveProgress(text);
+          setLiveProgressFraction(
+            typeof event.fraction === "number" ? event.fraction : null,
+          );
+          if (liveProgressClearRef.current) {
+            clearTimeout(liveProgressClearRef.current);
+            liveProgressClearRef.current = null;
+          }
+          if (event.done) {
+            liveProgressClearRef.current = setTimeout(() => {
+              setLiveProgress(null);
+              setLiveProgressFraction(null);
+              liveProgressClearRef.current = null;
+            }, 12_000);
+          }
+        }
+        if (!isLive) return;
+      }
+
       if (!isLive) {
         if (event.type === "pty") {
           appendPty(event.text);
@@ -2727,6 +2891,16 @@ export function App() {
           setToolApprovalDetail(
             String(event.detail || "").trim() || "Tool approval required",
           );
+          stickToBottom.current = true;
+        } else if (
+          event.phase === "thinking" ||
+          event.phase === "tool" ||
+          event.phase === "pty" ||
+          event.phase === "reasoning"
+        ) {
+          // Drop sticky Approve after auto-resolve (run-everything) or resume.
+          setToolApprovalPending(false);
+          setToolApprovalDetail(null);
         }
         if (event.phase === "done" || event.phase === "error") {
           setLoading(false);
@@ -2759,6 +2933,7 @@ export function App() {
         } else {
           setToolApprovalPending(true);
           setToolApprovalDetail(formatToolApprovalDetail(event.payload));
+          stickToBottom.current = true;
         }
       }
 
@@ -2912,7 +3087,25 @@ export function App() {
       }
 
       if (event.type === "warning") {
-        appendAgentLog(`[warn] ${event.message}\n`);
+        const warnMsg = String(event.message || "");
+        if (warnMsg.startsWith("__wa_plan__\n")) {
+          const planText = warnMsg.slice("__wa_plan__\n".length).trim();
+          if (planText) {
+            setItems((prev) => [
+              ...prev,
+              {
+                id: `wa-plan-${Date.now()}`,
+                kind: "assistant" as const,
+                text: planText,
+                at,
+              },
+            ]);
+            setPendingPlanMarkdown(planText);
+          }
+          appendAgentLog(`[warn] whatsapp plan approval shown in chat\n`);
+        } else {
+          appendAgentLog(`[warn] ${warnMsg}\n`);
+        }
       }
 
       if (event.type === "error") {
@@ -2937,8 +3130,12 @@ export function App() {
         setLoading(false);
       }
 
-      // Keep a dense live activity log (skip raw token / pty spam)
-      if (event.type !== "token" && event.type !== "pty") {
+      // Keep a dense live activity log (skip raw token / pty / job_progress spam)
+      if (
+        event.type !== "token" &&
+        event.type !== "pty" &&
+        event.type !== "job_progress"
+      ) {
         setActivity((prev) => {
           const next = [...prev, { id, event, at }];
           return next.length > 200 ? next.slice(-200) : next;
@@ -3017,6 +3214,42 @@ export function App() {
           event.name === "edit";
         const wroteCode = artifacts.some((a) => a.kind === "code");
 
+        // Post-apply Monaco + inline chat diff. Prefer middleware FILE_DIFF; else args.
+        let pendingChatDiff: {
+          path: string;
+          language: string;
+          before: string;
+          after: string;
+        } | null = null;
+        if (isFileWrite) {
+          const outText = String(event.output || "");
+          const fileDiff =
+            parseAgentFileDiffPayload(outText) ??
+            fileDiffPayloadFromEditArgs(event.name, input);
+          if (fileDiff) {
+            const diffPath = fileDiff.path || "file";
+            pendingChatDiff = {
+              path: diffPath,
+              language: fileDiff.language || "plaintext",
+              before: fileDiff.before,
+              after: fileDiff.after,
+            };
+            openCanvasRef.current(
+              {
+                id: `diff:${diffPath}`,
+                path: diffPath,
+                basename: `${basenamePath(diffPath)} (diff)`,
+                kind: "diff",
+                language: pendingChatDiff.language,
+                inlineContent: fileDiff.after,
+                diffOriginal: fileDiff.before,
+                diffModified: fileDiff.after,
+              },
+              true,
+            );
+          }
+        }
+
         // Generator scripts (.py/.js) often name the real output — open after execute.
         if (wroteCode && isFileWrite) {
           for (const a of artifacts) {
@@ -3083,6 +3316,7 @@ export function App() {
         };
         setItems((prev) => {
           const next = [...prev];
+          let replaced = false;
           for (let i = next.length - 1; i >= 0; i -= 1) {
             const row = next[i];
             if (
@@ -3095,19 +3329,31 @@ export function App() {
                 event: endEvent,
                 toolInput: row.toolInput ?? input,
               };
-              return next;
+              replaced = true;
+              break;
             }
           }
-          return [
-            ...next,
-            {
+          if (!replaced) {
+            next.push({
               id: `t-${id}`,
               kind: "trace",
               event: endEvent,
               at,
               toolInput: input,
-            },
-          ];
+            });
+          }
+          if (pendingChatDiff) {
+            next.push({
+              id: `diffcard-${id}`,
+              kind: "file_diff" as const,
+              path: pendingChatDiff.path,
+              language: pendingChatDiff.language,
+              before: pendingChatDiff.before,
+              after: pendingChatDiff.after,
+              at,
+            });
+          }
+          return next;
         });
       } else if (shouldMirrorInChat(event) && event.type !== "tool_start") {
         setItems((prev) => [
@@ -3123,6 +3369,60 @@ export function App() {
     if (pendingPlanMarkdown?.trim()) return;
     void hydratePlanApprovalRef.current();
   }, [planApprovalPending, pendingPlanMarkdown]);
+
+  // Self-heal: status can flip to waiting_approval while the pending flag was
+  // cleared by a stale session hydrate — always surface the Approve UI.
+  useEffect(() => {
+    if (phase !== "waiting_approval") return;
+    if (planApprovalPending) return;
+    if (toolApprovalPending) return;
+    setToolApprovalPending(true);
+    setToolApprovalDetail(
+      (phaseDetail && phaseDetail.trim()) || "Tool approval required",
+    );
+    stickToBottom.current = true;
+  }, [phase, phaseDetail, planApprovalPending, toolApprovalPending]);
+
+  // Recover sticky Approve UI if main still has a pending HITL (e.g. after
+  // renderer missed the interrupt event). Only poll while a turn looks busy
+  // and we are not already showing the card.
+  useEffect(() => {
+    const tid = activeThreadId;
+    if (!tid) return;
+    if (toolApprovalPending || planApprovalPending) return;
+    if (!loading && !busyThreadIds.includes(tid)) return;
+    let cancelled = false;
+    const sync = async () => {
+      const api = window.electronAgent as
+        | {
+            pendingApproval?: (threadId?: string) => Promise<{
+              ok?: boolean;
+              pending?: boolean;
+              detail?: string | null;
+            }>;
+          }
+        | undefined;
+      const res = await api?.pendingApproval?.(tid);
+      if (cancelled || !res?.ok || !res.pending) return;
+      if (activeThreadIdRef.current !== tid) return;
+      setToolApprovalPending(true);
+      if (res.detail) setToolApprovalDetail(res.detail);
+      setPhase("waiting_approval");
+      stickToBottom.current = true;
+    };
+    void sync();
+    const t = window.setInterval(() => void sync(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [
+    activeThreadId,
+    loading,
+    busyThreadIds,
+    toolApprovalPending,
+    planApprovalPending,
+  ]);
 
   useEffect(() => {
     const el = streamRef.current;
@@ -3624,15 +3924,22 @@ export function App() {
     }
   };
 
-  const resolveToolApproval = async (approved: boolean) => {
+  const resolveToolApproval = async (
+    approved: boolean,
+    opts?: { always?: boolean },
+  ) => {
     setToolApprovalBusy(true);
     try {
-      await window.electronAgent?.resolveApproval?.(
+      const res = await window.electronAgent?.resolveApproval?.(
         approved,
         activeThreadIdRef.current,
+        Boolean(opts?.always),
       );
       setToolApprovalPending(false);
       setToolApprovalDetail(null);
+      // Drop waiting_approval phase immediately so sticky bar does not linger.
+      setPhase((p) => (p === "waiting_approval" ? "thinking" : p));
+      setPhaseDetail(null);
       if (!approved) {
         setItems((prev) => [
           ...prev,
@@ -3643,6 +3950,19 @@ export function App() {
             at: now(),
           },
         ]);
+      } else if (opts?.always && res && "remembered" in (res as object)) {
+        const remembered = (res as { remembered?: string[] }).remembered;
+        if (remembered?.length) {
+          setItems((prev) => [
+            ...prev,
+            {
+              id: `s-allow-${Date.now()}`,
+              kind: "system",
+              text: `Session allowlist += ${remembered.join(", ")}`,
+              at: now(),
+            },
+          ]);
+        }
       }
     } finally {
       setToolApprovalBusy(false);
@@ -3660,9 +3980,11 @@ export function App() {
             ? "kanban"
             : mainView === "messaging"
               ? "messaging"
-              : railOpen && railLayer === "files"
-                ? "files"
-                : "chat";
+              : mainView === "hub-live"
+                ? "hub-live"
+                : railOpen && railLayer === "files"
+                  ? "files"
+                  : "chat";
 
   const handleNavRailSelect = (id: NavRailId) => {
     switch (id) {
@@ -3687,6 +4009,9 @@ export function App() {
         break;
       case "messaging":
         setMainView("messaging");
+        break;
+      case "hub-live":
+        setMainView("hub-live");
         break;
       case "workspaces":
         void window.electronAgent?.openWorkspacesWindow?.();
@@ -4504,6 +4829,10 @@ export function App() {
         <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
           <KanbanView onClose={() => setMainView("chat")} />
         </div>
+      ) : mainView === "hub-live" ? (
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+          <ModelHubLivePanel onClose={() => setMainView("chat")} />
+        </div>
       ) : mainView === "messaging" ? (
         <MessagingView onClose={() => setMainView("chat")} />
       ) : mainView === "profiles" ? (
@@ -4570,7 +4899,7 @@ export function App() {
       <div className="flex min-h-0 min-w-0 flex-1">
       {/* Main */}
       <section
-        className={`layout-panel flex min-w-0 flex-1 flex-col bg-surface-1 ${
+        className={`chat-surface layout-panel flex min-w-0 flex-1 flex-col bg-surface-1 ${
           chatDropActive ? "chat-column-drop" : ""
         }`}
         style={{ order: layout.swapped ? 3 : 1 }}
@@ -4625,6 +4954,7 @@ export function App() {
               !draftReasoning &&
               phase !== "reflecting" &&
               phase !== "done" &&
+              phase !== "waiting_approval" &&
               !planApprovalPending &&
               !toolApprovalPending;
             let lastUserId: string | null = null;
@@ -4842,6 +5172,32 @@ export function App() {
                 />
               );
             }
+            if (item.kind === "file_diff") {
+              return (
+                <ChatDiffCard
+                  key={item.id}
+                  path={item.path}
+                  language={item.language}
+                  before={item.before}
+                  after={item.after}
+                  onOpenCanvas={() => {
+                    openCanvasRef.current(
+                      {
+                        id: `diff:${item.path}`,
+                        path: item.path,
+                        basename: `${basenamePath(item.path)} (diff)`,
+                        kind: "diff",
+                        language: item.language || "plaintext",
+                        inlineContent: item.after,
+                        diffOriginal: item.before,
+                        diffModified: item.after,
+                      },
+                      true,
+                    );
+                  }}
+                />
+              );
+            }
             if (item.kind === "system") {
               return (
                 <div key={item.id} className="chat-system">
@@ -4889,6 +5245,7 @@ export function App() {
                 <div className="chat-assistant-body">
                   <MarkdownBody
                     text={draftAnswer}
+                    streaming
                     onOpenPath={
                       uiPrefs.openChatPathsInCanvas
                         ? openWorkspacePath
@@ -4899,45 +5256,6 @@ export function App() {
                 </div>
               </div>
             ))}
-
-          {planApprovalPending ? (
-            <PlanApprovalCard
-              markdown={
-                pendingPlanMarkdown ||
-                canvasTabs.find((t) => t.id === "plan:.agent/task/board.md")
-                  ?.inlineContent ||
-                "_Plan is ready. Approve to continue with todos & coding._"
-              }
-              busy={planApprovalBusy}
-              onApprove={() => {
-                void resolvePlanApproval(true);
-              }}
-              onReject={() => {
-                void resolvePlanApproval(false);
-              }}
-              onOpenCanvas={() => {
-                setRailLayer("canvas");
-                setRailOpen(true);
-                setActiveCanvasId("plan:.agent/task/board.md");
-              }}
-            />
-          ) : null}
-
-          {toolApprovalPending && !planApprovalPending ? (
-            <ToolApprovalCard
-              detail={
-                toolApprovalDetail ||
-                "_Tool approval required._"
-              }
-              busy={toolApprovalBusy}
-              onApprove={() => {
-                void resolveToolApproval(true);
-              }}
-              onReject={() => {
-                void resolveToolApproval(false);
-              }}
-            />
-          ) : null}
 
           {continueOffer && !loading && !planApprovalPending ? (
             <ContinueTurnCard
@@ -4953,6 +5271,52 @@ export function App() {
         </div>
 
         <div className="shrink-0">
+          {/* Sticky HITL bar — always visible above composer (not buried in scroll). */}
+          {planApprovalPending ? (
+            <div className="border-t border-border bg-surface-1 px-3 py-2">
+              <PlanApprovalCard
+                markdown={
+                  pendingPlanMarkdown ||
+                  canvasTabs.find((t) => t.id === "plan:.agent/task/board.md")
+                    ?.inlineContent ||
+                  "_Plan is ready. Approve to continue with todos & coding._"
+                }
+                busy={planApprovalBusy}
+                onApprove={() => {
+                  void resolvePlanApproval(true);
+                }}
+                onReject={() => {
+                  void resolvePlanApproval(false);
+                }}
+                onOpenCanvas={() => {
+                  setRailLayer("canvas");
+                  setRailOpen(true);
+                  setActiveCanvasId("plan:.agent/task/board.md");
+                }}
+              />
+            </div>
+          ) : null}
+          {toolApprovalPending && !planApprovalPending ? (
+            <div className="border-t border-border bg-surface-1 px-3 py-2">
+              <ToolApprovalCard
+                detail={
+                  toolApprovalDetail ||
+                  phaseDetail ||
+                  "_Tool approval required._"
+                }
+                busy={toolApprovalBusy}
+                onApprove={() => {
+                  void resolveToolApproval(true);
+                }}
+                onAllowAlways={() => {
+                  void resolveToolApproval(true, { always: true });
+                }}
+                onReject={() => {
+                  void resolveToolApproval(false);
+                }}
+              />
+            </div>
+          ) : null}
           <ChatComposer
             value={input}
             disabled={loading || !status.agentReady}
@@ -4978,6 +5342,49 @@ export function App() {
                 : undefined
             }
             git={gitChrome}
+            branches={gitBranches}
+            switchingBranch={branchSwitching}
+            onSelectBranch={async (b) => {
+              if (branchSwitching || !window.electronAgent?.checkoutGitBranch) return;
+              setBranchSwitching(true);
+              try {
+                const res = await window.electronAgent.checkoutGitBranch(b);
+                if (res?.ok) {
+                  const [summary, branchList] = await Promise.all([
+                    window.electronAgent.getGitSummary?.(),
+                    window.electronAgent.listGitBranches?.(),
+                  ]);
+                  if (summary) {
+                    setGitChrome({
+                      branch: summary.branch,
+                      additions: summary.additions,
+                      deletions: summary.deletions,
+                      dirty: summary.dirty,
+                    });
+                  }
+                  if (branchList?.ok && Array.isArray(branchList.branches)) {
+                    setGitBranches(branchList.branches);
+                  }
+                } else if (res?.error) {
+                  handleAttachError(`Git checkout error: ${res.error}`);
+                }
+              } catch (err) {
+                handleAttachError(`Git checkout error: ${err instanceof Error ? err.message : String(err)}`);
+              } finally {
+                setBranchSwitching(false);
+              }
+            }}
+            onRefreshBranches={async () => {
+              if (!window.electronAgent?.listGitBranches) return;
+              try {
+                const listed = await window.electronAgent.listGitBranches();
+                if (listed?.ok && Array.isArray(listed.branches)) {
+                  setGitBranches(listed.branches);
+                }
+              } catch {
+                /* ignore */
+              }
+            }}
             mode={composerMode}
             effort={composerEffort}
             thinking={composerThinking}
@@ -5163,6 +5570,9 @@ export function App() {
         profileId={status.profileId}
         profiles={profileIds}
         phase={phase}
+        phaseDetail={phaseDetail}
+        liveProgress={liveProgress}
+        liveProgressFraction={liveProgressFraction}
         backgroundBusyCount={backgroundBusyCount}
         statusError={status.error}
         learnedRules={learnedRules}

@@ -59,6 +59,11 @@ const TOOL_CATALOG: Array<{
   { name: "browser_screenshot", category: "Browser", description: "Screenshot" },
   { name: "browser_close", category: "Browser", description: "Close browser" },
   { name: "vision_analyze", category: "Vision", description: "Analyze image" },
+  {
+    name: "speech_transcribe",
+    category: "Speech",
+    description: "Transcribe audio/voice",
+  },
   { name: "read_document", category: "Filesystem", description: "Read docx/xlsx text" },
   { name: "graphify_status", category: "Codebase graph", description: "Graph ready?" },
   { name: "graphify_query", category: "Codebase graph", description: "Query project graph" },
@@ -143,13 +148,13 @@ export function buildSettingsSnapshot(
   return {
     model: {
       agentModel: process.env.AGENT_MODEL ?? "gpt-4o",
-      routerBaseUrl: process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1",
+      routerBaseUrl: process.env.ROUTER_BASE_URL ?? "http://127.0.0.1:27128/v1",
       routerApiKeyConfigured: Boolean(apiKey.trim()),
       routerApiKeyMasked: maskSecret(apiKey),
       embeddingModel: process.env.EMBEDDING_MODEL ?? "text-embedding-3-small",
       visionModel:
         process.env.VISION_MODEL || process.env.AGENT_MODEL || "gemini-2.0-flash",
-      contextWindowTokens: numEnv("CONTEXT_WINDOW_TOKENS", 256_000),
+      contextWindowTokens: numEnv("CONTEXT_WINDOW_TOKENS", 128_000),
     },
     agent: stored.agent,
     sandbox: {

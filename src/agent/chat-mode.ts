@@ -51,6 +51,7 @@ export const ASK_MODE_TOOLS: readonly string[] = [
   "git_log",
   "read_document",
   "vision_analyze",
+  "speech_transcribe",
   "task",
   "request_folder_access",
 ];

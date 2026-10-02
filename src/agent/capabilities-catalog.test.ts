@@ -71,6 +71,31 @@ describe("capabilities catalog", () => {
     const caps = listCapabilities({ workspaceRoot: root });
     assert.equal(caps.mcp.length, 1);
     assert.equal(caps.mcp[0]?.name, "memory");
+    assert.equal(caps.mcp[0]?.authStatus, "none");
+    assert.equal(caps.mcp[0]?.badge, "configured");
+  });
+
+  it("marks url MCP servers as needing login until connected", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "caps-"));
+    dirs.push(root);
+    fs.mkdirSync(path.join(root, ".agent"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, ".agent", "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          notion: {
+            url: "https://mcp.notion.com/mcp",
+            description: "Notion MCP",
+          },
+        },
+      }),
+      "utf8",
+    );
+    const caps = listCapabilities({ workspaceRoot: root });
+    assert.equal(caps.mcp[0]?.authStatus, "required");
+    assert.equal(caps.mcp[0]?.badge, "needs login");
+    assert.equal(caps.mcp[0]?.canOAuth, true);
+    assert.equal(caps.mcp[0]?.canBearer, true);
   });
 
   it("resolves runtime filter and filters tools/mcp/skills", () => {

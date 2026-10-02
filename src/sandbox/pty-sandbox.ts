@@ -9,6 +9,7 @@ import {
   type FileUploadResponse,
 } from "deepagents";
 import { checkCommand, checkCommandWorkspaceAccess, ensureLsLongListing } from "./guardrails.js";
+import { ensureRtkProxy } from "./rtk-proxy.js";
 import { registerPtyBackgroundProcess } from "../agent/process-manage.js";
 import { resolveWorkingAwarePath } from "../agent/working-paths.js";
 import {
@@ -155,6 +156,12 @@ class PtySession {
       cwd: this.cwd,
       env: {
         ...process.env,
+        // Prefer Homebrew rtk + common bins for token-optimized proxies.
+        PATH: [
+          "/opt/homebrew/bin",
+          "/usr/local/bin",
+          process.env.PATH || "/usr/bin:/bin",
+        ].join(":"),
         TERM: "xterm-256color",
         PAGER: "cat",
         GIT_PAGER: "cat",
@@ -663,6 +670,7 @@ export class PtySandbox extends BaseSandbox {
     }
 
     cmd = ensureLsLongListing(cmd);
+    cmd = ensureRtkProxy(cmd);
 
     const guard = checkCommand(cmd);
     if (!guard.ok) {

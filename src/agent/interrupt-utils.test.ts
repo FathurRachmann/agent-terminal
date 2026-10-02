@@ -6,6 +6,9 @@ import {
   formatToolApprovalDetail,
   isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
+  normalizeApprovalDecision,
+  buildApprovalDecisions,
+  countInterruptActionRequests,
   requiresExplicitApproval,
 } from "./interrupt-utils.js";
 
@@ -24,6 +27,24 @@ describe("interrupt utils", () => {
       }),
       false,
     );
+  });
+
+  it("pads approval decisions to match hanging actionRequests", () => {
+    const payload = {
+      actionRequests: [
+        { name: "execute", args: {} },
+        { name: "write_file", args: {} },
+        { name: "edit_file", args: {} },
+      ],
+    };
+    assert.equal(countInterruptActionRequests(payload), 3);
+    assert.equal(buildApprovalDecisions("approve", payload).length, 3);
+    const normalized = normalizeApprovalDecision(
+      { decisions: [{ type: "approve" }] },
+      payload,
+    );
+    assert.equal(normalized.decisions.length, 3);
+    assert.ok(normalized.decisions.every((d) => d.type === "approve"));
   });
 
   it("detects request_folder_access and extracts path", () => {

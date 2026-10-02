@@ -53,12 +53,14 @@ import { createProcessManagementTools } from "./process-manage.js";
 import { createVaultManagementTools } from "./vault-manage.js";
 import { createPlaywrightTools } from "./playwright-tools.js";
 import { createVisionTools } from "./vision-tools.js";
+import { createSpeechTools } from "./speech-tools.js";
 import { createDocumentTools } from "./document-tools.js";
 import { createGraphifyTools } from "./graphify-tools.js";
 import { createCodingTools } from "./coding-tools.js";
 import { loadMcpTools } from "./mcp-loader.js";
 import { createPostEditVerifyMiddleware } from "./post-edit-verify-middleware.js";
 import { createEditRetryMiddleware } from "./edit-retry-middleware.js";
+import { createEditDiffMiddleware } from "./edit-diff-middleware.js";
 import { createToolResultCompactMiddleware } from "./tool-result-compact-middleware.js";
 import { createOfficeBinaryWriteGuardMiddleware } from "./office-binary-write-guard.js";
 import { createWritePersistMiddleware } from "./write-persist-middleware.js";
@@ -296,7 +298,7 @@ export async function createTerminalAgent(
     model: process.env.AGENT_MODEL ?? "gpt-4o",
     embeddingModel: embedder.model,
     routerBaseUrl: process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1",
-    contextWindowTokens: process.env.CONTEXT_WINDOW_TOKENS ?? "256000",
+    contextWindowTokens: process.env.CONTEXT_WINDOW_TOKENS ?? "128000",
     workspaceRoot,
     profileHome,
     profileId,
@@ -390,6 +392,7 @@ export async function createTerminalAgent(
   const mcp = await loadMcpTools({
     roots: [profileHome, workspaceRoot],
     disabledMcpServers: capabilityFilter.disabledMcpServers,
+    profileHome,
   });
 
   const customTools = filterToolsByCapability(
@@ -405,6 +408,7 @@ export async function createTerminalAgent(
       ...createVaultManagementTools(profileHome),
       ...createPlaywrightTools(),
       ...createVisionTools(),
+      ...createSpeechTools(workspaceRoot),
       ...createDocumentTools(workspaceRoot),
       ...createGraphifyTools(workspaceRoot),
       ...desktopTools,
@@ -430,6 +434,7 @@ export async function createTerminalAgent(
   const botScope = createBotScopeController();
   const botScopeMw = createBotScopeMiddleware(botScope);
   const editRetryMw = createEditRetryMiddleware({ workspaceRoot });
+  const editDiffMw = createEditDiffMiddleware({ workspaceRoot });
   const postEditVerifyMw = createPostEditVerifyMiddleware({
     workspaceRoot,
   });
@@ -491,6 +496,7 @@ export async function createTerminalAgent(
         editRetryMw,
         postEditVerifyMw,
         toolCompactMw,
+        editDiffMw,
         multiTaskInjectMw,
       ],
       checkpointer: options.enableCheckpointer

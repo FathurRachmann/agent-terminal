@@ -36,4 +36,18 @@ Please analyze the attached image(s) and respond helpfully.`;
     assert.equal(parsed.text, "");
     assert.equal(parsed.attachments[0]?.basename, "a.png");
   });
+
+  it("extracts audio paths from AUDIO lines", () => {
+    const content = `[ATTACHMENTS]
+- AUDIO: \`tmp/global/uploads/meeting.m4a\` (audio/mp4, 100 bytes).
+[/ATTACHMENTS]
+
+[USER]
+tolong buatkan notulensinya`;
+    const parsed = parseUserMessageContent(content);
+    assert.equal(parsed.text, "tolong buatkan notulensinya");
+    assert.equal(parsed.attachments.length, 1);
+    assert.equal(parsed.attachments[0]?.kind, "audio");
+    assert.equal(parsed.attachments[0]?.basename, "meeting.m4a");
+  });
 });

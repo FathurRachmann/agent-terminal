@@ -5,6 +5,8 @@ type Props = {
   busy?: boolean;
   onApprove: () => void;
   onReject: () => void;
+  /** Persist tool/command to session allowlist then approve. */
+  onAllowAlways?: () => void;
   /** Optional override when interrupt carries a shell command. */
   command?: string | null;
   pid?: string | number | null;
@@ -61,6 +63,7 @@ export function ToolApprovalCard({
   busy,
   onApprove,
   onReject,
+  onAllowAlways,
   command: commandProp,
   pid,
   params: paramsProp,
@@ -157,7 +160,7 @@ export function ToolApprovalCard({
         <button
           type="button"
           disabled={busy}
-          onClick={onApprove}
+          onClick={onAllowAlways ?? onApprove}
           className="chat-btn-allow-always"
         >
           {busy ? "Working…" : "Allow Always for Session"}

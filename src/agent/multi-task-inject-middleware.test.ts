@@ -46,8 +46,8 @@ describe("multi-task-inject-middleware", () => {
 
     assert.ok(ToolMessage.isInstance(out));
     assert.match(String(out.content), /Parallel worker synthesis/);
-    assert.match(String(out.content), /ran=3/);
-    assert.equal(ran, 3);
+    assert.match(String(out.content), /ran=4/);
+    assert.equal(ran, 4);
   });
 
   it("skips duplicate fingerprint", async () => {

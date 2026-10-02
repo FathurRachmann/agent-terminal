@@ -7,6 +7,7 @@ import {
   type ActivityArtifact,
   type PreviewKind,
 } from "./activity-artifact.js";
+import { DiffMonacoViewer } from "./DiffMonacoViewer.js";
 
 export type CanvasTab = {
   id: string;
@@ -15,6 +16,10 @@ export type CanvasTab = {
   kind: PreviewKind;
   language: string;
   inlineContent?: string;
+  /** Monaco side-by-side original (pre-edit). */
+  diffOriginal?: string;
+  /** Monaco side-by-side modified (post-edit). */
+  diffModified?: string;
 };
 
 type PreviewPayload = {
@@ -244,6 +249,17 @@ export function ActivityCanvas({
         setPayload(null);
         return;
       }
+      // Diff tabs carry before/after inline — never fetch as a normal file.
+      if (active.kind === "diff") {
+        setPayload({
+          ok: true,
+          kind: "diff",
+          language: active.language,
+          text: active.inlineContent,
+        });
+        setLoading(false);
+        return;
+      }
       setLoading(true);
       setSheetIdx(0);
       try {
@@ -291,7 +307,15 @@ export function ActivityCanvas({
     return () => {
       cancelled = true;
     };
-  }, [active?.id, active?.path, active?.inlineContent, active?.kind, active?.language]);
+  }, [
+    active?.id,
+    active?.path,
+    active?.inlineContent,
+    active?.kind,
+    active?.language,
+    active?.diffOriginal,
+    active?.diffModified,
+  ]);
 
   if (!tabs.length) {
     return (
@@ -332,6 +356,9 @@ export function ActivityCanvas({
   const kind = (payload?.kind ?? active?.kind) as PreviewKind | undefined;
   const text = payload?.text ?? active?.inlineContent ?? "";
   const sheets = payload?.sheets ?? [];
+  const isLight =
+    typeof document !== "undefined" &&
+    document.documentElement.classList.contains("theme-light");
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -410,6 +437,15 @@ export function ActivityCanvas({
         )}
         {!loading && payload?.ok && payload.note && !text && !payload.html && !sheets.length && !payload.previewUrl && !payload.dataUrl && kind !== "binary" && (
           <div className="p-3 text-[10.5px] text-muted">{payload.note}</div>
+        )}
+        {!loading && payload?.ok && kind === "diff" && active && (
+          <DiffMonacoViewer
+            path={active.path}
+            language={active.language || "plaintext"}
+            original={active.diffOriginal ?? ""}
+            modified={active.diffModified ?? text}
+            theme={isLight ? "light" : "dark"}
+          />
         )}
         {!loading && payload?.ok && kind === "markdown" && text && (
           <div className="h-full overflow-auto p-3">
@@ -533,6 +569,7 @@ export function ActivityCanvas({
           kind !== "binary" &&
           kind !== "pdf" &&
           kind !== "media" &&
+          kind !== "diff" &&
           payload.note && (
             <div className="p-3 text-[10.5px] text-muted">{payload.note}</div>
           )}

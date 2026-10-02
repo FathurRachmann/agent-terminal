@@ -78,6 +78,19 @@ contextBridge.exposeInMainWorld("electronAgent", {
   listArtifacts: () => ipcRenderer.invoke("agent:listArtifacts"),
   setCapabilityEnabled: (id, enabled) =>
     ipcRenderer.invoke("agent:setCapabilityEnabled", { id, enabled }),
+  mcpConnectOAuth: (serverName) =>
+    ipcRenderer.invoke("agent:mcpConnectOAuth", { serverName }),
+  mcpSaveBearer: (serverName, token) =>
+    ipcRenderer.invoke("agent:mcpSaveBearer", { serverName, token }),
+  mcpSaveEnv: (serverName, env) =>
+    ipcRenderer.invoke("agent:mcpSaveEnv", { serverName, env }),
+  mcpDisconnect: (serverName) =>
+    ipcRenderer.invoke("agent:mcpDisconnect", { serverName }),
+  onCapabilitiesChanged: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on("capabilities:changed", listener);
+    return () => ipcRenderer.removeListener("capabilities:changed", listener);
+  },
   readWorkspacePreview: (filePath) =>
     ipcRenderer.invoke("agent:readWorkspacePreview", { path: filePath }),
   listWorkspaceDir: (dirPath) =>
@@ -91,9 +104,14 @@ contextBridge.exposeInMainWorld("electronAgent", {
     ipcRenderer.invoke("agent:revealWorkspaceFile", { path: filePath }),
   openWorkspaceFile: (filePath) =>
     ipcRenderer.invoke("agent:openWorkspaceFile", { path: filePath }),
-  resolveApproval: (approve, threadId) =>
+  resolveApproval: (approve, threadId, always) =>
     ipcRenderer.invoke("agent:resolveApproval", {
       approve: Boolean(approve),
+      threadId: threadId || undefined,
+      always: Boolean(always),
+    }),
+  pendingApproval: (threadId) =>
+    ipcRenderer.invoke("agent:pendingApproval", {
       threadId: threadId || undefined,
     }),
   onEvent: (callback) => {
@@ -121,6 +139,9 @@ contextBridge.exposeInMainWorld("electronAgent", {
   setDefaultProfile: (id) => ipcRenderer.invoke("profiles:setDefault", id),
   switchProfile: (id) => ipcRenderer.invoke("profiles:switch", id),
   listProjects: () => ipcRenderer.invoke("projects:list"),
+  graphifyStatus: () => ipcRenderer.invoke("project:graphifyStatus"),
+  graphifyUpdate: (payload) =>
+    ipcRenderer.invoke("project:graphifyUpdate", payload || {}),
   createProject: (payload) =>
     ipcRenderer.invoke("projects:create", payload || {}),
   updateProject: (payload) =>
@@ -223,4 +244,56 @@ contextBridge.exposeInMainWorld("electronAgent", {
     ipcRenderer.on("cron:changed", listener);
     return () => ipcRenderer.removeListener("cron:changed", listener);
   },
+
+  modelHubStatus: () => ipcRenderer.invoke("modelHub:status"),
+  modelHubEnsureSession: () => ipcRenderer.invoke("modelHub:ensureSession"),
+  modelHubOpenPage: (page) =>
+    ipcRenderer.invoke("modelHub:openPage", { page }),
+  modelHubShowEmbed: (page, bounds) =>
+    ipcRenderer.invoke("modelHub:showEmbed", { page, bounds }),
+  modelHubUpdateEmbedBounds: (bounds) =>
+    ipcRenderer.invoke("modelHub:updateEmbedBounds", bounds || {}),
+  modelHubHideEmbed: () => ipcRenderer.invoke("modelHub:hideEmbed"),
+  modelHubFetchProviders: () =>
+    ipcRenderer.invoke("modelHub:fetchProviders"),
+  modelHubFetchCombos: () => ipcRenderer.invoke("modelHub:fetchCombos"),
+  modelHubFetchUsage: (period) =>
+    ipcRenderer.invoke("modelHub:fetchUsage", { period }),
+  modelHubFetchUsageChart: (period) =>
+    ipcRenderer.invoke("modelHub:fetchUsageChart", { period }),
+  modelHubFetchModels: () => ipcRenderer.invoke("modelHub:fetchModels"),
+  modelHubCreateCombo: (payload) =>
+    ipcRenderer.invoke("modelHub:createCombo", payload || {}),
+  modelHubDeleteCombo: (id) =>
+    ipcRenderer.invoke("modelHub:deleteCombo", { id }),
+  modelHubUpdateCombo: (payload) =>
+    ipcRenderer.invoke("modelHub:updateCombo", payload || {}),
+  modelHubFetchSettings: () => ipcRenderer.invoke("modelHub:fetchSettings"),
+  modelHubPatchSettings: (payload) =>
+    ipcRenderer.invoke("modelHub:patchSettings", payload || {}),
+  modelHubConnectionQuota: (connectionId) =>
+    ipcRenderer.invoke("modelHub:connectionQuota", { connectionId }),
+  modelHubCatalog: () => ipcRenderer.invoke("modelHub:catalog"),
+  modelHubDeleteConnection: (id) =>
+    ipcRenderer.invoke("modelHub:deleteConnection", { id }),
+  modelHubUpdateConnection: (payload) =>
+    ipcRenderer.invoke("modelHub:updateConnection", payload || {}),
+  modelHubFetchDisabledModels: () =>
+    ipcRenderer.invoke("modelHub:fetchDisabledModels"),
+  modelHubSetModelEnabled: (payload) =>
+    ipcRenderer.invoke("modelHub:setModelEnabled", payload || {}),
+  modelHubTestConnection: (id) =>
+    ipcRenderer.invoke("modelHub:testConnection", { id }),
+  modelHubTestModel: (modelId) =>
+    ipcRenderer.invoke("modelHub:testModel", { modelId }),
+  modelHubTestProviderBatch: (providerId) =>
+    ipcRenderer.invoke("modelHub:testProviderBatch", { providerId }),
+  modelHubOAuthStart: (provider) =>
+    ipcRenderer.invoke("modelHub:oauthStart", { provider }),
+  modelHubOAuthPollCallback: (state) =>
+    ipcRenderer.invoke("modelHub:oauthPollCallback", { state }),
+  modelHubOAuthExchange: (payload) =>
+    ipcRenderer.invoke("modelHub:oauthExchange", payload || {}),
+  modelHubOAuthPollDevice: (payload) =>
+    ipcRenderer.invoke("modelHub:oauthPollDevice", payload || {}),
 });

@@ -24,6 +24,10 @@ describe("graphify-tools helpers", () => {
     try {
       assert.equal(hasGraphifyGraph(root), false);
       fs.mkdirSync(path.join(root, "graphify-out"), { recursive: true });
+      // 0-byte file is not considered ready
+      fs.writeFileSync(graphifyGraphPath(root), "");
+      assert.equal(hasGraphifyGraph(root), false);
+      // Non-empty file is ready
       fs.writeFileSync(graphifyGraphPath(root), "{\"nodes\":[]}");
       assert.equal(hasGraphifyGraph(root), true);
     } finally {

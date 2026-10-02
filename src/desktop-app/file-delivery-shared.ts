@@ -76,6 +76,11 @@ const MIME_BY_EXT: Record<string, string> = {
   mp3: "audio/mpeg",
   wav: "audio/wav",
   ogg: "audio/ogg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  flac: "audio/flac",
+  opus: "audio/ogg",
+  webm: "audio/webm",
   odt: "application/vnd.oasis.opendocument.text",
   ods: "application/vnd.oasis.opendocument.spreadsheet",
   rtf: "application/rtf",
@@ -117,6 +122,11 @@ export function isProseFalsePositivePath(filePath: string): boolean {
       base,
     )
   ) {
+    return true;
+  }
+
+  // DOM/Code-like false positives: document.doc, document.body, document.title, window.opener, etc.
+  if (/^(document|window|element|node|process|global|console|navigator|location)\.[a-z0-9]+$/i.test(base)) {
     return true;
   }
 

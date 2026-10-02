@@ -23,6 +23,8 @@ describe("inbound-attachments", () => {
     assert.equal(isImageMime("application/pdf"), false);
     assert.equal(attachmentKindFor("shot.PNG"), "image");
     assert.equal(attachmentKindFor("notes.pdf"), "file");
+    assert.equal(attachmentKindFor("clip.m4a"), "audio");
+    assert.equal(attachmentKindFor("wa-audio.ogg", "audio/ogg"), "audio");
   });
 
   it("saves buffer under tmp/uploads", () => {
@@ -133,6 +135,37 @@ describe("inbound-attachments", () => {
       assert.match(block, /Isi laporan TP Administrasi September/);
       assert.match(block, /read_document/);
     } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("marks audio attachments and surfaces transcript or STT error", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "in-att-"));
+    const prevKey = process.env.ROUTER_API_KEY;
+    delete process.env.ROUTER_API_KEY;
+    try {
+      const saved = saveAttachmentBuffer(root, {
+        buffer: Buffer.from("fake-ogg"),
+        fileName: "meeting.m4a",
+        mime: "audio/mp4",
+        source: "whatsapp",
+      });
+      assert.equal(saved.ok, true);
+      if (!saved.ok) return;
+      assert.equal(saved.attachment.kind, "audio");
+
+      const block = await buildAttachmentPromptBlock([saved.attachment]);
+      assert.match(block, /AUDIO:/);
+      assert.match(block, /speech_transcribe/);
+      assert.match(block, /transcript_error/);
+
+      const prompt = await composePromptWithAttachments("", [
+        saved.attachment,
+      ]);
+      assert.match(prompt, /transcribe\/summarize the attached audio/);
+    } finally {
+      if (prevKey === undefined) delete process.env.ROUTER_API_KEY;
+      else process.env.ROUTER_API_KEY = prevKey;
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

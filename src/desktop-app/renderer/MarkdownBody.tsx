@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlock, parseFenceMeta } from "./CodeBlock.js";
@@ -9,6 +9,15 @@ import {
 } from "./mermaid-markdown-repair.js";
 import { DbSchemaDiagram, looksLikeSqlSchema } from "./DbSchemaDiagram.js";
 import { looksLikeWorkspacePath } from "./activity-artifact.js";
+import {
+  attachFencePaths,
+  shouldRenderFenceAsDiff,
+} from "./markdown-code-policy.js";
+import { ProposedCodeDiff } from "./ProposedCodeDiff.js";
+import {
+  sectionDefaultOpen,
+  splitMarkdownByH2,
+} from "./md-sections.js";
 
 function buildMdComponents(
   onOpenPath?: (path: string) => void,
@@ -122,7 +131,23 @@ function buildMdComponents(
           />
         );
       }
-      return <CodeBlock code={text} language={language} filename={filename} />;
+      if (shouldRenderFenceAsDiff(language, text)) {
+        return (
+          <ProposedCodeDiff
+            code={text}
+            language={language}
+            filename={filename}
+            onOpenPath={onOpenPath}
+          />
+        );
+      }
+      return (
+        <CodeBlock
+          code={text}
+          language={language}
+          filename={filename || language || "code"}
+        />
+      );
     },
     blockquote: ({ children }) => (
       <blockquote className="mb-2.5 rounded-r-md border-l-[3px] border-accent/50 bg-surface-1 px-3 py-1.5 text-fg-dim">
@@ -145,23 +170,126 @@ function buildMdComponents(
   };
 }
 
+function MdChunkView({
+  markdown,
+  components,
+}: {
+  markdown: string;
+  components: React.ComponentProps<typeof ReactMarkdown>["components"];
+}) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      {markdown}
+    </ReactMarkdown>
+  );
+}
+
+function CollapsibleSection({
+  title,
+  markdown,
+  lineCount,
+  streaming,
+  components,
+}: {
+  title: string;
+  markdown: string;
+  lineCount: number;
+  streaming: boolean;
+  components: React.ComponentProps<typeof ReactMarkdown>["components"];
+}) {
+  const [open, setOpen] = useState(() =>
+    sectionDefaultOpen(lineCount, { streaming }),
+  );
+  const wasStreaming = useRef(streaming);
+  useEffect(() => {
+    if (wasStreaming.current && !streaming) {
+      setOpen(sectionDefaultOpen(lineCount));
+    }
+    wasStreaming.current = streaming;
+  }, [streaming, lineCount]);
+
+  return (
+    <div className={`md-section${open ? " is-open" : ""}`}>
+      <button
+        type="button"
+        className="md-section-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="md-section-chevron material-symbols-outlined" aria-hidden>
+          {open ? "expand_more" : "chevron_right"}
+        </span>
+        <span className="md-section-title">{title}</span>
+        {!open ? (
+          <span className="md-section-hint">Click to expand</span>
+        ) : null}
+      </button>
+      {open ? (
+        <div className="md-section-body">
+          <MdChunkView markdown={markdown} components={components} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function MarkdownBody({
   text,
   onOpenPath,
+  streaming = false,
+  collapsibleSections = true,
 }: {
   text: string;
   onOpenPath?: (path: string) => void;
+  /** Keep ## sections open while the answer is still streaming. */
+  streaming?: boolean;
+  /** Wrap ## headings in open/close panels (default on). */
+  collapsibleSections?: boolean;
 }) {
   const components = useMemo(
     () => buildMdComponents(onOpenPath),
     [onOpenPath],
   );
-  const repaired = useMemo(() => repairMermaidMarkdown(text), [text]);
+  const repaired = useMemo(
+    () => attachFencePaths(repairMermaidMarkdown(text)),
+    [text],
+  );
+  const chunks = useMemo(
+    () => (collapsibleSections ? splitMarkdownByH2(repaired) : null),
+    [repaired, collapsibleSections],
+  );
+
+  const hasSections = Boolean(
+    chunks && chunks.some((c) => c.type === "section"),
+  );
+
   return (
-    <div className="md-body break-words text-xs leading-relaxed text-fg">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-        {repaired}
-      </ReactMarkdown>
+    <div className="md-body select-text break-words text-xs leading-relaxed text-fg">
+      {hasSections && chunks ? (
+        chunks.map((chunk, i) => {
+          if (chunk.type === "prose") {
+            return (
+              <MdChunkView
+                key={`p-${i}`}
+                markdown={chunk.markdown}
+                components={components}
+              />
+            );
+          }
+          return (
+            <CollapsibleSection
+              key={`s-${i}-${chunk.title}`}
+              title={chunk.title}
+              markdown={chunk.markdown}
+              lineCount={chunk.lineCount}
+              streaming={streaming}
+              components={components}
+            />
+          );
+        })
+      ) : (
+        <MdChunkView markdown={repaired} components={components} />
+      )}
     </div>
   );
 }

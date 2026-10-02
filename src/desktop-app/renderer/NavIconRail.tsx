@@ -7,6 +7,7 @@ export type NavRailId =
   | "artifacts"
   | "kanban"
   | "messaging"
+  | "hub-live"
   | "workspaces"
   | "settings"
   | "profiles";
@@ -107,6 +108,13 @@ export function NavIconRail({
           <Ms name="forum" />
         </RailBtn>
         <RailBtn
+          tip="Model Hub Live"
+          active={active === "hub-live"}
+          onClick={() => onSelect("hub-live")}
+        >
+          <Ms name="hub" />
+        </RailBtn>
+        <RailBtn
           tip="Workspaces Directory"
           active={active === "workspaces"}
           onClick={() => {
@@ -114,7 +122,7 @@ export function NavIconRail({
             onSelect("workspaces");
           }}
         >
-          <Ms name="hub" />
+          <Ms name="account_tree" />
         </RailBtn>
       </nav>
 

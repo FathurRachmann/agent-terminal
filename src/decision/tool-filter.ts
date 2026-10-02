@@ -30,6 +30,7 @@ export const TOOL_CATEGORY_MAP: Record<string, string[]> = {
   ],
   office: ["read_document"],
   vision: ["vision_analyze"],
+  speech: ["speech_transcribe"],
   vault: ["vault_store", "vault_list", "vault_get", "vault_delete"],
 };
 
@@ -81,6 +82,11 @@ export async function decideExtraDisabledTools(options: {
         instructions:
           "Does the user need image/screenshot visual analysis?",
       },
+      needs_speech: {
+        type: "noul",
+        instructions:
+          "Does the user need speech-to-text / audio transcription of a voice memo or recording?",
+      },
       needs_vault: {
         type: "noul",
         instructions:
@@ -97,6 +103,7 @@ export async function decideExtraDisabledTools(options: {
     ["browser", "needs_browser"],
     ["office", "needs_office"],
     ["vision", "needs_vision"],
+    ["speech", "needs_speech"],
     ["vault", "needs_vault"],
   ];
 

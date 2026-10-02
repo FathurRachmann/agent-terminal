@@ -112,6 +112,7 @@ export type WorkspaceIpcContext = {
   loadStoredAutoApprove: () => boolean;
   requestApproval: (
     threadId: string,
+    interrupt?: unknown,
   ) => Promise<{ decisions: Array<{ type: "approve" | "reject" }> }>;
   /** Reject/clear any pending HITL for a thread. */
   clearPendingApproval: (threadId: string) => void;

@@ -16,6 +16,9 @@ type Props = {
   profileId: string;
   profiles?: string[];
   phase: AgentPhase;
+  phaseDetail?: string | null;
+  liveProgress?: string | null;
+  liveProgressFraction?: number | null;
   backgroundBusyCount?: number;
   statusError?: string | null;
   learnedRules?: LearnedRule[];
@@ -48,6 +51,9 @@ export function AppFooter({
   profileId,
   profiles = [],
   phase,
+  phaseDetail = null,
+  liveProgress = null,
+  liveProgressFraction = null,
   backgroundBusyCount = 0,
   statusError = null,
   learnedRules = [],
@@ -69,8 +75,12 @@ export function AppFooter({
   const label = status?.label ?? "Gateway stopped";
   const ready = status?.phase === "ready";
   const processColor = phaseColor(phase);
+  const progressText = (liveProgress || "").trim();
+  const detailText = (phaseDetail || "").trim();
   const phaseTip = [
     `Live phase: ${phase}`,
+    detailText || null,
+    progressText || null,
     backgroundBusyCount > 0
       ? backgroundBusyCount === 1
         ? "1 background turn still running"
@@ -149,23 +159,44 @@ export function AppFooter({
 
         {showFooterPhase ? (
           <div
-            className="flex min-w-0 items-center gap-1.5 font-mono text-[10px] tracking-wider uppercase"
+            className="flex min-w-0 max-w-[55vw] items-center gap-1.5 font-mono text-[10px] tracking-wider uppercase"
             data-tip={phaseTip}
             role="status"
             aria-live="polite"
           >
             <span className="text-fg-dim">PHASE:</span>
             <span
-              className="truncate font-bold"
+              className="shrink-0 font-bold"
               style={{ color: processColor }}
             >
               {phase.replace(/_/g, "_").toUpperCase()}
             </span>
+            {progressText ? (
+              <>
+                <span className="text-fg-dim">· JOB:</span>
+                <span className="truncate font-bold text-accent normal-case tracking-normal">
+                  {progressText}
+                </span>
+                {typeof liveProgressFraction === "number" &&
+                liveProgressFraction >= 0 ? (
+                  <span className="shrink-0 text-muted normal-case">
+                    {Math.round(liveProgressFraction * 100)}%
+                  </span>
+                ) : null}
+              </>
+            ) : detailText ? (
+              <>
+                <span className="text-fg-dim">·</span>
+                <span className="truncate text-fg-dim normal-case tracking-normal">
+                  {detailText}
+                </span>
+              </>
+            ) : null}
             {backgroundBusyCount > 0 ? (
-              <span className="text-warn">· BG {backgroundBusyCount}</span>
+              <span className="shrink-0 text-warn">· BG {backgroundBusyCount}</span>
             ) : null}
             {statusError ? (
-              <span className="text-danger">· ERROR</span>
+              <span className="shrink-0 text-danger">· ERROR</span>
             ) : null}
           </div>
         ) : null}

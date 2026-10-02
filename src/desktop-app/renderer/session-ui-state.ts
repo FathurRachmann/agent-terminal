@@ -30,7 +30,7 @@ export type ChatItem =
         path: string;
         absPath?: string;
         basename: string;
-        kind: "image" | "file";
+        kind: "image" | "audio" | "file";
         mime?: string;
         size?: number;
         label?: string;
@@ -47,6 +47,15 @@ export type ChatItem =
       basename: string;
       at: string;
       note?: string;
+    }
+  | {
+      id: string;
+      kind: "file_diff";
+      path: string;
+      language: string;
+      before: string;
+      after: string;
+      at: string;
     }
   | {
       id: string;
@@ -143,6 +152,17 @@ export function reduceSessionEvent(
         toolApprovalDetail:
           String(event.detail || "").trim() || "Tool approval required",
       };
+    } else if (
+      event.phase === "thinking" ||
+      event.phase === "tool" ||
+      event.phase === "pty" ||
+      event.phase === "reasoning"
+    ) {
+      next = {
+        ...next,
+        toolApprovalPending: false,
+        toolApprovalDetail: null,
+      };
     }
     if (event.phase === "done" || event.phase === "error") {
       // Keep plan-gate UI across a soft "done" after task_plan — the model often
@@ -232,6 +252,24 @@ export function reduceSessionEvent(
 
   if (event.type === "warning" && /retrying/i.test(event.message)) {
     next = { ...next, draftAnswer: "" };
+  }
+
+  if (event.type === "warning") {
+    const warnMsg = String(event.message || "");
+    if (warnMsg.startsWith("__wa_plan__\n")) {
+      const planText = warnMsg.slice("__wa_plan__\n".length).trim();
+      if (planText) {
+        next = {
+          ...next,
+          items: [
+            ...next.items,
+            { id, kind: "assistant", text: planText, at },
+          ],
+          pendingPlanMarkdown: planText,
+          planApprovalPending: true,
+        };
+      }
+    }
   }
 
   if (event.type === "error") {

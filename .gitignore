@@ -46,3 +46,16 @@ tmp
 
 # Python venv (Laya decision bridge)
 .venv/
+
+# Model hub external open-sse credentials/source
+src/model-hub/open-sse/
+
+
+# Model Hub local DB / runtime (created under profile; also ignore accidental local dirs)
+src/model-hub/**/node_modules/
+
+
+# Vendored Model Hub runtime deps (keep source + LICENSE; install via npm in vendor/model-hub)
+vendor/model-hub/node_modules/
+vendor/model-hub/app/node_modules/
+vendor/model-hub/app/logs/

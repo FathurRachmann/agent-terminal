@@ -194,9 +194,18 @@ async function downloadInboundMedia(
       mime: meta.mime,
       source: "whatsapp",
     });
-    if (!saved.ok) return null;
+    if (!saved.ok) {
+      console.warn(
+        `[whatsapp] media save failed (${meta.type}): ${saved.error}`,
+      );
+      return null;
+    }
     return applyKind(saved.attachment);
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[whatsapp] media stream download failed (${meta.type}):`,
+      err instanceof Error ? err.message : err,
+    );
     /* fall through to buffer path for older media */
   }
 
@@ -212,16 +221,28 @@ async function downloadInboundMedia(
     } catch {
       buffer = (await downloadMediaMessage(msg, "buffer", {})) as Buffer;
     }
-    if (!buffer?.length) return null;
+    if (!buffer?.length) {
+      console.warn(`[whatsapp] media buffer empty (${meta.type})`);
+      return null;
+    }
     const saved = saveAttachmentBuffer(saveRoot, {
       buffer,
       fileName,
       mime: meta.mime,
       source: "whatsapp",
     });
-    if (!saved.ok) return null;
+    if (!saved.ok) {
+      console.warn(
+        `[whatsapp] media buffer save failed (${meta.type}): ${saved.error}`,
+      );
+      return null;
+    }
     return applyKind(saved.attachment);
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[whatsapp] media download failed (${meta.type}):`,
+      err instanceof Error ? err.message : err,
+    );
     return null;
   }
 }
@@ -639,9 +660,11 @@ export class WhatsAppBridge {
     const text = extractText(msg);
     const sock = this.sock;
     const attachments: InboundAttachment[] = [];
+    let mediaDownloadFailed = false;
     if (sock && mediaMetaFromMessage(msg)) {
       const saved = await downloadInboundMedia(msg, sock, this.mediaSaveRoot);
       if (saved) attachments.push(saved);
+      else mediaDownloadFailed = true;
     }
 
     if (!text && attachments.length === 0) {
@@ -650,7 +673,12 @@ export class WhatsAppBridge {
       if (type) {
         this.emit({
           type: "ignored",
-          payload: { jid, reason: `Unsupported message type: ${type}` },
+          payload: {
+            jid,
+            reason: mediaDownloadFailed
+              ? `Media download failed for ${type}`
+              : `Unsupported message type: ${type}`,
+          },
         });
       }
       return;
@@ -683,7 +711,10 @@ export class WhatsAppBridge {
         identityJid,
         candidates,
         pushName: msg.pushName || undefined,
-        text,
+        text:
+          mediaDownloadFailed && attachments.length === 0
+            ? `${text}${text ? "\n\n" : ""}[system: WhatsApp media download failed — ask the user to resend a smaller voice note or attach via desktop chat.]`
+            : text,
         messageId: msg.key.id || undefined,
         attachments: attachments.length ? attachments : undefined,
       },

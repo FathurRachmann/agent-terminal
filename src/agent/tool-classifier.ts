@@ -126,7 +126,7 @@ export async function classifyToolCall(
     model: resolveClassifierModel(),
     apiKey,
     configuration: {
-      baseURL: process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1",
+      baseURL: process.env.ROUTER_BASE_URL ?? "http://127.0.0.1:27128/v1",
     },
     temperature: 0,
     streaming: false,

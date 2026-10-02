@@ -3,7 +3,7 @@ export type UserBubbleAttachment = {
   path: string;
   absPath?: string;
   basename: string;
-  kind: "image" | "file";
+  kind: "image" | "audio" | "file";
   mime?: string;
   size?: number;
   label?: string;
@@ -14,6 +14,7 @@ const ATTACHMENTS_BLOCK_RE =
   /\[ATTACHMENTS\][\s\S]*?\[\/ATTACHMENTS\]\s*/g;
 const USER_TAG_RE = /^\[USER\]\s*/m;
 const IMAGE_LINE_RE = /- IMAGE:\s*`([^`]+)`/g;
+const AUDIO_LINE_RE = /- AUDIO:\s*`([^`]+)`/g;
 const FILE_LINE_RE = /- FILE:\s*`([^`]+)`/g;
 
 function basenameOf(p: string): string {
@@ -22,7 +23,7 @@ function basenameOf(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
-function kindFromPath(filePath: string): "image" | "file" {
+function kindFromPath(filePath: string): "image" | "audio" | "file" {
   const ext = basenameOf(filePath).split(".").pop()?.toLowerCase() || "";
   if (
     ["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff"].includes(
@@ -30,6 +31,11 @@ function kindFromPath(filePath: string): "image" | "file" {
     )
   ) {
     return "image";
+  }
+  if (
+    ["m4a", "mp3", "wav", "ogg", "oga", "opus", "aac", "flac", "webm"].includes(ext)
+  ) {
+    return "audio";
   }
   return "file";
 }
@@ -46,7 +52,7 @@ export function parseUserMessageContent(content: string): {
   const attachments: UserBubbleAttachment[] = [];
   const seen = new Set<string>();
 
-  const push = (filePath: string, kindHint?: "image" | "file") => {
+  const push = (filePath: string, kindHint?: "image" | "audio" | "file") => {
     const path = filePath.trim();
     if (!path || seen.has(path)) return;
     seen.add(path);
@@ -60,6 +66,8 @@ export function parseUserMessageContent(content: string): {
   let m: RegExpExecArray | null;
   IMAGE_LINE_RE.lastIndex = 0;
   while ((m = IMAGE_LINE_RE.exec(raw))) push(m[1]!, "image");
+  AUDIO_LINE_RE.lastIndex = 0;
+  while ((m = AUDIO_LINE_RE.exec(raw))) push(m[1]!, "audio");
   FILE_LINE_RE.lastIndex = 0;
   while ((m = FILE_LINE_RE.exec(raw))) push(m[1]!, "file");
 
@@ -71,7 +79,9 @@ export function parseUserMessageContent(content: string): {
   // Fallback placeholder when user sent only attachments with no typed message
   if (
     !text ||
-    /^Please (analyze the attached image|review the attached file)/i.test(text)
+    /^Please (analyze the attached image|review the attached file|transcribe\/summarize the attached audio)/i.test(
+      text,
+    )
   ) {
     text = attachments.length ? "" : raw.trim();
   }

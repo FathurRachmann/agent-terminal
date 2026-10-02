@@ -1,5 +1,5 @@
 /**
- * OpenAI-compatible embeddings via 9router (semantic long-term memory).
+ * OpenAI-compatible embeddings via Model Hub (semantic long-term memory).
  */
 export type EmbeddingClient = {
   embed(texts: string[]): Promise<number[][]>;
@@ -22,7 +22,7 @@ export function createEmbeddingClient(): EmbeddingClient {
     throw new Error("ROUTER_API_KEY is not set");
   }
   const baseURL = (
-    process.env.ROUTER_BASE_URL ?? "https://api.9router.com/v1"
+    process.env.ROUTER_BASE_URL ?? "http://127.0.0.1:27128/v1"
   ).replace(/\/$/, "");
   const model =
     process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";

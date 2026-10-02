@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolveMcpAuthInfo, type McpServerAuthConfig } from "./mcp-auth.js";
 
 export type CapabilityKind = "skills" | "tools" | "mcp";
 
@@ -13,6 +14,13 @@ export type CapabilityItem = {
   enabled: boolean;
   detailMarkdown: string;
   meta?: Record<string, string | number | boolean>;
+  /** MCP auth — only set for kind === "mcp". */
+  authStatus?: "none" | "required" | "connected" | "expired";
+  authMode?: "none" | "oauth" | "bearer" | "env";
+  authEnvKeys?: string[];
+  canOAuth?: boolean;
+  canBearer?: boolean;
+  canEnv?: boolean;
 };
 
 export type CapabilitiesPrefs = {
@@ -279,6 +287,14 @@ const CUSTOM_TOOLS: Array<{
     category: "Vision",
     description: "Multimodal analysis of a local image/screenshot.",
     detail: "Describe UI state, errors, or visual diffs.",
+  },
+  {
+    id: "tool:speech_transcribe",
+    name: "speech_transcribe",
+    category: "Speech",
+    description: "Transcribe a local audio/voice file to text.",
+    detail:
+      "WhatsApp voice memos and meeting recordings (m4a/mp3/ogg/wav). Large files are compressed/split when ffmpeg is available.",
   },
   {
     id: "tool:read_document",
@@ -607,7 +623,13 @@ function listMcp(workspaceRoot: string, disabled: Set<string>): CapabilityItem[]
       const raw = JSON.parse(fs.readFileSync(file, "utf8")) as {
         mcpServers?: Record<
           string,
-          { command?: string; args?: string[]; url?: string; description?: string }
+          {
+            command?: string;
+            args?: string[];
+            url?: string;
+            description?: string;
+            auth?: McpServerAuthConfig;
+          }
         >;
       };
       const servers = raw.mcpServers ?? {};
@@ -619,22 +641,48 @@ function listMcp(workspaceRoot: string, disabled: Set<string>): CapabilityItem[]
             cfg.command ||
             cfg.url ||
             "Configured MCP server";
+          const authInfo = resolveMcpAuthInfo(workspaceRoot, name, cfg);
+          const badge =
+            authInfo.status === "connected"
+              ? "connected"
+              : authInfo.status === "required" || authInfo.status === "expired"
+                ? "needs login"
+                : "configured";
+          const authLines =
+            authInfo.mode === "none"
+              ? ["- **Auth**: not required"]
+              : [
+                  `- **Auth**: ${authInfo.status} (${authInfo.mode})`,
+                  authInfo.envKeys.length
+                    ? `- **Env keys**: ${authInfo.envKeys.join(", ")}`
+                    : "",
+                  "- Use **Connect / Paste token / Env** in the panel to sign in. Credentials are stored encrypted in `.agent/mcp-auth.enc`.",
+                ];
           return {
             id,
             kind: "mcp" as const,
             name,
             category: "MCP",
             description,
-            badge: "configured",
+            badge,
             enabled: !disabled.has(id),
+            authStatus: authInfo.status,
+            authMode: authInfo.mode,
+            authEnvKeys: authInfo.envKeys,
+            canOAuth: authInfo.canOAuth,
+            canBearer: authInfo.canBearer,
+            canEnv: authInfo.canEnv,
             detailMarkdown: [
               `# ${name}`,
               "",
               description,
               "",
               `- **Config**: \`${path.relative(workspaceRoot, file)}\``,
-              cfg.command ? `- **Command**: \`${cfg.command} ${(cfg.args ?? []).join(" ")}\`` : "",
+              cfg.command
+                ? `- **Command**: \`${cfg.command} ${(cfg.args ?? []).join(" ")}\``
+                : "",
               cfg.url ? `- **URL**: ${cfg.url}` : "",
+              ...authLines,
               "",
               "MCP tools from this server are loaded into the agent at runtime (names prefixed `mcp_<server>_`). Disable via Capabilities if unused.",
             ]

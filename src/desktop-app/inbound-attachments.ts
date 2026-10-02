@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { mimeForPath, WA_DOCUMENT_MAX_BYTES } from "./file-delivery-shared.js";
+import {
+  isAudioMime,
+  isAudioPath,
+  transcribeAudioFile,
+} from "../agent/speech-transcribe.js";
 
 export const INBOUND_UPLOAD_MAX_BYTES = WA_DOCUMENT_MAX_BYTES;
 
@@ -29,7 +34,7 @@ const IMAGE_MIMES = new Set([
   "image/heif",
 ]);
 
-export type AttachmentKind = "image" | "file";
+export type AttachmentKind = "image" | "audio" | "file";
 export type AttachmentSource = "desktop" | "whatsapp";
 
 export type InboundAttachment = {
@@ -71,6 +76,7 @@ export function attachmentKindFor(
   mime?: string | null,
 ): AttachmentKind {
   if (isImageMime(mime) || isImagePath(fileName)) return "image";
+  if (isAudioMime(mime) || isAudioPath(fileName)) return "audio";
   return "file";
 }
 
@@ -312,7 +318,8 @@ export async function buildAttachmentPromptBlock(
     "[ATTACHMENTS]",
     "The user attached the following file(s). They are saved under tmp/<scope>/uploads/.",
     "For .docx/.xlsx use read_document (NOT read_file — those formats are binary ZIP).",
-    "Extracted text below (when available) is authoritative — base your answer on it, do not invent from older files.",
+    "Audio/voice is auto-transcribed when STT is available; use speech_transcribe only if you need a re-run or a different language hint.",
+    "Extracted text / transcript below (when available) is authoritative — base your answer on it, do not invent from older files.",
   ];
   for (const a of attachments) {
     const where = a.relPath || a.absPath;
@@ -320,6 +327,26 @@ export async function buildAttachmentPromptBlock(
       lines.push(
         `- IMAGE: \`${where}\` (${a.mime}, ${a.size} bytes). Call vision_analyze on this path before answering questions about what is in the image.`,
       );
+      continue;
+    }
+    if (a.kind === "audio") {
+      lines.push(
+        `- AUDIO: \`${where}\` (${a.mime || "audio/*"}, ${a.size} bytes). Transcript below is preferred; call speech_transcribe on this path only if missing or wrong language.`,
+      );
+      const transcribed = await transcribeAudioFile(a.absPath);
+      if (transcribed.ok) {
+        const extra =
+          transcribed.chunks && transcribed.chunks > 1
+            ? ` chunks="${transcribed.chunks}"`
+            : "";
+        lines.push(
+          `  <transcript model="${transcribed.model}"${transcribed.truncated ? ' truncated="true"' : ""}${extra}>`,
+        );
+        lines.push(transcribed.text);
+        lines.push("  </transcript>");
+      } else {
+        lines.push(`  <transcript_error>${transcribed.error}</transcript_error>`);
+      }
       continue;
     }
     lines.push(
@@ -351,9 +378,11 @@ export async function composePromptWithAttachments(
   }
   const body =
     text ||
-    (attachments.some((a) => a.kind === "image")
-      ? "Please analyze the attached image(s) and respond helpfully."
-      : "Please review the attached file(s) and respond helpfully.");
+    (attachments.some((a) => a.kind === "audio")
+      ? "Please transcribe/summarize the attached audio and respond helpfully (e.g. notulensi / poin-poin)."
+      : attachments.some((a) => a.kind === "image")
+        ? "Please analyze the attached image(s) and respond helpfully."
+        : "Please review the attached file(s) and respond helpfully.");
   return `${block}\n\n[USER]\n${body}`;
 }
 
@@ -494,19 +523,25 @@ export function waMediaFileName(
               ? "pdf"
               : m.includes("ogg") || m.includes("opus")
                 ? "ogg"
-                : m.includes("mp4")
-                  ? "mp4"
-                  : m.includes("mpeg") || m.includes("mp3")
-                    ? "mp3"
-                    : type === "stickerMessage"
-                      ? "webp"
-                      : type === "imageMessage"
-                        ? "jpg"
-                        : type === "videoMessage"
-                          ? "mp4"
-                          : type === "audioMessage"
-                            ? "ogg"
-                            : "bin";
+                : m.includes("m4a") || (m.includes("audio") && m.includes("mp4"))
+                  ? "m4a"
+                  : m.includes("mp4")
+                    ? "mp4"
+                    : m.includes("mpeg") || m.includes("mp3")
+                      ? "mp3"
+                      : m.includes("wav")
+                        ? "wav"
+                        : m.includes("aac")
+                          ? "aac"
+                          : type === "stickerMessage"
+                            ? "webp"
+                            : type === "imageMessage"
+                              ? "jpg"
+                              : type === "videoMessage"
+                                ? "mp4"
+                                : type === "audioMessage"
+                                  ? "ogg"
+                                  : "bin";
   const stamp = Date.now();
   const prefix =
     type === "imageMessage"

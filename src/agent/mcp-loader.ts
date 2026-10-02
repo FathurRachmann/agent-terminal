@@ -3,6 +3,10 @@ import path from "node:path";
 import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { filterMcpServers } from "./capabilities-catalog.js";
+import {
+  applyMcpAuthToConnection,
+  type McpServerAuthConfig,
+} from "./mcp-auth.js";
 
 export type McpServerConfig = {
   command?: string;
@@ -14,6 +18,7 @@ export type McpServerConfig = {
   headers?: Record<string, string>;
   description?: string;
   cwd?: string;
+  auth?: McpServerAuthConfig;
 };
 
 export type LoadedMcp = {
@@ -80,6 +85,17 @@ function toConnection(
   return null;
 }
 
+async function toAuthedConnection(
+  profileHome: string | undefined,
+  name: string,
+  cfg: McpServerConfig,
+): Promise<Record<string, unknown> | null> {
+  const base = toConnection(name, cfg);
+  if (!base) return null;
+  if (!profileHome) return base;
+  return applyMcpAuthToConnection(profileHome, name, cfg, base);
+}
+
 /**
  * Connect enabled MCP servers from `.agent/mcp.json` / `.mcp.json` and
  * return LangChain tools. Failures on individual servers are skipped so the
@@ -88,6 +104,8 @@ function toConnection(
 export async function loadMcpTools(options: {
   roots: string[];
   disabledMcpServers?: Set<string>;
+  /** Profile home used to load encrypted MCP credentials. */
+  profileHome?: string;
 }): Promise<LoadedMcp> {
   const empty: LoadedMcp = {
     tools: [],
@@ -103,9 +121,10 @@ export async function loadMcpTools(options: {
     options.disabledMcpServers ?? new Set(),
   );
 
+  const profileHome = options.profileHome ?? options.roots[0];
   const mcpServers: Record<string, Record<string, unknown>> = {};
   for (const [name, cfg] of Object.entries(enabled)) {
-    const conn = toConnection(name, cfg);
+    const conn = await toAuthedConnection(profileHome, name, cfg);
     if (conn) mcpServers[name] = conn;
   }
 

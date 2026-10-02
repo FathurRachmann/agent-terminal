@@ -2,6 +2,7 @@
  * Resolve approve/reject for a tool interrupt under Run Modes + classifier.
  */
 import {
+  buildApprovalDecisions,
   extractInterruptActionNames,
   isFolderAccessInterrupt,
   isPlanApprovalInterrupt,
@@ -105,7 +106,7 @@ export async function tryAutoResolveRunModeInterrupt(options: {
   if (isFolderAccessInterrupt(payload)) {
     if (privacyOn === false) {
       return {
-        decisions: [{ type: "approve" }],
+        decisions: buildApprovalDecisions("approve", payload),
         source: "privacy-off",
       };
     }
@@ -117,7 +118,7 @@ export async function tryAutoResolveRunModeInterrupt(options: {
 
   if (effectiveMode === "run-everything") {
     return {
-      decisions: [{ type: "approve" }],
+      decisions: buildApprovalDecisions("approve", payload),
       source: "run-everything",
     };
   }
@@ -130,7 +131,7 @@ export async function tryAutoResolveRunModeInterrupt(options: {
 
   if (matchesToolAllowlist(action.name, action.args, allowlist)) {
     return {
-      decisions: [{ type: "approve" }],
+      decisions: buildApprovalDecisions("approve", payload),
       source: "allowlist",
     };
   }
@@ -152,14 +153,14 @@ export async function tryAutoResolveRunModeInterrupt(options: {
   });
   if (verdict === "allow") {
     return {
-      decisions: [{ type: "approve" }],
+      decisions: buildApprovalDecisions("approve", payload),
       source: "classifier",
       verdict,
     };
   }
   if (verdict === "deny") {
     return {
-      decisions: [{ type: "reject" }],
+      decisions: buildApprovalDecisions("reject", payload),
       source: "classifier",
       verdict,
     };

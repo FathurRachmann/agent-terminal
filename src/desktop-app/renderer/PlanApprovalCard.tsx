@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { MarkdownBody } from "./MarkdownBody.js";
 
 export type PlanStep = {
@@ -80,6 +81,9 @@ export function PlanApprovalCard({
 }: Props) {
   const steps = parsePlanSteps(markdown);
   const subtitle = planSubtitle(markdown, steps);
+  const longBody =
+    steps.length > 4 || String(markdown || "").split("\n").length > 12;
+  const [bodyOpen, setBodyOpen] = useState(!longBody);
 
   return (
     <div className="chat-plan">
@@ -95,6 +99,21 @@ export function PlanApprovalCard({
         </div>
         <span className="chat-plan-halt">HALTED FOR SIGN-OFF</span>
       </div>
+      <button
+        type="button"
+        className="chat-plan-body-toggle"
+        aria-expanded={bodyOpen}
+        onClick={() => setBodyOpen((v) => !v)}
+      >
+        <span className="material-symbols-outlined text-[16px]" aria-hidden>
+          {bodyOpen ? "expand_more" : "chevron_right"}
+        </span>
+        {bodyOpen ? "Hide plan details" : "Show plan details"}
+        {steps.length > 0 ? (
+          <span className="chat-plan-body-count">{steps.length} steps</span>
+        ) : null}
+      </button>
+      {bodyOpen ? (
       <div className="chat-plan-body">
         {steps.length > 0 ? (
           <ul className="chat-plan-steps">
@@ -122,6 +141,7 @@ export function PlanApprovalCard({
           <MarkdownBody text={markdown || "_Plan saved. Approve to continue._"} />
         )}
       </div>
+      ) : null}
       <div className="chat-plan-actions">
         {onOpenCanvas ? (
           <button

@@ -1,9 +1,10 @@
 {
   "mcpServers": {
-    "tradingview": {
+    "ccxt": {
       "command": "npx",
-      "args": ["-y", "tradingview-mcp-server@0.7.1"],
-      "description": "Unofficial TradingView screener API — stocks, forex, crypto, ETFs"
+      "args": ["-y", "ccxt-mcp"],
+      "description": "CCXT MCP — 100+ crypto exchanges: market data, balances, and trading (sandbox/live via local config)",
+      "auth": { "type": "none" }
     }
   }
 }

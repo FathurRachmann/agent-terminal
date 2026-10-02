@@ -19,6 +19,8 @@ import {
   startKanbanDispatcher,
   stopKanbanServices,
 } from "./kanban-service.js";
+import { startCapabilitiesWatch } from "./capabilities-watch.js";
+import type { CapabilitiesWatchHandle } from "./capabilities-watch.js";
 import { createRouterModel } from "../model/9router.js";
 import { createDeepAgent } from "deepagents";
 import { FilesystemBackend } from "deepagents";
@@ -68,7 +70,10 @@ import {
   isWorkspaceThreadId,
   registerWorkspaceIpc,
 } from "./workspace-service.js";
-import { softAllowProjectFolders } from "./soft-allow-project.js";
+import {
+  projectFoldersOf,
+  softAllowProjectFolders,
+} from "./soft-allow-project.js";
 import {
   buildDeliverySearchRoots,
   sessionWorkspaceFields,
@@ -99,7 +104,12 @@ import {
   sanitizeWhatsAppOutboundText,
   WA_OUTBOUND_HYGIENE_INSTRUCTION,
 } from "./whatsapp-outbound.js";
-import { extractInterruptActionNames, isPlanApprovalInterrupt } from "../agent/interrupt-utils.js";
+import { extractInterruptActionNames, extractToolApprovalMeta, formatToolApprovalDetail, isPlanApprovalInterrupt, buildApprovalDecisions } from "../agent/interrupt-utils.js";
+import {
+  buildWhatsAppPlanApprovalMessage,
+  parseWhatsAppPlanReply,
+  WA_PLAN_CHAT_PREFIX,
+} from "./whatsapp-plan-approval.js";
 import { loadFolderAllowlist } from "../agent/folder-allowlist.js";
 import { userHomeRoot, usersScopeRoot } from "../agent/default-sandbox-roots.js";
 import {
@@ -120,6 +130,10 @@ import {
   decodeAgentPreviewUrl,
 } from "./preview-protocol.js";
 import { installMainProcessCrashGuards } from "./main-process-guards.js";
+import {
+  extractWritePath,
+  JobProgressWatcher,
+} from "./job-progress-watch.js";
 
 // Catch undici/fetch aborts before Electron paints a fatal dialog.
 installMainProcessCrashGuards();
@@ -143,6 +157,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let mainWindow: BrowserWindow | null = null;
 let workspacesWindow: BrowserWindow | null = null;
+let capabilitiesWatch: CapabilitiesWatchHandle | null = null;
 let agentBundle: AgentBundle | null = null;
 let agentBootError: string | null = null;
 /** True while createTerminalAgent is in flight (window may already be open). */
@@ -162,8 +177,79 @@ let activeProjectId: string | null = null;
 const localGateway = new LocalGatewayController();
 const pendingApprovals = new Map<
   string,
-  (decision: { decisions: Array<{ type: "approve" | "reject" }> }) => void
+  {
+    resolve: (decision: {
+      decisions: Array<{ type: "approve" | "reject" }>;
+    }) => void;
+    detail: string;
+    interrupt?: unknown;
+  }
 >();
+
+/** Session-scoped extras from "Allow Always for Session" (not persisted). */
+const sessionToolAllowlist = new Set<string>();
+
+function mergeLiveAllowlist(base: readonly string[] = []): string[] {
+  return [...new Set([...base, ...sessionToolAllowlist])];
+}
+
+function rememberSessionAllowFromInterrupt(interrupt: unknown): string[] {
+  const added: string[] = [];
+  const names = extractInterruptActionNames(interrupt);
+  for (const name of names) {
+    if (!name) continue;
+    const key = name === "execute" ? "tool:execute" : `tool:${name}`;
+    if (!sessionToolAllowlist.has(key) && !sessionToolAllowlist.has(name)) {
+      sessionToolAllowlist.add(key);
+      added.push(key);
+    }
+    // For shell, also remember command prefix (first token) when present.
+    if (name === "execute") {
+      const meta = extractToolApprovalMeta(interrupt);
+      const cmd = (meta.command || "").trim();
+      if (cmd) {
+        const token = cmd.split(/\s+/)[0] || "";
+        if (token && token.length >= 2) {
+          sessionToolAllowlist.add(token);
+          added.push(token);
+        }
+      }
+    }
+  }
+  if (agentBundle && added.length) {
+    const settingsAllow =
+      loadStoredSettings(agentStateRoot()).agent.toolAllowlist ?? [];
+    agentBundle.runMode.setAllowlist(mergeLiveAllowlist(settingsAllow));
+  }
+  return [...new Set(added)];
+}
+
+function setPendingApproval(
+  threadId: string,
+  resolve: (decision: {
+    decisions: Array<{ type: "approve" | "reject" }>;
+  }) => void,
+  detail = "Tool approval required",
+  interrupt?: unknown,
+): void {
+  pendingApprovals.set(threadId, { resolve, detail, interrupt });
+}
+
+function takePendingApproval(threadId: string): {
+  resolve: (decision: {
+    decisions: Array<{ type: "approve" | "reject" }>;
+  }) => void;
+  detail: string;
+  interrupt?: unknown;
+} | undefined {
+  const hit = pendingApprovals.get(threadId);
+  if (hit) pendingApprovals.delete(threadId);
+  return hit;
+}
+
+function listPendingApprovalThreadIds(): string[] {
+  return [...pendingApprovals.keys()];
+}
 let whatsappBridge: WhatsAppBridge | null = null;
 const selfHeal = new SelfHealController();
 
@@ -384,10 +470,103 @@ function emitToRenderer(event: AgentUiEvent) {
   if (event.type === "error" && typeof event.message === "string") {
     selfHeal.recordTurnError(event.message, "turn");
   }
+  maybeTrackJobProgressFromEvent(event);
   for (const win of [mainWindow, workspacesWindow]) {
     if (!win || win.isDestroyed()) continue;
     win.webContents.send("agent:event", event);
   }
+}
+
+function emitCapabilitiesChanged(reason = "fs") {
+  for (const win of [mainWindow, workspacesWindow]) {
+    if (!win || win.isDestroyed()) continue;
+    win.webContents.send("capabilities:changed", {
+      at: Date.now(),
+      reason,
+      root: agentStateRoot(),
+    });
+  }
+}
+
+function ensureCapabilitiesWatch() {
+  const root = agentStateRoot();
+  if (!root) return;
+  if (capabilitiesWatch) {
+    capabilitiesWatch.retarget(root);
+    return;
+  }
+  capabilitiesWatch = startCapabilitiesWatch(root, () => {
+    emitCapabilitiesChanged("fs");
+  });
+}
+
+function resolveProgressAbsPath(relOrAbs: string): string | null {
+  const raw = String(relOrAbs || "").trim();
+  if (!raw) return null;
+  if (path.isAbsolute(raw)) return raw;
+  const roots = [
+    effectiveWorkspaceRoot(),
+    workspaceRoot,
+    agentBundle?.workspaceRoot,
+    process.cwd(),
+  ].filter(Boolean) as string[];
+  for (const root of roots) {
+    const candidate = path.resolve(root, raw);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  // Prefer primary workspace even if file not written yet.
+  const primary = effectiveWorkspaceRoot() || workspaceRoot;
+  return primary ? path.resolve(primary, raw) : null;
+}
+
+const jobProgressWatcher = new JobProgressWatcher({
+  emit: (ev) => {
+    for (const win of [mainWindow, workspacesWindow]) {
+      if (!win || win.isDestroyed()) continue;
+      win.webContents.send("agent:event", ev);
+    }
+  },
+  resolveAbs: resolveProgressAbsPath,
+});
+
+function maybeTrackJobProgressFromEvent(event: AgentUiEvent): void {
+  if (event.type !== "tool_start" && event.type !== "tool_end") return;
+  const name = String(event.name || "");
+  if (!/^(write_file|edit_file|write|edit)$/i.test(name)) return;
+  const input =
+    event.type === "tool_start"
+      ? event.input
+      : undefined;
+  // tool_end often has path only in prior tool_start — also scrape output.
+  let rel = extractWritePath(input);
+  if (!rel && event.type === "tool_end") {
+    const out = String(event.output || "");
+    const m = out.match(
+      /(?:wrote|updated|saved|created)\s+[`']?([^\s`'"]+status[^\s`'"]*\.(?:txt|log|md|json))/i,
+    );
+    if (m?.[1]) rel = m[1];
+    else if (isProgressStatusPathFromOut(out)) {
+      const hit = out.match(/([^\s`'"]*status[^\s`'"]*\.(?:txt|log|md|json))/i);
+      if (hit?.[1]) rel = hit[1];
+    }
+  }
+  if (!rel) return;
+  const tidRaw = (event as { threadId?: unknown }).threadId;
+  const threadId = typeof tidRaw === "string" ? tidRaw : undefined;
+  jobProgressWatcher.watch(rel, threadId);
+}
+
+function isProgressStatusPathFromOut(out: string): boolean {
+  return /status\.(txt|log|md|json)/i.test(out);
+}
+
+function scanJobProgressFiles(threadId?: string): void {
+  const roots = [
+    effectiveWorkspaceRoot(),
+    workspaceRoot,
+    agentBundle?.workspaceRoot,
+  ].filter(Boolean) as string[];
+  jobProgressWatcher.scanWorkspaceRoots(roots, threadId);
 }
 
 /** Prefer the IPC sender's window so dialogs aren't hidden behind Workspaces. */
@@ -557,9 +736,14 @@ async function runSelfHealTurn(opts: {
         agentBundle?.sandbox.isPrivacyStrict() ?? true,
       desktopEnabled: false,
       skipTurnScope: true,
-      requestApproval: () =>
+      requestApproval: (interrupt) =>
         new Promise((resolve) => {
-          pendingApprovals.set(turnThreadId, resolve);
+          setPendingApproval(
+            turnThreadId,
+            resolve,
+            formatToolApprovalDetail(interrupt),
+            interrupt,
+          );
         }),
       memory: {
         sessionStore: agentBundle.sessionStore,
@@ -623,10 +807,9 @@ async function runSelfHealTurn(opts: {
     return { ok: false, error, threadId: turnThreadId };
   } finally {
     busyThreadIds.delete(turnThreadId);
-    const pending = pendingApprovals.get(turnThreadId);
+    const pending = takePendingApproval(turnThreadId);
     if (pending) {
-      pendingApprovals.delete(turnThreadId);
-      pending({ decisions: [{ type: "reject" }] });
+      pending.resolve({ decisions: [{ type: "reject" }] });
     }
     if (busyThreadIds.size === 0) {
       applyBotScope(activeBotId);
@@ -657,21 +840,112 @@ function ensureWhatsAppBridge(): WhatsAppBridge {
   return whatsappBridge;
 }
 
-/** WhatsApp HITL: friends only auto-approve workspace file writes; reject shell/folder/plan. */
+/** WhatsApp HITL: friends only auto-approve workspace file writes; reject shell/folder. Plans use waitForWhatsAppPlanApproval. */
 function decideWhatsAppApproval(
   role: "user" | "friend",
   interrupt: unknown,
 ): { decisions: Array<{ type: "approve" | "reject" }> } {
-  if (isPlanApprovalInterrupt(interrupt)) {
-    return { decisions: [{ type: "reject" }] };
-  }
   const tools = extractInterruptActionNames(interrupt);
   if (role === "user") {
-    return { decisions: [{ type: "approve" }] };
+    return { decisions: buildApprovalDecisions("approve", interrupt) };
   }
   const friendOk = new Set(["write_file", "edit_file"]);
   const ok = tools.length > 0 && tools.every((t) => friendOk.has(t));
-  return { decisions: [{ type: ok ? "approve" : "reject" }] };
+  return {
+    decisions: buildApprovalDecisions(ok ? "approve" : "reject", interrupt),
+  };
+}
+
+/** jid metadata for WA plan waiters (resolve lives in pendingApprovals). */
+const waPlanWaitMeta = new Map<string, { jid: string }>();
+
+async function waitForWhatsAppPlanApproval(options: {
+  jid: string;
+  threadId: string;
+  interrupt: unknown;
+  workspaceRoot: string;
+  bridge: WhatsAppBridge;
+}): Promise<{ decisions: Array<{ type: "approve" | "reject" }> }> {
+  const { jid, threadId, interrupt, workspaceRoot, bridge } = options;
+  const { waText, chatMarkdown } = buildWhatsAppPlanApprovalMessage(
+    workspaceRoot,
+    interrupt,
+  );
+  const chatBody = `${chatMarkdown}\n\n_Balas di WhatsApp: **setuju** atau **tolak**._`;
+
+  try {
+    await bridge.sendText(jid, waText);
+  } catch (e) {
+    console.error("[wa] failed to send plan approval text", e);
+  }
+
+  // Show plan in desktop chat for this WA thread (do NOT emit `done` — turn still waits).
+  emitToRenderer({
+    type: "warning",
+    message: `${WA_PLAN_CHAT_PREFIX}${chatBody}`,
+    threadId,
+  } as never);
+
+  return new Promise((resolve) => {
+    waPlanWaitMeta.set(threadId, { jid });
+    setPendingApproval(
+      threadId,
+      (decision) => {
+        waPlanWaitMeta.delete(threadId);
+        resolve(decision);
+        const approved = decision.decisions.some((d) => d.type === "approve");
+        void bridge
+          .sendText(
+            jid,
+            approved
+              ? "✅ Plan disetujui — lanjut eksekusi…"
+              : "❌ Plan ditolak — tidak dieksekusi.",
+          )
+          .catch(() => undefined);
+      },
+      "plan approval required (whatsapp)",
+      interrupt,
+    );
+  });
+}
+
+async function tryResolveWhatsAppPlanReply(
+  threadId: string,
+  jid: string,
+  text: string,
+  bridge: WhatsAppBridge,
+): Promise<boolean> {
+  if (!waPlanWaitMeta.has(threadId) && !pendingApprovals.has(threadId)) {
+    return false;
+  }
+  const pending = pendingApprovals.get(threadId);
+  const isPlanWait =
+    waPlanWaitMeta.has(threadId) ||
+    (pending?.interrupt != null && isPlanApprovalInterrupt(pending.interrupt));
+  if (!isPlanWait) return false;
+
+  const decision = parseWhatsAppPlanReply(text);
+  if (!decision) {
+    await bridge.sendText(
+      jid,
+      "Menunggu keputusan plan.\nBalas *setuju* untuk eksekusi, atau *tolak* untuk membatalkan.",
+    );
+    return true;
+  }
+
+  const taken = takePendingApproval(threadId);
+  waPlanWaitMeta.delete(threadId);
+  if (!taken) {
+    await bridge.sendText(jid, "Tidak ada plan yang menunggu approval.");
+    return true;
+  }
+  taken.resolve({
+    decisions: buildApprovalDecisions(
+      decision === "approve" ? "approve" : "reject",
+      pending?.interrupt ?? taken.interrupt,
+    ),
+  });
+  return true;
 }
 
 async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
@@ -689,6 +963,18 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
         reason: "Not in User/Friends allowlist (main guard).",
       },
     });
+    return;
+  }
+
+  // Plan waiting for setuju/tolak — do not start a new turn.
+  if (
+    await tryResolveWhatsAppPlanReply(
+      turnThreadId,
+      msg.jid,
+      msg.text || "",
+      bridge,
+    )
+  ) {
     return;
   }
 
@@ -737,7 +1023,7 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
     const hasImages = (msg.attachments ?? []).some((a) => a.kind === "image");
     if (role === "friend") {
       const tools = hasImages
-        ? [...WA_FRIEND_ALLOWED_TOOLS, "vision_analyze"]
+        ? [...WA_FRIEND_ALLOWED_TOOLS, "vision_analyze", "speech_transcribe"]
         : [...WA_FRIEND_ALLOWED_TOOLS];
       waBundle.botScope.setAllowedTools(tools);
     } else {
@@ -774,8 +1060,18 @@ async function handleWhatsAppInbound(msg: WhatsAppInboundMessage) {
         get: () => waBundle.botScope.getAllowedTools(),
         set: (tools) => waBundle.botScope.setAllowedTools(tools),
       },
-      requestApproval: async (interrupt) =>
-        decideWhatsAppApproval(role, interrupt),
+      requestApproval: async (interrupt) => {
+        if (isPlanApprovalInterrupt(interrupt)) {
+          return waitForWhatsAppPlanApproval({
+            jid: msg.jid,
+            threadId: turnThreadId,
+            interrupt,
+            workspaceRoot: waBundle.workspaceRoot,
+            bridge,
+          });
+        }
+        return decideWhatsAppApproval(role, interrupt);
+      },
       memory: {
         sessionStore: waBundle.sessionStore,
         memoryStore: waBundle.memoryStore,
@@ -943,6 +1239,8 @@ async function bootAgentEngine(options?: { disposePrevious?: boolean }) {
       phase: "idle",
       detail: "agent ready",
     } as never);
+    // Resume live footer progress for any in-flight bot status files.
+    scanJobProgressFiles();
     if (options?.disposePrevious && previous) {
       try {
         previous.sandbox.dispose();
@@ -1127,6 +1425,509 @@ app.whenReady().then(async () => {
     return buildSettingsSnapshot(settingsCtx(), folders);
   });
 
+  // --- Embedded Model Hub (Providers / Combos / Usage / Quota) ---
+  const {
+    probeModelHub,
+    ensureModelHubSession,
+    openModelHubPanel,
+    showModelHubEmbed,
+    hideModelHubEmbed,
+    updateModelHubEmbedBounds,
+    fetchModelHubUsage,
+    fetchModelHubUsageChart,
+    fetchModelHubProviders,
+    fetchModelHubCombos,
+    fetchModelHubCatalog,
+    fetchModelHubModels,
+    createModelHubCombo,
+    deleteModelHubCombo,
+    updateModelHubCombo,
+    fetchModelHubSettings,
+    patchModelHubSettings,
+    fetchModelHubConnectionQuota,
+    deleteModelHubConnection,
+    updateModelHubConnection,
+    fetchModelHubDisabledModels,
+    setModelHubModelEnabled,
+    testModelHubConnection,
+    testModelHubModel,
+    testModelHubProviderBatch,
+    startModelHubOAuth,
+    pollModelHubOAuthCallback,
+    exchangeModelHubOAuth,
+    pollModelHubDeviceToken,
+    modelHubStatusPayload,
+    MODEL_HUB_PAGES,
+  } = await import("./model-hub-bridge.js");
+  const { startModelHub, getModelHubStatus } = await import(
+    "./model-hub-runtime.js"
+  );
+
+  const syncModelHubGatewayToSettings = () => {
+    const st = getModelHubStatus();
+    if (!st.ready || !st.v1BaseUrl || !st.apiKey) return;
+    try {
+      applySettingsUpdate(settingsCtx(), {
+        model: {
+          routerBaseUrl: st.v1BaseUrl,
+          routerApiKey: st.apiKey,
+        },
+      });
+    } catch {
+      /* env already injected by runtime */
+    }
+    process.env.ROUTER_BASE_URL = st.v1BaseUrl;
+    process.env.ROUTER_API_KEY = st.apiKey;
+  };
+
+  ipcMain.handle("modelHub:status", async () => {
+    const runtime = modelHubStatusPayload();
+    const probe = await probeModelHub();
+    return {
+      ok: true,
+      ...runtime,
+      online: probe.online,
+      authenticated: probe.authenticated,
+      requireLogin: probe.requireLogin,
+      error: runtime.error || probe.error || null,
+    };
+  });
+
+  ipcMain.handle("modelHub:ensureSession", async () => {
+    const result = await ensureModelHubSession();
+    if (result.ok) syncModelHubGatewayToSettings();
+    return result;
+  });
+
+  ipcMain.handle(
+    "modelHub:openPage",
+    async (_e, payload?: { page?: string }) => {
+      const page = String(payload?.page || "providers") as
+        | "providers"
+        | "combos"
+        | "usage"
+        | "quota";
+      if (!MODEL_HUB_PAGES[page]) {
+        return { ok: false, error: "Unknown page" };
+      }
+      await ensureModelHubSession();
+      return openModelHubPanel({ page, parent: mainWindow });
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:showEmbed",
+    async (
+      _e,
+      payload?: {
+        page?: string;
+        bounds?: { x: number; y: number; width: number; height: number };
+      },
+    ) => {
+      const page = String(payload?.page || "providers") as
+        | "providers"
+        | "combos"
+        | "usage"
+        | "quota";
+      if (!MODEL_HUB_PAGES[page] || !mainWindow || !payload?.bounds) {
+        return { ok: false, error: "Invalid embed request" };
+      }
+      return showModelHubEmbed({
+        page,
+        parent: mainWindow,
+        bounds: payload.bounds,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:updateEmbedBounds",
+    async (
+      _e,
+      payload?: { x?: number; y?: number; width?: number; height?: number },
+    ) => {
+      if (
+        payload &&
+        typeof payload.x === "number" &&
+        typeof payload.y === "number" &&
+        typeof payload.width === "number" &&
+        typeof payload.height === "number"
+      ) {
+        updateModelHubEmbedBounds({
+          x: payload.x,
+          y: payload.y,
+          width: payload.width,
+          height: payload.height,
+        });
+      }
+      return { ok: true };
+    },
+  );
+
+  ipcMain.handle("modelHub:hideEmbed", async () => {
+    hideModelHubEmbed();
+    return { ok: true };
+  });
+
+  ipcMain.handle("modelHub:fetchProviders", async () => {
+    try {
+      return { ok: true, data: await fetchModelHubProviders() };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle("modelHub:fetchCombos", async () => {
+    try {
+      return { ok: true, data: await fetchModelHubCombos() };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle("modelHub:fetchUsage", async (_e, payload?: { period?: string }) => {
+    try {
+      return {
+        ok: true,
+        data: await fetchModelHubUsage(payload?.period || "7d"),
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle("modelHub:fetchUsageChart", async (_e, payload?: { period?: string }) => {
+    try {
+      return {
+        ok: true,
+        data: await fetchModelHubUsageChart(payload?.period || "7d"),
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle("modelHub:fetchModels", async () => {
+    try {
+      return { ok: true, data: await fetchModelHubModels() };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle(
+    "modelHub:createCombo",
+    async (
+      _e,
+      payload?: { name?: string; models?: string[]; kind?: string | null },
+    ) => {
+      const name = String(payload?.name || "").trim();
+      const models = Array.isArray(payload?.models) ? payload!.models! : [];
+      if (!name) return { ok: false, error: "Name required" };
+      if (!models.length) return { ok: false, error: "Pick at least one model" };
+      return createModelHubCombo({
+        name,
+        models,
+        kind: payload?.kind ?? null,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:deleteCombo",
+    async (_e, payload?: { id?: string }) => {
+      const id = String(payload?.id || "").trim();
+      if (!id) return { ok: false, error: "Missing combo id" };
+      return deleteModelHubCombo(id);
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:updateCombo",
+    async (
+      _e,
+      payload?: {
+        id?: string;
+        name?: string;
+        models?: string[];
+        kind?: string | null;
+      },
+    ) => {
+      const id = String(payload?.id || "").trim();
+      if (!id) return { ok: false, error: "Missing combo id" };
+      const body: {
+        name?: string;
+        models?: string[];
+        kind?: string | null;
+      } = {};
+      if (payload?.name != null) body.name = String(payload.name).trim();
+      if (Array.isArray(payload?.models)) body.models = payload.models;
+      if (payload?.kind !== undefined) body.kind = payload.kind;
+      return updateModelHubCombo(id, body);
+    },
+  );
+
+  ipcMain.handle("modelHub:fetchSettings", async () => {
+    try {
+      return await fetchModelHubSettings();
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle(
+    "modelHub:patchSettings",
+    async (_e, payload?: Record<string, unknown>) => {
+      try {
+        return await patchModelHubSettings(payload || {});
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:connectionQuota",
+    async (_e, payload?: { connectionId?: string }) => {
+      const id = String(payload?.connectionId || "").trim();
+      if (!id) return { ok: false, error: "Missing connection id" };
+      try {
+        return {
+          ok: true,
+          data: await fetchModelHubConnectionQuota(id),
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle("modelHub:catalog", async () => {
+    try {
+      return { ok: true, data: await fetchModelHubCatalog() };
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle(
+    "modelHub:deleteConnection",
+    async (_e, payload?: { id?: string }) => {
+      const id = String(payload?.id || "").trim();
+      if (!id) return { ok: false, error: "Missing connection id" };
+      return deleteModelHubConnection(id);
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:updateConnection",
+    async (
+      _e,
+      payload?: { id?: string; isActive?: boolean; name?: string },
+    ) => {
+      const id = String(payload?.id || "").trim();
+      if (!id) return { ok: false, error: "Missing connection id" };
+      const patch: { isActive?: boolean; name?: string } = {};
+      if (typeof payload?.isActive === "boolean") patch.isActive = payload.isActive;
+      if (payload?.name != null) patch.name = String(payload.name);
+      return updateModelHubConnection(id, patch);
+    },
+  );
+
+  ipcMain.handle("modelHub:fetchDisabledModels", async () => {
+    try {
+      return await fetchModelHubDisabledModels();
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  });
+
+  ipcMain.handle(
+    "modelHub:setModelEnabled",
+    async (
+      _e,
+      payload?: { alias?: string; modelIds?: string[]; enabled?: boolean },
+    ) => {
+      const alias = String(payload?.alias || "").trim();
+      const modelIds = Array.isArray(payload?.modelIds)
+        ? payload!.modelIds!.map(String)
+        : [];
+      if (!alias || !modelIds.length) {
+        return { ok: false, error: "alias and modelIds required" };
+      }
+      try {
+        return await setModelHubModelEnabled({
+          alias,
+          modelIds,
+          enabled: payload?.enabled !== false,
+        });
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:testConnection",
+    async (_e, payload?: { id?: string }) => {
+      const id = String(payload?.id || "").trim();
+      if (!id) return { ok: false, valid: false, error: "Missing connection id" };
+      try {
+        return await testModelHubConnection(id);
+      } catch (e) {
+        return {
+          ok: false,
+          valid: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:testModel",
+    async (_e, payload?: { modelId?: string }) => {
+      const modelId = String(payload?.modelId || "").trim();
+      if (!modelId) {
+        return {
+          ok: false,
+          modelId: "",
+          latencyMs: 0,
+          error: "Missing model id",
+          testedAt: new Date().toISOString(),
+        };
+      }
+      try {
+        return await testModelHubModel(modelId);
+      } catch (e) {
+        return {
+          ok: false,
+          modelId,
+          latencyMs: 0,
+          error: e instanceof Error ? e.message : String(e),
+          testedAt: new Date().toISOString(),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:testProviderBatch",
+    async (_e, payload?: { providerId?: string }) => {
+      const providerId = String(payload?.providerId || "").trim();
+      if (!providerId) return { ok: false, error: "Missing provider id" };
+      try {
+        return await testModelHubProviderBatch(providerId);
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:oauthStart",
+    async (_e, payload?: { provider?: string }) => {
+      const provider = String(payload?.provider || "").trim();
+      if (!provider) return { ok: false, error: "Missing provider" };
+      return startModelHubOAuth(provider);
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:oauthPollCallback",
+    async (_e, payload?: { state?: string }) => {
+      const state = String(payload?.state || "").trim();
+      if (!state) return { status: "error", error: "Missing state" };
+      return pollModelHubOAuthCallback(state);
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:oauthExchange",
+    async (
+      _e,
+      payload?: {
+        provider?: string;
+        code?: string;
+        redirectUri?: string;
+        codeVerifier?: string;
+        state?: string;
+      },
+    ) => {
+      const provider = String(payload?.provider || "").trim();
+      const code = String(payload?.code || "").trim();
+      if (!provider || !code) {
+        return { ok: false, error: "Missing provider or code" };
+      }
+      return exchangeModelHubOAuth({
+        provider,
+        code,
+        redirectUri: payload?.redirectUri,
+        codeVerifier: payload?.codeVerifier,
+        state: payload?.state,
+      });
+    },
+  );
+
+  ipcMain.handle(
+    "modelHub:oauthPollDevice",
+    async (
+      _e,
+      payload?: {
+        provider?: string;
+        deviceCode?: string;
+        codeVerifier?: string;
+      },
+    ) => {
+      const provider = String(payload?.provider || "").trim();
+      const deviceCode = String(payload?.deviceCode || "").trim();
+      if (!provider || !deviceCode) {
+        return { status: "error", error: "Missing provider or deviceCode" };
+      }
+      return pollModelHubDeviceToken({
+        provider,
+        deviceCode,
+        codeVerifier: payload?.codeVerifier,
+      });
+    },
+  );
+
   ipcMain.handle("agent:selfHealStatus", async () => selfHeal.getStatus());
 
   ipcMain.handle(
@@ -1158,7 +1959,9 @@ app.whenReady().then(async () => {
           ) {
             agentBundle.runMode.setRunMode(mode);
           }
-          agentBundle.runMode.setAllowlist(snapshot.agent.toolAllowlist ?? []);
+          agentBundle.runMode.setAllowlist(
+            mergeLiveAllowlist(snapshot.agent.toolAllowlist ?? []),
+          );
         }
         let reloaded = false;
         let reloadReason: string | undefined;
@@ -1319,6 +2122,7 @@ app.whenReady().then(async () => {
     busy: busyThreadIds.size > 0,
     busyThreadIds: listBusyThreadIds(),
     busyThreadId: primaryBusyThreadId(),
+    pendingApprovalThreadIds: listPendingApprovalThreadIds(),
     activeThreadId,
     activeBotId,
   }));
@@ -1504,10 +2308,12 @@ app.whenReady().then(async () => {
         });
         const settingsAllow =
           loadStoredSettings(agentStateRoot()).agent.toolAllowlist ?? [];
-        agentBundle.runMode.setAllowlist([
-          ...settingsAllow,
-          ...merged.terminalAllowlist,
-        ]);
+        agentBundle.runMode.setAllowlist(
+          mergeLiveAllowlist([
+            ...settingsAllow,
+            ...merged.terminalAllowlist,
+          ]),
+        );
       }
       return { ok: true };
     },
@@ -1605,6 +2411,135 @@ app.whenReady().then(async () => {
     });
   });
 
+  const resolveMcpServerConfig = async (serverName: string) => {
+    const { readMcpServerMap } = await import("../agent/mcp-loader.js");
+    const roots = [agentStateRoot(), workspaceRoot].filter(Boolean);
+    const loaded = readMcpServerMap(roots);
+    if (!loaded) return null;
+    const cfg = loaded.servers[serverName];
+    return cfg ? { cfg, file: loaded.file } : null;
+  };
+
+  const capsSnapshot = async () => {
+    const { listCapabilities } = await import("../agent/capabilities-catalog.js");
+    return listCapabilities({
+      workspaceRoot: agentStateRoot(),
+      desktopEnabled: Boolean(agentBundle?.desktopEnabled),
+    });
+  };
+
+  ipcMain.handle(
+    "agent:mcpConnectOAuth",
+    async (_event, payload: { serverName?: string }) => {
+      const serverName = String(payload?.serverName || "").trim();
+      if (!serverName) return { ok: false, error: "serverName required" };
+      try {
+        const found = await resolveMcpServerConfig(serverName);
+        if (!found) return { ok: false, error: `MCP server "${serverName}" not found` };
+        const { connectMcpOAuth } = await import("../agent/mcp-auth.js");
+        await connectMcpOAuth({
+          profileHome: agentStateRoot(),
+          serverName,
+          cfg: found.cfg,
+          openUrl: async (url) => {
+            await shell.openExternal(url);
+          },
+        });
+        const reload = await reloadAgentForCapabilities();
+        return {
+          ok: true,
+          reloaded: reload.reloaded,
+          reloadReason: reload.reason,
+          ...(await capsSnapshot()),
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "agent:mcpSaveBearer",
+    async (_event, payload: { serverName?: string; token?: string }) => {
+      const serverName = String(payload?.serverName || "").trim();
+      const token = String(payload?.token || "");
+      if (!serverName) return { ok: false, error: "serverName required" };
+      try {
+        const { saveMcpBearerToken } = await import("../agent/mcp-auth.js");
+        saveMcpBearerToken(agentStateRoot(), serverName, token);
+        const reload = await reloadAgentForCapabilities();
+        return {
+          ok: true,
+          reloaded: reload.reloaded,
+          reloadReason: reload.reason,
+          ...(await capsSnapshot()),
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "agent:mcpSaveEnv",
+    async (
+      _event,
+      payload: { serverName?: string; env?: Record<string, string> },
+    ) => {
+      const serverName = String(payload?.serverName || "").trim();
+      if (!serverName) return { ok: false, error: "serverName required" };
+      try {
+        const { saveMcpEnvCredentials } = await import("../agent/mcp-auth.js");
+        saveMcpEnvCredentials(
+          agentStateRoot(),
+          serverName,
+          payload?.env && typeof payload.env === "object" ? payload.env : {},
+        );
+        const reload = await reloadAgentForCapabilities();
+        return {
+          ok: true,
+          reloaded: reload.reloaded,
+          reloadReason: reload.reason,
+          ...(await capsSnapshot()),
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "agent:mcpDisconnect",
+    async (_event, payload: { serverName?: string }) => {
+      const serverName = String(payload?.serverName || "").trim();
+      if (!serverName) return { ok: false, error: "serverName required" };
+      try {
+        const { disconnectMcpAuth } = await import("../agent/mcp-auth.js");
+        disconnectMcpAuth(agentStateRoot(), serverName);
+        const reload = await reloadAgentForCapabilities();
+        return {
+          ok: true,
+          reloaded: reload.reloaded,
+          reloadReason: reload.reason,
+          ...(await capsSnapshot()),
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
   ipcMain.handle(
     "agent:setCapabilityEnabled",
     async (_event, payload: { id: string; enabled: boolean }) => {
@@ -1615,6 +2550,7 @@ app.whenReady().then(async () => {
       if (!id) return { ok: false, error: "id required" };
       setCapabilityEnabled(agentStateRoot(), id, Boolean(payload.enabled));
       const reload = await reloadAgentForCapabilities();
+      emitCapabilitiesChanged("prefs");
       return {
         ok: true,
         reloaded: reload.reloaded,
@@ -1994,21 +2930,61 @@ app.whenReady().then(async () => {
 
   ipcMain.handle(
     "agent:resolveApproval",
-    async (_event, payload: { approve?: boolean; threadId?: string }) => {
+    async (
+      _event,
+      payload: { approve?: boolean; threadId?: string; always?: boolean },
+    ) => {
       const tid =
         String(payload?.threadId || "").trim() ||
         activeThreadId ||
         primaryBusyThreadId();
-      const resolve = tid ? pendingApprovals.get(tid) : undefined;
-      if (!resolve || !tid) {
+      const pending = tid ? takePendingApproval(tid) : undefined;
+      if (!pending || !tid) {
         return { ok: false, error: "No pending approval" };
       }
-      pendingApprovals.delete(tid);
       const approve = payload?.approve !== false;
-      resolve({
-        decisions: [{ type: approve ? "approve" : "reject" }],
+      let remembered: string[] = [];
+      if (approve && payload?.always === true && pending.interrupt != null) {
+        remembered = rememberSessionAllowFromInterrupt(pending.interrupt);
+      }
+      pending.resolve({
+        decisions: buildApprovalDecisions(
+          approve ? "approve" : "reject",
+          pending.interrupt,
+        ),
       });
-      return { ok: true, approve, threadId: tid };
+      return {
+        ok: true,
+        approve,
+        threadId: tid,
+        always: Boolean(payload?.always),
+        remembered,
+      };
+    },
+  );
+
+  ipcMain.handle(
+    "agent:pendingApproval",
+    async (_event, payload?: { threadId?: string }) => {
+      const tid =
+        String(payload?.threadId || "").trim() ||
+        activeThreadId ||
+        primaryBusyThreadId();
+      if (!tid) {
+        return {
+          ok: true,
+          pending: false,
+          threadIds: listPendingApprovalThreadIds(),
+        };
+      }
+      const hit = pendingApprovals.get(tid);
+      return {
+        ok: true,
+        pending: Boolean(hit),
+        threadId: tid,
+        detail: hit?.detail ?? null,
+        threadIds: listPendingApprovalThreadIds(),
+      };
     },
   );
 
@@ -2133,11 +3109,10 @@ app.whenReady().then(async () => {
       }
       // Force-switch: drop HITL waiters and clear the busy set so reboot can proceed.
       for (const tid of [...busyThreadIds]) {
-        const pending = pendingApprovals.get(tid);
+        const pending = takePendingApproval(tid);
         if (pending) {
-          pendingApprovals.delete(tid);
           try {
-            pending({ decisions: [{ type: "reject" }] });
+            pending.resolve({ decisions: [{ type: "reject" }] });
           } catch {
             /* ignore */
           }
@@ -2196,15 +3171,21 @@ app.whenReady().then(async () => {
     },
     loadStoredAutoApprove: () =>
       loadStoredSettings(agentStateRoot()).agent.autoApproveDestructive,
-    requestApproval: (threadId) =>
+    requestApproval: (threadId, interrupt) =>
       new Promise((resolve) => {
-        pendingApprovals.set(threadId, resolve);
+        setPendingApproval(
+          threadId,
+          resolve,
+          interrupt != null
+            ? formatToolApprovalDetail(interrupt)
+            : "Tool approval required",
+          interrupt,
+        );
       }),
     clearPendingApproval: (threadId) => {
-      const pending = pendingApprovals.get(threadId);
+      const pending = takePendingApproval(threadId);
       if (pending) {
-        pendingApprovals.delete(threadId);
-        pending({ decisions: [{ type: "reject" }] });
+        pending.resolve({ decisions: [{ type: "reject" }] });
       }
     },
     restoreBotScope: () => {
@@ -2224,6 +3205,78 @@ app.whenReady().then(async () => {
       registry: loadProjectRegistry(agentStateRoot()),
     };
   });
+
+  ipcMain.handle("project:graphifyStatus", async () => {
+    const root = effectiveWorkspaceRoot();
+    const {
+      graphifyGraphPath,
+      graphifyOutDir,
+      hasGraphifyGraph,
+    } = await import("../agent/graphify-tools.js");
+    const graphPath = graphifyGraphPath(root);
+    const outDir = graphifyOutDir(root);
+    const ready = hasGraphifyGraph(root);
+    let sizeBytes = 0;
+    let updatedAt: string | null = null;
+    if (ready) {
+      try {
+        const st = fs.statSync(graphPath);
+        sizeBytes = st.size;
+        updatedAt = st.mtime.toISOString();
+      } catch {
+        /* ignore */
+      }
+    }
+    return {
+      ok: true,
+      workspaceRoot: root,
+      graphPath,
+      ready,
+      sizeBytes,
+      updatedAt,
+      hasWiki: fs.existsSync(path.join(outDir, "wiki", "index.md")),
+      hasReport: fs.existsSync(path.join(outDir, "GRAPH_REPORT.md")),
+    };
+  });
+
+  let graphifyUpdateBusy = false;
+  ipcMain.handle(
+    "project:graphifyUpdate",
+    async (_event, payload?: { force?: boolean }) => {
+      if (graphifyUpdateBusy) {
+        return { ok: false, error: "Index already running…" };
+      }
+      graphifyUpdateBusy = true;
+      try {
+        const root = effectiveWorkspaceRoot();
+        const {
+          graphifyGraphPath,
+          hasGraphifyGraph,
+          runGraphifyCommand,
+        } = await import("../agent/graphify-tools.js");
+        // ponytail: graphify update only supports --force / --no-cluster (no --no-viz)
+        const args = ["update", root];
+        if (payload?.force) args.push("--force");
+        const res = await runGraphifyCommand(args, {
+          cwd: root,
+          timeoutMs: 5 * 60_000,
+        });
+        const ready = hasGraphifyGraph(root);
+        return {
+          ok: ready || res.ok,
+          ready,
+          graphPath: graphifyGraphPath(root),
+          stdout: (res.stdout || "").slice(0, 4000),
+          stderr: (res.stderr || "").slice(0, 2000),
+          error: ready
+            ? undefined
+            : res.stderr || res.stdout || `exit ${res.code}`,
+        };
+      } finally {
+        graphifyUpdateBusy = false;
+      }
+    },
+  );
 
   ipcMain.handle(
     "projects:create",
@@ -2495,6 +3548,8 @@ app.whenReady().then(async () => {
         activeThreadId = newestGeneral.threadId;
       }
       applyBotScope(activeBotId);
+      ensureCapabilitiesWatch();
+      emitCapabilitiesChanged("profile");
       return {
         ok: true,
         profileId,
@@ -2564,7 +3619,7 @@ app.whenReady().then(async () => {
   const attachmentPreviewDataUrl = (
     absPath: string,
     mime: string,
-    kind: "image" | "file",
+    kind: "image" | "audio" | "file",
   ): string | undefined => {
     if (kind !== "image") return undefined;
     try {
@@ -2584,7 +3639,7 @@ app.whenReady().then(async () => {
     basename: string;
     mime: string;
     size: number;
-    kind: "image" | "file";
+    kind: "image" | "audio" | "file";
   }) => ({
     path: attachment.relPath,
     absPath: attachment.absPath,
@@ -2862,11 +3917,36 @@ app.whenReady().then(async () => {
     const turnBotId = activeBotId;
     const scope = turnWorkingScope({ threadId: turnThreadId, botId: turnBotId });
     const { nudge: workingScopeNudgeBase } = ensureTurnWorkingDirs(scope);
+    const sessionProjectId = isBotThreadId(turnThreadId)
+      ? null
+      : (bundle.sessionStore.readSessionMeta(turnThreadId).projectId ?? null);
+    if (sessionProjectId) {
+      softAllowProjectFolders(agentBundle, agentStateRoot(), sessionProjectId);
+    }
+    const projectContextInstruction = sessionProjectId
+      ? (() => {
+          const project = loadProjectRegistry(agentStateRoot()).projects.find(
+            (p) => p.id === sessionProjectId,
+          );
+          if (!project) return "";
+          const folders = projectFoldersOf(project);
+          const folderList = folders.length
+            ? folders.map((f) => `\`${f}\``).join(", ")
+            : "(no folders linked yet)";
+          const ideaNote = project.idea ? ` · Context: ${project.idea}` : "";
+          return (
+            `[ACTIVE PROJECT: ${project.name}${ideaNote}]\n` +
+            `Primary source folder(s): ${folderList}\n` +
+            `Inspect and modify source files directly under these folders using tools (ls, read_file, edit_file, grep).`
+          );
+        })()
+      : "";
     const privacyOn = agentBundle?.sandbox.isPrivacyStrict()
       ? true
       : loadPrivacyMode(agentStateRoot());
     const workingScopeNudge = [
       workingScopeNudgeBase,
+      projectContextInstruction,
       privacyModeInstruction(privacyOn),
     ]
       .filter(Boolean)
@@ -2936,8 +4016,7 @@ app.whenReady().then(async () => {
       if (prefs.runMode) {
         bundle.runMode.setRunMode(prefs.runMode);
       }
-      bundle.runMode.setAllowlist(prefs.toolAllowlist ?? []);
-
+      bundle.runMode.setAllowlist(mergeLiveAllowlist(prefs.toolAllowlist ?? []));
       // Plan mode starts locked until Build (task_todos Approve).
       if (chatMode === "plan") {
         bundle.planGate.lock();
@@ -2975,9 +4054,14 @@ app.whenReady().then(async () => {
         // Desktop fast-path is general-mode only — specialized bots stay scoped.
         desktopEnabled: bundle.desktopEnabled && !specialized,
         toolScope,
-        requestApproval: () =>
+        requestApproval: (interrupt) =>
           new Promise((resolve) => {
-            pendingApprovals.set(turnThreadId, resolve);
+            setPendingApproval(
+              turnThreadId,
+              resolve,
+              formatToolApprovalDetail(interrupt),
+              interrupt,
+            );
           }),
         memory: {
           sessionStore: bundle.sessionStore,
@@ -3020,10 +4104,9 @@ app.whenReady().then(async () => {
       };
     } finally {
       busyThreadIds.delete(turnThreadId);
-      const pending = pendingApprovals.get(turnThreadId);
+      const pending = takePendingApproval(turnThreadId);
       if (pending) {
-        pendingApprovals.delete(turnThreadId);
-        pending({
+        pending.resolve({
           decisions: [{ type: "reject" }],
         });
       }
@@ -3063,11 +4146,43 @@ app.whenReady().then(async () => {
   emitToRenderer({
     type: "status",
     phase: "boot",
+    detail: "starting Model Hub",
+  } as never);
+
+  try {
+    const hub = await startModelHub(agentStateRoot());
+    if (hub.ready) {
+      syncModelHubGatewayToSettings();
+      await ensureModelHubSession();
+      console.log(
+        `Model Hub ready on ${hub.baseUrl} (pid ${hub.pid ?? "?"})`,
+      );
+    } else {
+      console.warn(
+        `Model Hub failed to start: ${hub.error || "unknown error"}`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "Model Hub start error:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  emitToRenderer({
+    type: "status",
+    phase: "boot",
     detail: "starting agent engine",
   } as never);
 
   try {
     await bootAgentEngine();
+    // Re-assert hub gateway in case settings apply overwrote env.
+    const hubAfter = getModelHubStatus();
+    if (hubAfter.ready && hubAfter.v1BaseUrl && hubAfter.apiKey) {
+      process.env.ROUTER_BASE_URL = hubAfter.v1BaseUrl;
+      process.env.ROUTER_API_KEY = hubAfter.apiKey;
+    }
     terminalService.disposeAll();
     // Fresh general session on every launch (old sessions stay in the sidebar).
     activeThreadId = `desktop-${Date.now()}`;
@@ -3077,6 +4192,8 @@ app.whenReady().then(async () => {
     });
     applyBotScope("general");
     console.log("Agent engine ready");
+    ensureCapabilitiesWatch();
+    emitCapabilitiesChanged("boot");
     // Prefetch Laya so the first chat turn does not pay cold HF/torch load.
     try {
       const { warmLayaInBackground } = await import("../decision/warm.js");
@@ -3120,4 +4237,10 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   terminalService.disposeAll();
   stopKanbanServices();
+  void import("./model-hub-bridge.js")
+    .then((m) => m.hideModelHubEmbed())
+    .catch(() => undefined);
+  void import("./model-hub-runtime.js")
+    .then((m) => m.stopModelHub())
+    .catch(() => undefined);
 });

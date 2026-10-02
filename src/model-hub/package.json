@@ -1,0 +1,8 @@
+{
+  "name": "@agent/model-hub",
+  "version": "0.5.55",
+  "private": true,
+  "type": "module",
+  "description": "Vendored 9Router engine source (MIT) adapted as Agent Model Hub",
+  "license": "MIT"
+}

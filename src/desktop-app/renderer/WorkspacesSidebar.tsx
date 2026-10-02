@@ -2,6 +2,70 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BotAvatar } from "./BotAvatar.js";
 import { EditWorkspaceBotModal } from "./EditWorkspaceBotModal.js";
 
+/** Compact Index-repo CTA when Graphify graph is missing for the active workspace. */
+function GraphifyIndexCta({
+  activeProjectId,
+}: {
+  activeProjectId: string | null;
+}) {
+  const [ready, setReady] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    const api = (
+      window as unknown as {
+        electronAgent?: {
+          graphifyStatus?: () => Promise<{ ok: boolean; ready?: boolean }>;
+        };
+      }
+    ).electronAgent;
+    if (!api?.graphifyStatus) {
+      setReady(null);
+      return;
+    }
+    const res = await api.graphifyStatus();
+    setReady(res.ok ? Boolean(res.ready) : null);
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, [activeProjectId]);
+
+  if (ready !== false) return null;
+
+  return (
+    <div className="mb-1.5 rounded border border-warn/30 bg-warn/10 px-1.5 py-1">
+      <div className="text-[9px] text-fg-dim">Codebase index missing</div>
+      <button
+        type="button"
+        disabled={busy}
+        className="mt-0.5 text-[10px] font-semibold text-accent disabled:opacity-50"
+        onClick={async () => {
+          const api = (
+            window as unknown as {
+              electronAgent?: {
+                graphifyUpdate?: (p?: {
+                  force?: boolean;
+                }) => Promise<{ ok: boolean }>;
+              };
+            }
+          ).electronAgent;
+          if (!api?.graphifyUpdate) return;
+          setBusy(true);
+          try {
+            await api.graphifyUpdate({});
+            await refresh();
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? "Indexing…" : "Index repo"}
+      </button>
+    </div>
+  );
+}
+
 export type WorkspaceSummaryRow = {
   id: string;
   name: string;
@@ -474,6 +538,7 @@ export function WorkspacesSidebar({
         <div className="mb-1 text-[9px] font-semibold tracking-wider text-accent-soft uppercase">
           Projects
         </div>
+        <GraphifyIndexCta activeProjectId={focused?.activeProjectId ?? null} />
         {(focused?.projectIds || []).length === 0 ? (
           <div className="text-[10px] text-muted">None assigned</div>
         ) : (
