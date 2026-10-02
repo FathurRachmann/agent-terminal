@@ -1,7 +1,22 @@
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import type { PersistentMemoryStore } from "../memory/persistent-store.js";
+import type { SessionStore } from "../memory/session-store.js";
+import type { EmbeddingClient } from "../memory/embeddings.js";
+
 export type AgentRunnerOptions = {
   workingDirectory?: string;
   modelName?: string;
   interactive?: boolean;
+};
+
+export type MemoryRuntime = {
+  sessionStore: SessionStore;
+  memoryStore: PersistentMemoryStore;
+  embedder: EmbeddingClient;
+  model: BaseChatModel;
+  workspaceRoot: string;
+  profileHome?: string;
+  enableReflection?: boolean;
 };
 
 export class AgentRunner {
@@ -21,3 +36,4 @@ export class AgentRunner {
     };
   }
 }
+
