@@ -31,6 +31,12 @@ describe("checkCommand", () => {
     assert.equal(r.ok, false);
     if (!r.ok) assert.match(r.reason, /desktop_automate/i);
   });
+
+  it("blocks base64 decode piped to shell", () => {
+    const r = checkCommand('echo "cm0gLXJmIC8=" | base64 -d | sh');
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.reason, /base64 decode/i);
+  });
 });
 
 describe("ensureLsLongListing", () => {

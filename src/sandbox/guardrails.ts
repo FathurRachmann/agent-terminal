@@ -27,6 +27,10 @@ const BLOCKED_PATTERNS: Array<{ re: RegExp; reason: string }> = [
     re: /\bosacompile\b/i,
     reason: "blocked: osacompile — use desktop_automate instead",
   },
+  {
+    re: /\bbase64\s+(-d|--decode)\s*\|\s*(ba)?sh\b/i,
+    reason: "blocked: base64 decode piped to shell execution",
+  },
 ];
 
 const DESTRUCTIVE_PATTERNS: Array<{ re: RegExp; reason: string }> = [
